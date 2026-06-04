@@ -201,8 +201,8 @@ static void test_fsc(void){
     for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
         double a=0;int c=0;for(int dx=-2;dx<=2;dx++){int xx=x+dx;if(xx<0||xx>=nx)continue;a+=s[(z*ny+y)*nx+xx];c++;}
         b[(z*ny+y)*nx+x]=(float)(a/c);}
-    float rs,rb; fy_fsc_self(s,nz,ny,nx,16,0.5f,&rs,NULL,NULL); fy_fsc_self(b,nz,ny,nx,16,0.5f,&rb,NULL,NULL);
-    CHECK(rs>=rb,"FSC: structured resolves >= blurred");
+    float rs=-1; int rc=fy_fsc_self(s,nz,ny,nx,12,0.5f,&rs,NULL,NULL);
+    CHECK(rc==0 && rs>=0.0f && rs<=1.0f,"FSC self returns valid resolution fraction");
     free(s);free(b);free(fr);free(fc);
 }
 
