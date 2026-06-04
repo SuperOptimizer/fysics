@@ -11,6 +11,22 @@ it analytically inverts a known transfer function.
 Intended for import by viewers/tools (e.g. **vc3d**) as on-the-fly post-processing,
 or as batch preprocessing.
 
+## What's physics-grounded vs. generic (read this)
+
+Be honest about what we can defensibly claim on ESRF/BM18 data:
+
+| operation | grounded? | where / how |
+|---|---|---|
+| **Paganin deconvolution** | ✅ **exact** | metadata gives `delta_beta`, energy, distance; we invert the *exact* nabu filter (verified to 1e-16). Apply to the reconstructed volume. |
+| **Unsharp accounting** | ✅ **exact** | metadata gives `coeff`/`sigma`; modeled in the net transfer. |
+| **NLM / bilateral denoise** | ✅ safe, generic | denoising is always valid; pairs with deconv (which amplifies noise). Strength tuned empirically (we don't have the exact noise model). Apply *after* deconv. |
+| FBP ramp filter inversion | ❌ not clean | applied in sinogram domain before backprojection — cannot be cleanly inverted from the reconstructed volume. **Not implemented.** |
+| ring-artifact removal | ⚠️ heuristic | residual rings have no metadata model; standard suppression is heuristic, not a physics inverse. (Could add, clearly labeled.) |
+
+So fysics provides a **physics-exact Paganin deblur** + a **standard denoise pass**.
+The deblur is grounded in the metadata; the denoise is a safe complement. We do
+*not* claim to invert the FBP filter or rings as "physics."
+
 ## What it does
 
 The BM18/ESRF reconstructions apply a Paganin phase-retrieval filter (a deliberate

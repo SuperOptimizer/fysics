@@ -92,12 +92,53 @@ static void test_halo_reasonable(void) {
     printf("      (halo = %d voxels)\n", h);
 }
 
+
+static void test_nlm_denoises(void) {
+    int nz=16,ny=24,nx=24,n=nz*ny*nx;
+    float *clean=malloc(4*n),*noisy=malloc(4*n),*out=malloc(4*n);
+    /* smooth structure + noise */
+    unsigned s=12345;
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        double v=0.5+0.4*sin(x*0.4)*cos(y*0.3);
+        clean[(z*ny+y)*nx+x]=(float)v;
+        s=s*1103515245u+12345u; double nse=((s>>16)&0x7fff)/32768.0-0.5;
+        noisy[(z*ny+y)*nx+x]=(float)(v+0.15*nse);
+    }
+    fy_nlm_denoise(noisy,out,nz,ny,nx,0.15,4,1);
+    /* denoised should be closer to clean than noisy was */
+    double en=0,eo=0;
+    for(int i=0;i<n;i++){double a=noisy[i]-clean[i],b=out[i]-clean[i];en+=a*a;eo+=b*b;}
+    CHECK(eo<en, "NLM reduces error vs clean (denoises)");
+    printf("      (noisy MSE=%.5f -> denoised MSE=%.5f)\n", en/n, eo/n);
+    free(clean);free(noisy);free(out);
+}
+static void test_bilateral_denoises(void){
+    int nz=16,ny=24,nx=24,n=nz*ny*nx;
+    float *clean=malloc(4*n),*noisy=malloc(4*n),*out=malloc(4*n);
+    unsigned s=999;
+    /* smooth spatial structure so neighbors are genuinely similar */
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        double v=0.5+0.3*sin(x*0.25)*sin(y*0.2);
+        clean[(z*ny+y)*nx+x]=(float)v;
+        s=s*1103515245u+12345u;double nse=((s>>16)&0x7fff)/32768.0-0.5;
+        noisy[(z*ny+y)*nx+x]=(float)(v+0.08*nse);
+    }
+    /* sigma_range >= noise amplitude so the filter averages across noise */
+    fy_bilateral_denoise(noisy,out,nz,ny,nx,1.5,0.10,2);
+    double en=0,eo=0;for(int i=0;i<n;i++){double a=noisy[i]-clean[i],b=out[i]-clean[i];en+=a*a;eo+=b*b;}
+    CHECK(eo<en,"bilateral reduces error vs clean");
+    printf("      (noisy MSE=%.5f -> denoised MSE=%.5f)\n", en/n, eo/n);
+    free(clean);free(noisy);free(out);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
     test_paganin_transfer();
     test_deconvolve_sharpens();
     test_halo_reasonable();
+    test_nlm_denoises();
+    test_bilateral_denoises();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

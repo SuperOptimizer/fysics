@@ -51,6 +51,16 @@ int fy_deconvolve(const float *in, float *out,
                   int nz, int ny, int nx,
                   const fy_physics *p, double reg);
 
+
+/* ---- denoising (complements deconvolution; deconv amplifies noise) ----
+ * NLM: non-local means, edge/texture preserving (papyrus is self-similar -> ideal).
+ *   h = filter strength (~noise level), search_radius S, patch_radius P.
+ * Bilateral: cheaper edge-preserving alternative. */
+int fy_nlm_denoise(const float *in, float *out, int nz, int ny, int nx,
+                   double h, int search_radius, int patch_radius);
+int fy_bilateral_denoise(const float *in, float *out, int nz, int ny, int nx,
+                         double sigma_spatial, double sigma_range, int radius);
+
 /* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);
