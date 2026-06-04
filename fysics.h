@@ -83,6 +83,8 @@ typedef struct {
     float  glcae_clip;       /* CLAHE clip limit for GLCAE (default 2.0) */
     int    do_musica;        /* 1 -> MUSICA multiscale contrast (preferred) */
     float  musica_p;         /* MUSICA gain exponent (<1 boosts faint; ~0.8) */
+    float  air_fill;         /* what to put in masked air: 0=zero it out (black),
+                              * <0=keep the smooth original (gray). Default 0. */
 } fy_recipe;
 
 fy_recipe fy_recipe_default(void);     /* the one good pipeline (punchy; glcae off) */

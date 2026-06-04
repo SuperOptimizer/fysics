@@ -29,9 +29,10 @@ fy_recipe fy_recipe_default(void) {
     fy_recipe r;
     r.deconv_reg = 0.015;          /* punchy -- recover resolution */
     r.air_thresh = 0.25f;          /* mask air (histogram-valley threshold) */
+    r.air_fill = 0.0f;             /* ZERO out the air (black gaps), before contrast */
     r.denoise_bilateral = 0.05;    /* light guided denoise (eps), tames deconv noise */
-    r.do_musica = 0;               /* MUSICA contrast off by default (on-switch) */
-    r.musica_p = 0.8f;
+    r.do_musica = 1;               /* MUSICA contrast ON, gentle (see musica_p) */
+    r.musica_p = 0.9f;             /* gentle (closer to 1 = milder boost) */
     r.do_glcae = 0;                /* legacy GLCAE off; prefer MUSICA */
     r.glcae_clip = 2.0f;
     return r;
@@ -46,7 +47,7 @@ int fy_process(const float *in, float *out, int nz, int ny, int nx,
 
     const float *cur = in;
 
-    /* 1. mask on raw */
+    /* 1. mask computed on the RAW data (cleanest air/papyrus histogram valley) */
     int use_mask = (r->air_thresh > 0.0f);
     if (use_mask) {
         mask = malloc(sizeof(float) * n);
@@ -58,35 +59,50 @@ int fy_process(const float *in, float *out, int nz, int ny, int nx,
     /* 2. deconvolve */
     if (r->deconv_reg > 0.0) {
         fy_deconvolve(cur, buf, nz, ny, nx, p, r->deconv_reg);
-        /* 3. re-apply mask: air = smooth original (in), papyrus = deconv (buf) */
-        if (use_mask) { fy_apply_mask(buf, in, mask, out, nz, ny, nx, -1.0f); }
-        else { memcpy(out, buf, sizeof(float) * n); }
+        memcpy(out, buf, sizeof(float) * n);
         cur = out;
     } else {
         memcpy(out, in, sizeof(float) * n);
         cur = out;
     }
 
-    /* 4. optional denoise -- GUIDED filter (fast, O(N), no gradient reversal).
-     * denoise_bilateral is reused as the guided eps (range); ~7x faster than
-     * bilateral and O(1) in radius, the right default for streaming volumes. */
+    /* 3. optional denoise (guided filter -- fast O(N), no gradient reversal) */
     if (r->denoise_bilateral > 0.0) {
-        double eps = r->denoise_bilateral * r->denoise_bilateral;  /* range^2 */
+        double eps = r->denoise_bilateral * r->denoise_bilateral;
         fy_guided_denoise(cur, buf, nz, ny, nx, 2, eps);
         memcpy(out, buf, sizeof(float) * n);
         cur = out;
     }
 
-    /* 5. optional contrast enhancement, per XY slice. MUSICA preferred (multiscale,
-     * no tile/halo artifacts, better for faint detail); GLCAE legacy fallback. */
+    /* 4. ZERO OUT THE AIR (before contrast) -- we don't want to contrast-enhance
+     * empty gaps. air_fill: 0 = black (default), <0 = keep smooth original. */
+    if (use_mask) {
+        float fill = r->air_fill;
+        fy_apply_mask(cur, in, mask, buf, nz, ny, nx, fill < 0 ? -1.0f : fill);
+        memcpy(out, buf, sizeof(float) * n);
+        cur = out;
+    }
+
+    /* 5. CONTRAST ENHANCE (after air is zeroed -- operates on papyrus + black gaps).
+     * MUSICA preferred (multiscale, no tile/halo, better for faint detail). The
+     * zeroed air is flat -> no detail to amplify (coring leaves it alone). */
     if (r->do_musica) {
         float pexp = r->musica_p > 0 ? r->musica_p : 0.8f;
         for (int z = 0; z < nz; z++)
             fy_musica2d(cur + (size_t)z*ny*nx, buf + (size_t)z*ny*nx, ny, nx, 4, pexp, 0.0f);
         memcpy(out, buf, sizeof(float) * n);
+        cur = out;
     } else if (r->do_glcae) {
         for (int z = 0; z < nz; z++)
             fy_glcae2d(cur + (size_t)z*ny*nx, buf + (size_t)z*ny*nx, ny, nx, 8, r->glcae_clip);
+        memcpy(out, buf, sizeof(float) * n);
+        cur = out;
+    }
+
+    /* 6. re-zero air after contrast (contrast may have lifted the black slightly) */
+    if (use_mask && (r->air_fill >= 0)) {
+        float fill = r->air_fill;
+        fy_apply_mask(cur, in, mask, buf, nz, ny, nx, fill);
         memcpy(out, buf, sizeof(float) * n);
     }
 
