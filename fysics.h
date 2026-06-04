@@ -162,6 +162,13 @@ int fy_deconvolve_masked(const float *in, float *out, int nz, int ny, int nx,
  * fused by local-contrast x brightness. Input/output normalized [0,1] per slice. */
 int fy_glcae2d(const float *in, float *out, int ny, int nx,
                int clahe_tiles, float clahe_clip);
+/* MUSICA multiscale contrast (Vuylsteke-Schoeters): Laplacian-pyramid sublinear
+ * detail amplification. Better than CLAHE/GLCAE for faint detail in noisy X-ray --
+ * no tile/halo artifacts, doesn't penalize rare faint features. levels=pyramid
+ * depth (~4), p=gain exponent (<1 boosts faint detail, ~0.7), core=noise coring
+ * (0 disables). Per [0,1] slice. The recommended contrast method. */
+int fy_musica2d(const float *in, float *out, int ny, int nx,
+                int levels, float p, float core);
 int fy_clahe2d(const float *in, float *out, int ny, int nx,
                int tiles_y, int tiles_x, int nbins, float clip_limit);
 
