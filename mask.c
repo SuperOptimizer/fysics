@@ -53,10 +53,45 @@ static inline float smoothstep(float lo, float hi, float x) {
     return t * t * (3.0f - 2.0f * t);
 }
 
-/* Build a soft papyrus mask in [0,1] from a (normalized ~[0,1]) volume.
- *   intensity_lo/hi: smoothstep band on local mean intensity (air is dark)
- *   var_lo/hi: smoothstep band on local variance (air is flat)
- * mask = intensity_term * variance_term. Larger => more "papyrus".
+/* simple separable box blur (smooths a mask so it isn't speckly) */
+static void box_blur3d(float *restrict v, int nz, int ny, int nx, int r) {
+    size_t n = (size_t)nz * ny * nx;
+    float *tmp = malloc(sizeof(float) * n);
+    if (!tmp) return;
+    /* X */
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) {
+        size_t row = ((size_t)z * ny + y) * nx;
+        for (int x = 0; x < nx; x++) {
+            double s = 0; int c = 0;
+            for (int dx = -r; dx <= r; dx++) { int xx = x+dx; if (xx>=0&&xx<nx){s+=v[row+xx];c++;} }
+            tmp[row + x] = (float)(s / c);
+        }
+    }
+    /* Y */
+    for (int z = 0; z < nz; z++) for (int x = 0; x < nx; x++) {
+        for (int y = 0; y < ny; y++) {
+            double s = 0; int c = 0;
+            for (int dy = -r; dy <= r; dy++){int yy=y+dy;if(yy>=0&&yy<ny){s+=tmp[((size_t)z*ny+yy)*nx+x];c++;}}
+            v[((size_t)z*ny+y)*nx+x] = (float)(s / c);
+        }
+    }
+    /* Z */
+    for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        for (int z = 0; z < nz; z++) {
+            double s = 0; int c = 0;
+            for (int dz = -r; dz <= r; dz++){int zz=z+dz;if(zz>=0&&zz<nz){s+=v[((size_t)zz*ny+y)*nx+x];c++;}}
+            tmp[((size_t)z*ny+y)*nx+x] = (float)(s / c);
+        }
+    }
+    memcpy(v, tmp, sizeof(float) * n);
+    free(tmp);
+}
+
+/* Build a soft papyrus mask in [0,1]. PRIMARY signal is INTENSITY (air is dark,
+ * papyrus is bright -- the histogram is cleanly bimodal). We threshold the
+ * LOCAL-MEAN intensity (robust to per-voxel noise) with a smoothstep band, then
+ * blur the mask so it's smooth (no speckle). The variance band is optional extra
+ * (set var_lo=var_hi=0 to disable -- intensity alone works well).
  */
 int fy_papyrus_mask(const float *in, float *mask, int nz, int ny, int nx,
                     float intensity_lo, float intensity_hi,
@@ -67,11 +102,14 @@ int fy_papyrus_mask(const float *in, float *mask, int nz, int ny, int nx,
     float *var = malloc(sizeof(float) * n);
     if (!mean || !var) { free(mean); free(var); return 1; }
     local_stats(in, nz, ny, nx, radius, mean, var);
+    int use_var = (var_hi > var_lo);
     for (size_t i = 0; i < n; i++) {
         float mi = smoothstep(intensity_lo, intensity_hi, mean[i]);
-        float mv = smoothstep(var_lo, var_hi, var[i]);
+        float mv = use_var ? smoothstep(var_lo, var_hi, var[i]) : 1.0f;
         mask[i] = mi * mv;
     }
+    /* smooth the mask so air/papyrus transition is gradual, not blotchy */
+    box_blur3d(mask, nz, ny, nx, 2);
     free(mean); free(var);
     return 0;
 }
