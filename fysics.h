@@ -27,6 +27,8 @@ typedef struct {
     double pixel_um;          /* sample pixel size (micron/voxel) */
     double unsharp_sigma;     /* unsharp gaussian sigma (voxels); 0 disables */
     double unsharp_coeff;     /* unsharp coefficient; 0 disables */
+    double psf_sigma_vox;     /* Gaussian SYSTEM PSF width (voxels) for the Gureyev
+                               * deconvolution; 0 -> estimate ~0.5 vox default. */
 } fy_physics;
 
 /* ---- FFT (powers of two) ---- */
@@ -102,6 +104,19 @@ double fy_recon_transfer(double f_cyc_per_voxel, const fy_physics *p); /* pagani
 int fy_deconvolve(const float *in, float *out,
                   int nz, int ny, int nx,
                   const fy_physics *p, double reg);
+
+/* ---- Gureyev-Paganin deconvolution (arXiv 2601.07225) -- published SOTA ----
+ * Resolution recovery that goes beyond inverting the Paganin filter: it also
+ * explicitly Tikhonov-deconvolves the Gaussian SYSTEM PSF (detector+source blur),
+ * which the standard Paganin over-regularizes against. The combined Fourier filter:
+ *   H(k) = (1 + b'*k^2) * [ G(k) / (G(k)^2 + gamma) ]
+ * where (1 + b'*k^2) is the reduced-strength Paganin inverse (b' = paganin b minus
+ * the PSF contribution) and G(k)=exp(-2 pi^2 sigma^2 k^2) is the Gaussian system
+ * PSF, Tikhonov-regularized by gamma. p->psf_sigma_vox sets sigma; gamma = tikhonov.
+ * Reduces to the plain Paganin inverse when psf_sigma_vox=0. */
+int fy_deconvolve_gureyev(const float *in, float *out,
+                          int nz, int ny, int nx,
+                          const fy_physics *p, double tikhonov);
 
 
 /* ---- denoising (complements deconvolution; deconv amplifies noise) ----

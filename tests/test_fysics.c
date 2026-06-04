@@ -168,6 +168,25 @@ static void test_streaming_global(void){
     free(vol);free(oc);free(ow);
 }
 
+
+static void test_gureyev_deconv(void){
+    fy_physics p={1000,77,220,2.403,1.2,4.0,0.6};
+    int nz=24,ny=24,nx=24,n=nz*ny*nx;
+    float*in=malloc(4*n),*out=malloc(4*n);
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        double r=(x-12.0)*(x-12.0)+(y-12.0)*(y-12.0)+(z-12.0)*(z-12.0);
+        in[(z*ny+y)*nx+x]=(float)exp(-r/30.0);
+    }
+    int rc=fy_deconvolve_gureyev(in,out,nz,ny,nx,&p,0.02);
+    CHECK(rc==0,"gureyev deconv runs");
+    int finite=1; for(int i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
+    CHECK(finite,"gureyev output finite");
+    double si=0,so=0,mi=0,mo=0;
+    for(int i=0;i<n;i++){mi+=in[i];mo+=out[i];} mi/=n;mo/=n;
+    for(int i=0;i<n;i++){si+=(in[i]-mi)*(in[i]-mi);so+=(out[i]-mo)*(out[i]-mo);}
+    CHECK(so>si,"gureyev sharpens (raises contrast vs input)");
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -178,6 +197,7 @@ int main(void) {
     test_bilateral_denoises();
     test_process_recipe();
     test_streaming_global();
+    test_gureyev_deconv();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

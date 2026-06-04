@@ -144,3 +144,69 @@ int fy_deconvolve(const float *in, float *out,
     free(re); free(im); free(fz2); free(fy2); free(fx2);
     return 0;
 }
+
+/* Gureyev-Paganin combined transfer (the Fourier filter to apply to the image):
+ *   reduced-Paganin inverse  (1 + b'*k2)   [boosts high freq -- undoes the blur]
+ * times Tikhonov Gaussian-PSF deconvolution  G/(G^2+gamma).
+ * b' = paganin b reduced by the PSF's variance contribution (per the paper, the
+ * PSF already does partial deblur, so we deconvolve LESS in the Paganin step and
+ * deconvolve the PSF explicitly). k in cycles/voxel. */
+static double gureyev_transfer(double fr, const fy_physics *p, double gamma) {
+    /* Paganin b in (cycles/voxel)^-2 units: standard filter is 1/(1+b*f_um^2) with
+     * f_um=fr/pixel_um, so in cycles/voxel: b_vox = db*L*D*pi / pixel_um^2. */
+    double L = FY_HC_KEV_UM / p->energy_kev;     /* wavelength (micron) */
+    double D = p->distance_mm * 1000.0;
+    double px = p->pixel_um; if (px > 0 && px < 0.1) px *= 1000.0;
+    double b_vox = p->delta_beta * L * D * M_PI / (px * px);
+    /* system PSF (Gaussian) variance contribution to the regularization:
+     * the PSF transfer is G(f)=exp(-2 pi^2 sigma^2 f^2); its small-f expansion is
+     * 1 - 2 pi^2 sigma^2 f^2, i.e. it ALSO acts like a (1 - c f^2) low-pass with
+     * c = 2 pi^2 sigma^2. Reduce the Paganin b by this so we don't double-count. */
+    double sigma = p->psf_sigma_vox > 0 ? p->psf_sigma_vox : 0.5;
+    double c_psf = 2.0 * M_PI * M_PI * sigma * sigma;
+    double b_reduced = b_vox - c_psf;
+    if (b_reduced < 0) b_reduced = 0;
+    double f2 = fr * fr;
+    double paganin_inv = 1.0 + b_reduced * f2;           /* high-freq boost */
+    double G = exp(-2.0 * M_PI * M_PI * sigma * sigma * f2); /* PSF transfer */
+    double psf_deconv = G / (G * G + gamma);              /* Tikhonov inverse */
+    return paganin_inv * psf_deconv;
+}
+
+int fy_deconvolve_gureyev(const float *in, float *out,
+                          int nz, int ny, int nx,
+                          const fy_physics *p, double tikhonov) {
+    if (tikhonov <= 0) tikhonov = 0.02;
+    int pz = fy_next_pow2(nz), py = fy_next_pow2(ny), px = fy_next_pow2(nx);
+    size_t np = (size_t)pz * py * px;
+    float *re = (float *)malloc(sizeof(float) * np);
+    float *im = (float *)calloc(np, sizeof(float));
+    if (!re || !im) { free(re); free(im); return 1; }
+    for (int z = 0; z < pz; z++) for (int y = 0; y < py; y++) {
+        int sz = reflect(z, nz), sy = reflect(y, ny);
+        size_t drow = ((size_t)z * py + y) * px, srow = ((size_t)sz * ny + sy) * nx;
+        for (int x = 0; x < px; x++) re[drow + x] = in[srow + reflect(x, nx)];
+    }
+    fy_fft3d(re, im, pz, py, px, -1);
+    double *fz2 = malloc(sizeof(double)*pz), *fy2 = malloc(sizeof(double)*py), *fx2 = malloc(sizeof(double)*px);
+    if (!fz2||!fy2||!fx2){ free(re);free(im);free(fz2);free(fy2);free(fx2); return 1; }
+    for (int i=0;i<pz;i++){double f=(i<=pz/2)?(double)i/pz:(double)(i-pz)/pz; fz2[i]=f*f;}
+    for (int i=0;i<py;i++){double f=(i<=py/2)?(double)i/py:(double)(i-py)/py; fy2[i]=f*f;}
+    for (int i=0;i<px;i++){double f=(i<=px/2)?(double)i/px:(double)(i-px)/px; fx2[i]=f*f;}
+    for (int z=0;z<pz;z++) for (int y=0;y<py;y++){
+        size_t row=((size_t)z*py+y)*px; double fzy=fz2[z]+fy2[y];
+        for (int x=0;x<px;x++){
+            double fr=sqrt(fzy+fx2[x]);
+            double w=gureyev_transfer(fr,p,tikhonov);
+            re[row+x]*=(float)w; im[row+x]*=(float)w;
+        }
+    }
+    fy_fft3d(re, im, pz, py, px, +1);
+    fy_fft3d_normalize(re, im, pz, py, px);
+    for (int z=0;z<nz;z++) for (int y=0;y<ny;y++){
+        size_t drow=((size_t)z*ny+y)*nx, srow=((size_t)z*py+y)*px;
+        for (int x=0;x<nx;x++) out[drow+x]=re[srow+x];
+    }
+    free(re); free(im); free(fz2); free(fy2); free(fx2);
+    return 0;
+}
