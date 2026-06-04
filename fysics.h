@@ -174,6 +174,18 @@ int fy_musica2d(const float *in, float *out, int ny, int nx,
 int fy_clahe2d(const float *in, float *out, int ny, int nx,
                int tiles_y, int tiles_x, int nbins, float clip_limit);
 
+
+/* ---- Fourier Shell Correlation (FSC): synchrotron resolution metric ----
+ * Proves a processing step actually RECOVERED resolution (not just amplified
+ * noise): if FSC extends to higher frequency after processing, resolution
+ * improved. fy_fsc correlates two half-volumes shell-by-shell; fy_fsc_self splits
+ * one volume (checkerboard) for a reduced-reference estimate. res_frac = resolution
+ * as a fraction of Nyquist at the threshold (e.g. 0.143). */
+int fy_fsc(const float *vol1, const float *vol2, int nz, int ny, int nx,
+           int nbins, float *freqs, float *fsc);
+int fy_fsc_self(const float *vol, int nz, int ny, int nx, int nbins,
+                float threshold, float *res_frac, float *freqs, float *fsc);
+
 /* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);

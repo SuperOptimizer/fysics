@@ -187,6 +187,25 @@ static void test_gureyev_deconv(void){
     CHECK(so>si,"gureyev sharpens (raises contrast vs input)");
 }
 
+
+static void test_fsc(void){
+    int nz=32,ny=32,nx=32,n=nz*ny*nx;
+    float*s=malloc(4*n),*b=malloc(4*n),*fr=malloc(4*24),*fc=malloc(4*24);
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++)
+        s[(z*ny+y)*nx+x]=(float)(0.5+0.3*sin(x*0.3)*cos(y*0.25)+0.15*sin(x*1.1));
+    /* FSC of a volume with itself = ~1 everywhere (perfect correlation) */
+    fy_fsc(s,s,nz,ny,nx,24,fr,fc);
+    int high=1; for(int k=1;k<12;k++) if(fc[k]<0.9f) high=0;
+    CHECK(high,"FSC(vol,vol) ~ 1 (self-correlation)");
+    /* blurred resolves <= structured */
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        double a=0;int c=0;for(int dx=-2;dx<=2;dx++){int xx=x+dx;if(xx<0||xx>=nx)continue;a+=s[(z*ny+y)*nx+xx];c++;}
+        b[(z*ny+y)*nx+x]=(float)(a/c);}
+    float rs,rb; fy_fsc_self(s,nz,ny,nx,16,0.5f,&rs,NULL,NULL); fy_fsc_self(b,nz,ny,nx,16,0.5f,&rb,NULL,NULL);
+    CHECK(rs>=rb,"FSC: structured resolves >= blurred");
+    free(s);free(b);free(fr);free(fc);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -198,6 +217,7 @@ int main(void) {
     test_process_recipe();
     test_streaming_global();
     test_gureyev_deconv();
+    test_fsc();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
