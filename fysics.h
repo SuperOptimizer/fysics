@@ -188,6 +188,20 @@ int fy_fsc(const float *vol1, const float *vol2, int nz, int ny, int nx,
 int fy_fsc_self(const float *vol, int nz, int ny, int nx, int nbins,
                 float threshold, float *res_frac, float *freqs, float *fsc);
 
+
+/* ---- z-drift / shading correction (whole-volume, the 13% beam-current drop) ----
+ * Removes the slow brightness gradient along z from beam-current drift during the
+ * scan. Two-pass streaming (tiny state = one scalar per slice):
+ *   pass1: fy_zdrift_accumulate() per slab -> per-slice papyrus sum/count
+ *   finalize: fy_zdrift_finalize() -> smoothed per-slice correction factor
+ *   pass2: fy_zdrift_apply() per slab -> multiply by factor
+ * Or fy_correct_zdrift() for a whole in-RAM volume. */
+void fy_zdrift_accumulate(const float *chunk, int nz_slab, int ny, int nx,
+                          int z0, double *sums, long *counts, float papyrus_thresh);
+void fy_zdrift_finalize(const double *sums, const long *counts, int nz, float *factor);
+void fy_zdrift_apply(float *chunk, int nz_slab, int ny, int nx, int z0, const float *factor);
+int  fy_correct_zdrift(float *vol, int nz, int ny, int nx, float papyrus_thresh);
+
 /* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);

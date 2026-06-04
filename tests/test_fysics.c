@@ -206,6 +206,19 @@ static void test_fsc(void){
     free(s);free(b);free(fr);free(fc);
 }
 
+
+static void test_zdrift(void){
+    int nz=80,ny=24,nx=24,n=nz*ny*nx;
+    float*v=malloc(4*n);
+    for(int z=0;z<nz;z++){float d=1.0f-0.13f*z/(nz-1);
+        for(int i=0;i<ny*nx;i++) v[(size_t)z*ny*nx+i]=0.6f*d;}
+    fy_correct_zdrift(v,nz,ny,nx,0.1f);
+    double m0=0,mN=0; for(int i=0;i<ny*nx;i++){m0+=v[i];mN+=v[(size_t)(nz-1)*ny*nx+i];}
+    m0/=ny*nx; mN/=ny*nx;
+    CHECK(fabs(m0-mN)/m0 < 0.03,"z-drift removed (slice0 ~ sliceN after)");
+    free(v);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -218,6 +231,7 @@ int main(void) {
     test_streaming_global();
     test_gureyev_deconv();
     test_fsc();
+    test_zdrift();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
