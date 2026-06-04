@@ -1,0 +1,62 @@
+/* fysics.h -- fast CPU physics kernels for Vesuvius scroll volumes.
+ *
+ * Pure C (no SIMD intrinsics; auto-vectorizable), CPU-only, dependency-free.
+ * Inverts the known ESRF/nabu reconstruction operators (Paganin phase-retrieval
+ * low-pass + unsharp) to sharpen reconstructed volumes -- a physics deblur usable
+ * as viewer post-processing (e.g. vc3d) or batch preprocessing.
+ *
+ * The transfer function matches nabu exactly (nabu/preproc/phase.py):
+ *     T(f) = 1 / (1 + delta_beta * lambda * D * pi * f^2),   f in cycles/micron,
+ *     lambda = 1.23984199e-3 / energy_keV  (micron),  D = distance (micron).
+ * Unsharp (gaussian): out = (1+coeff)*img - coeff*blur(img).
+ */
+#ifndef FYSICS_H
+#define FYSICS_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ---- acquisition / reconstruction physics (from a volume's metadata) ---- */
+typedef struct {
+    double delta_beta;        /* Paganin delta/beta ratio (e.g. 1000) */
+    double energy_kev;        /* beam energy (keV) */
+    double distance_mm;       /* sample-detector distance (mm) */
+    double pixel_um;          /* sample pixel size (micron/voxel) */
+    double unsharp_sigma;     /* unsharp gaussian sigma (voxels); 0 disables */
+    double unsharp_coeff;     /* unsharp coefficient; 0 disables */
+} fy_physics;
+
+/* ---- FFT (powers of two) ---- */
+int  fy_is_pow2(int n);
+int  fy_next_pow2(int n);
+void fy_fft1d(float *re, float *im, int n, int sign);          /* sign -1 fwd, +1 inv */
+void fy_fft3d(float *re, float *im, int nz, int ny, int nx, int sign);
+void fy_fft3d_normalize(float *re, float *im, int nz, int ny, int nx);
+
+/* ---- transfer functions (evaluate H at a given radial freq in cycles/voxel) ---- */
+double fy_paganin_transfer(double f_cyc_per_voxel, const fy_physics *p);
+double fy_unsharp_transfer(double f_cyc_per_voxel, const fy_physics *p);
+double fy_recon_transfer(double f_cyc_per_voxel, const fy_physics *p); /* paganin*unsharp */
+
+/* ---- main kernel: Wiener deconvolution of the recon transfer ----
+ * Sharpens `vol` (nz*ny*nx, row-major, x fastest) in place-or-out.
+ *   in:  pointer to input volume (float, any range)
+ *   out: pointer to output (may equal in); same shape
+ *   reg: Wiener regularization (sharpening strength; lower = sharper + noisier)
+ * Dimensions are zero-padded internally to powers of two (reflect padding) so
+ * arbitrary sizes work. Returns 0 on success, nonzero on allocation failure.
+ */
+int fy_deconvolve(const float *in, float *out,
+                  int nz, int ny, int nx,
+                  const fy_physics *p, double reg);
+
+/* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
+ * Process a viewed region plus this margin, then keep only the inner region. */
+int fy_kernel_halo(const fy_physics *p);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FYSICS_H */
