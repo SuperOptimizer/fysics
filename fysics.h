@@ -83,6 +83,16 @@ int fy_deconvolve_masked(const float *in, float *out, int nz, int ny, int nx,
                          const fy_physics *p, double reg,
                          float intensity_thresh, float var_thresh);
 
+
+/* ---- contrast enhancement: GLCAE (Global+Local Contrast Adaptive Enhancement) ----
+ * Grayscale adaptation of Tian & Cohen ICCV-W 2017. Handles non-uniform
+ * illumination: an adaptive GLOBAL histogram blend (auto lambda) + LOCAL CLAHE,
+ * fused by local-contrast x brightness. Input/output normalized [0,1] per slice. */
+int fy_glcae2d(const float *in, float *out, int ny, int nx,
+               int clahe_tiles, float clahe_clip);
+int fy_clahe2d(const float *in, float *out, int ny, int nx,
+               int tiles_y, int tiles_x, int nbins, float clip_limit);
+
 /* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);
