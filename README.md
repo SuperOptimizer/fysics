@@ -79,6 +79,43 @@ fy_deconvolve(region_in, region_out, dz, dy, dx, &p, reg);
 /* keep the inner [halo..dz-halo] etc. for display */
 ```
 
+## Whole-volume processing at 20TB+ (streaming)
+
+Real scroll volumes are **20+ TB of dense u8** — they never fit in RAM. fysics is
+built for this: it does the per-chunk **math**, and the **caller owns chunk
+iteration + I/O** (use your existing fast zarr reader). Operators split two ways:
+
+**LOCAL ops** (deconv, denoise, mask) — each output voxel depends only on a small
+neighborhood, so process one chunk **+ a halo** independently (embarrassingly
+parallel). Halo = `fy_kernel_halo()` (~15 vox).
+
+**GLOBAL ops** (normalization, GLCAE global stage) — need whole-volume statistics,
+so they are **two-pass streaming**:
+
+```c
+/* PASS 1: accumulate a tiny 256-bin histogram over every chunk */
+fy_hist_state st; fy_hist_init(&st);
+for (each chunk)            /* your I/O loop */
+    fy_hist_accumulate_u8(&st, chunk_u8, chunk_n);
+/* (parallel? accumulate per-thread, then fy_hist_merge) */
+
+/* FINALIZE: compute the mapping ONCE from the global histogram */
+int glcae_map[256];  fy_glcae_global_finalize(&st, glcae_map);
+unsigned char lo, hi; fy_norm_finalize(&st, 0.5, 99.5, &lo, &hi);
+
+/* PASS 2: apply the SAME mapping to every chunk -> consistent everywhere */
+for (each chunk) {
+    fy_norm_apply_u8(chunk_u8, tmpf, chunk_n, lo, hi);      /* global normalize */
+    fy_glcae_global_apply_u8(chunk_u8, outf, chunk_n, glcae_map);  /* global GLCAE */
+    /* + local ops on chunk+halo: fy_deconvolve, fy_bilateral_denoise, ... */
+    fy_float_to_u8(outf, out_u8, chunk_n);                  /* write back u8 */
+}
+```
+
+The global state is a 256-long histogram (a few KB) — **20TB never sits in RAM**,
+and a per-slice operation never sees inconsistent global stats. Verified: chunked
+two-pass GLCAE == whole-volume processing, **bit-identical**.
+
 ## Build (CMake)
 
 ```bash
