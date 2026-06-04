@@ -167,10 +167,16 @@ static double gureyev_transfer(double fr, const fy_physics *p, double gamma) {
     double b_reduced = b_vox - c_psf;
     if (b_reduced < 0) b_reduced = 0;
     double f2 = fr * fr;
-    double paganin_inv = 1.0 + b_reduced * f2;           /* high-freq boost */
+    /* The reduced-Paganin inverse (1+b'k^2) is UNBOUNDED at high f. For very large
+     * delta_beta (e.g. 1000) it over-amplifies into noise. Bound it the same way
+     * Wiener does: write the Paganin LOW-PASS H_p=1/(1+b'k^2) and invert it with
+     * Tikhonov, H_p/(H_p^2+gamma_p), so the boost self-limits near the noise floor.
+     * Then multiply by the Tikhonov PSF deconvolution. */
+    double Hp = 1.0 / (1.0 + b_reduced * f2);            /* Paganin low-pass */
+    double paganin_deconv = Hp / (Hp * Hp + gamma);      /* bounded inverse */
     double G = exp(-2.0 * M_PI * M_PI * sigma * sigma * f2); /* PSF transfer */
-    double psf_deconv = G / (G * G + gamma);              /* Tikhonov inverse */
-    return paganin_inv * psf_deconv;
+    double psf_deconv = G / (G * G + gamma);             /* Tikhonov PSF inverse */
+    return paganin_deconv * psf_deconv;
 }
 
 int fy_deconvolve_gureyev(const float *in, float *out,
