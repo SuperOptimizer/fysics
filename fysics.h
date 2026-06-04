@@ -69,6 +69,20 @@ int fy_bilateral_denoise(const float *in, float *out, int nz, int ny, int nx,
 int fy_remove_rings(const float *in, float *out, int nz, int ny, int nx,
                     double center_x, double center_y, double strength, int smooth_win);
 
+
+/* ---- papyrus/air masking (kills "air noise" -- deconv of empty gaps) ----
+ * Papyrus is bright+textured, air is dark+flat. Build a soft mask and keep the
+ * sharpening only on papyrus; air stays as the smooth original (or a constant). */
+int fy_papyrus_mask(const float *in, float *mask, int nz, int ny, int nx,
+                    float intensity_lo, float intensity_hi,
+                    float var_lo, float var_hi, int radius);
+int fy_apply_mask(const float *processed, const float *original, const float *mask,
+                  float *out, int nz, int ny, int nx, float air_fill);
+/* one-call sharpen-without-air-noise: deconv, keep only on papyrus */
+int fy_deconvolve_masked(const float *in, float *out, int nz, int ny, int nx,
+                         const fy_physics *p, double reg,
+                         float intensity_thresh, float var_thresh);
+
 /* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);
