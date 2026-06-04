@@ -28,7 +28,7 @@
 fy_recipe fy_recipe_default(void) {
     fy_recipe r;
     r.deconv_reg = 0.015;          /* punchy -- recover resolution */
-    r.air_thresh = 0.25f;          /* mask air (histogram-valley threshold) */
+    r.air_thresh = 0.15f;          /* mask air (lower = keep more dim papyrus) */
     r.air_fill = 0.0f;             /* ZERO out the air (black gaps), before contrast */
     r.denoise_bilateral = 0.05;    /* light guided denoise (eps), tames deconv noise */
     r.do_musica = 1;               /* MUSICA contrast ON, gentle (see musica_p) */
