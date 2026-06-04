@@ -18,7 +18,12 @@ double fy_paganin_transfer(double f_cyc_per_voxel, const fy_physics *p) {
     /* exact nabu form: 1/(1 + db*L*D*pi*f^2), f in cycles/micron */
     double L = FY_HC_KEV_UM / p->energy_kev;     /* micron */
     double D = p->distance_mm * 1000.0;           /* micron */
-    double f_um = f_cyc_per_voxel / p->pixel_um;  /* cycles/voxel -> cycles/micron */
+    /* pixel_um MUST be microns (e.g. 2.4). Guard against the common mistake of
+     * passing the metadata's millimeter value (e.g. 0.0024): a sub-0.1 "micron"
+     * pixel is physically a mm value, so auto-correct to keep callers safe. */
+    double px = p->pixel_um;
+    if (px > 0.0 && px < 0.1) px *= 1000.0;        /* mm -> micron */
+    double f_um = f_cyc_per_voxel / px;            /* cycles/voxel -> cycles/micron */
     double f2 = f_um * f_um;
     return 1.0 / (1.0 + p->delta_beta * L * D * M_PI * f2);
 }
