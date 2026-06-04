@@ -61,6 +61,14 @@ int fy_nlm_denoise(const float *in, float *out, int nz, int ny, int nx,
 int fy_bilateral_denoise(const float *in, float *out, int nz, int ny, int nx,
                          double sigma_spatial, double sigma_range, int radius);
 
+
+/* ---- ring-artifact removal (heuristic, not a physics inverse) ----
+ * Concentric ring artifacts from detector defects. Removed via radial-profile
+ * high-pass in polar coords. center<0 -> slice center. strength in [0,1],
+ * smooth_win = radial high-pass window (e.g. 30; larger -> only sharper rings). */
+int fy_remove_rings(const float *in, float *out, int nz, int ny, int nx,
+                    double center_x, double center_y, double strength, int smooth_win);
+
 /* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);
