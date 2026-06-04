@@ -30,7 +30,9 @@ fy_recipe fy_recipe_default(void) {
     r.deconv_reg = 0.015;          /* punchy -- recover resolution */
     r.air_thresh = 0.25f;          /* mask air (histogram-valley threshold) */
     r.denoise_bilateral = 0.05;    /* light guided denoise (eps), tames deconv noise */
-    r.do_glcae = 0;                /* contrast enhancement off by default */
+    r.do_musica = 0;               /* MUSICA contrast off by default (on-switch) */
+    r.musica_p = 0.8f;
+    r.do_glcae = 0;                /* legacy GLCAE off; prefer MUSICA */
     r.glcae_clip = 2.0f;
     return r;
 }
@@ -75,13 +77,16 @@ int fy_process(const float *in, float *out, int nz, int ny, int nx,
         cur = out;
     }
 
-    /* 5. optional GLCAE contrast, per XY slice */
-    if (r->do_glcae) {
-        for (int z = 0; z < nz; z++) {
-            const float *sin = cur + (size_t)z * ny * nx;
-            float *sout = buf + (size_t)z * ny * nx;
-            fy_glcae2d(sin, sout, ny, nx, 8, r->glcae_clip);
-        }
+    /* 5. optional contrast enhancement, per XY slice. MUSICA preferred (multiscale,
+     * no tile/halo artifacts, better for faint detail); GLCAE legacy fallback. */
+    if (r->do_musica) {
+        float pexp = r->musica_p > 0 ? r->musica_p : 0.8f;
+        for (int z = 0; z < nz; z++)
+            fy_musica2d(cur + (size_t)z*ny*nx, buf + (size_t)z*ny*nx, ny, nx, 4, pexp, 0.0f);
+        memcpy(out, buf, sizeof(float) * n);
+    } else if (r->do_glcae) {
+        for (int z = 0; z < nz; z++)
+            fy_glcae2d(cur + (size_t)z*ny*nx, buf + (size_t)z*ny*nx, ny, nx, 8, r->glcae_clip);
         memcpy(out, buf, sizeof(float) * n);
     }
 

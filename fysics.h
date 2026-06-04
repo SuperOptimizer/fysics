@@ -78,9 +78,11 @@ void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
 typedef struct {
     double deconv_reg;       /* Wiener strength (0.02-0.03 good; <=0 skips deconv) */
     float  air_thresh;       /* papyrus/air intensity threshold (0=skip masking) */
-    double denoise_bilateral;/* bilateral sigma_range (<=0 skips; 0.08-0.2) */
-    int    do_glcae;         /* 1 -> GLCAE contrast (per XY slice) */
+    double denoise_bilateral;/* guided-denoise eps (<=0 skips; 0.05 light) */
+    int    do_glcae;         /* 1 -> GLCAE contrast (legacy; prefer MUSICA) */
     float  glcae_clip;       /* CLAHE clip limit for GLCAE (default 2.0) */
+    int    do_musica;        /* 1 -> MUSICA multiscale contrast (preferred) */
+    float  musica_p;         /* MUSICA gain exponent (<1 boosts faint; ~0.8) */
 } fy_recipe;
 
 fy_recipe fy_recipe_default(void);     /* the one good pipeline (punchy; glcae off) */
