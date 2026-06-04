@@ -19,40 +19,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ONE pipeline. Punchy default: aggressive deconv to recover resolution, air mask
+ * to keep gaps clean, light guided denoise to tame the deconv noise. GLCAE contrast
+ * is OFF by default (it's the most opinionated step and may fight downstream model
+ * normalization) -- flip do_glcae=1 to add it for human viewing. We deliberately do
+ * NOT pre-split into task "grades" yet; settle one good pipeline first, specialize
+ * later only if ablation shows it's needed. */
 fy_recipe fy_recipe_default(void) {
     fy_recipe r;
-    r.deconv_reg = 0.02; r.air_thresh = 0.25f; r.denoise_bilateral = 0.0;
-    r.do_glcae = 1; r.glcae_clip = 2.0f;
-    return r;
-}
-
-fy_recipe fy_recipe_ink(void) {
-    /* INK-GRADE: ink is a subtle, near-threshold signal (carbon-on-carbon has low
-     * attenuation contrast), so we bias toward PRESERVING fine high-frequency
-     * detail rather than smoothing it away -- deconv to recover resolution, no
-     * heavy denoise, no aggressive contrast stretch (let the downstream ink model
-     * do its own per-fragment normalization). Denoise is left OFF by default but
-     * the field is available if ablation shows it helps.
-     *
-     * NOTE: the precise ink-grade recipe for BM18/ESRF data is UNVALIDATED -- the
-     * "crackle morphology" guidance comes from earlier non-BM18 (Diamond/2023)
-     * scans, and there is no published controlled ablation of denoise/contrast vs
-     * ink-model F0.5 on BM18 volumes. Treat these as sensible defaults to be tuned
-     * empirically against labeled BM18 ink data, not as hard rules. */
-    fy_recipe r;
-    r.deconv_reg = 0.02;            /* recover resolution */
-    r.air_thresh = 0.25f;          /* mask air (cleaning gaps shouldn't hurt ink) */
-    r.denoise_bilateral = 0.0;     /* off by default -- ablate before enabling */
-    r.do_glcae = 0;                /* no contrast stretch -- model normalizes itself */
-    r.glcae_clip = 0.0f;
-    return r;
-}
-
-fy_recipe fy_recipe_segment(void) {
-    /* clean + sharp boundaries, denoise on, no contrast stretch */
-    fy_recipe r;
-    r.deconv_reg = 0.025; r.air_thresh = 0.25f; r.denoise_bilateral = 0.12;
-    r.do_glcae = 0; r.glcae_clip = 2.0f;
+    r.deconv_reg = 0.015;          /* punchy -- recover resolution */
+    r.air_thresh = 0.25f;          /* mask air (histogram-valley threshold) */
+    r.denoise_bilateral = 0.05;    /* light guided denoise (eps), tames deconv noise */
+    r.do_glcae = 0;                /* contrast enhancement off by default */
+    r.glcae_clip = 2.0f;
     return r;
 }
 

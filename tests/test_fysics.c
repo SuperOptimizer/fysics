@@ -145,10 +145,8 @@ static void test_process_recipe(void){
     CHECK(rc==0,"fy_process default runs");
     int finite=1; for(int i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
     CHECK(finite,"fy_process output finite");
-    // profiles
-    fy_recipe ink=fy_recipe_ink(), seg=fy_recipe_segment();
-    CHECK(ink.do_glcae==0 && seg.do_glcae==0,"ink-grade does NOT GLCAE (preserves crackle)");
-    CHECK(seg.denoise_bilateral>0 && ink.denoise_bilateral==0,"ink keeps texture (no denoise), seg denoises");
+    fy_recipe d=fy_recipe_default();
+    CHECK(d.deconv_reg>0 && d.air_thresh>0,"default recipe sharpens + masks");
     free(in);free(out);
 }
 

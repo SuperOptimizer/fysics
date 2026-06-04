@@ -81,9 +81,7 @@ typedef struct {
     float  glcae_clip;       /* CLAHE clip limit for GLCAE (default 2.0) */
 } fy_recipe;
 
-fy_recipe fy_recipe_default(void);     /* sensible defaults */
-fy_recipe fy_recipe_ink(void);         /* contrast + keep texture (ink detection) */
-fy_recipe fy_recipe_segment(void);     /* clean + sharp boundaries (segmentation) */
+fy_recipe fy_recipe_default(void);     /* the one good pipeline (punchy; glcae off) */
 
 int fy_process(const float *in, float *out, int nz, int ny, int nx,
                const fy_physics *p, const fy_recipe *r);
