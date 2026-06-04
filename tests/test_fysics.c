@@ -131,6 +131,27 @@ static void test_bilateral_denoises(void){
     free(clean);free(noisy);free(out);
 }
 
+
+static void test_process_recipe(void){
+    fy_physics p={1000,78,220,2.4,1.2,4.0};
+    int nz=16,ny=64,nx=64,n=nz*ny*nx;
+    float*in=malloc(4*n),*out=malloc(4*n);
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        double v=(y%20<10)?0.6+0.1*sin(x*0.5):0.05; // sheets + air
+        in[(z*ny+y)*nx+x]=(float)v;
+    }
+    fy_recipe r=fy_recipe_default();
+    int rc=fy_process(in,out,nz,ny,nx,&p,&r);
+    CHECK(rc==0,"fy_process default runs");
+    int finite=1; for(int i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
+    CHECK(finite,"fy_process output finite");
+    // profiles
+    fy_recipe ink=fy_recipe_ink(), seg=fy_recipe_segment();
+    CHECK(ink.do_glcae==1 && seg.do_glcae==0,"ink/segment profiles differ (glcae)");
+    CHECK(seg.denoise_bilateral>0 && ink.denoise_bilateral==0,"ink keeps texture, seg denoises");
+    free(in);free(out);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -139,6 +160,7 @@ int main(void) {
     test_halo_reasonable();
     test_nlm_denoises();
     test_bilateral_denoises();
+    test_process_recipe();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

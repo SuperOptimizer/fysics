@@ -34,6 +34,27 @@ void fy_fft1d(float *re, float *im, int n, int sign);          /* sign -1 fwd, +
 void fy_fft3d(float *re, float *im, int nz, int ny, int nx, int sign);
 void fy_fft3d_normalize(float *re, float *im, int nz, int ny, int nx);
 
+/* ---- one-call recipe: the validated processing chain ----
+ * mask air (on the raw, clean valley) -> deconvolve -> re-mask (keep air clean)
+ * -> optional denoise -> optional GLCAE contrast. This is the "do the good thing"
+ * entry point for importers (e.g. vc3d). Toggle stages via the params; 0/<=0
+ * disables a stage. Operates on a tile (with halo for deconv correctness).
+ */
+typedef struct {
+    double deconv_reg;       /* Wiener strength (0.02-0.03 good; <=0 skips deconv) */
+    float  air_thresh;       /* papyrus/air intensity threshold (0=skip masking) */
+    double denoise_bilateral;/* bilateral sigma_range (<=0 skips; 0.08-0.2) */
+    int    do_glcae;         /* 1 -> GLCAE contrast (per XY slice) */
+    float  glcae_clip;       /* CLAHE clip limit for GLCAE (default 2.0) */
+} fy_recipe;
+
+fy_recipe fy_recipe_default(void);     /* sensible defaults */
+fy_recipe fy_recipe_ink(void);         /* contrast + keep texture (ink detection) */
+fy_recipe fy_recipe_segment(void);     /* clean + sharp boundaries (segmentation) */
+
+int fy_process(const float *in, float *out, int nz, int ny, int nx,
+               const fy_physics *p, const fy_recipe *r);
+
 /* ---- transfer functions (evaluate H at a given radial freq in cycles/voxel) ---- */
 double fy_paganin_transfer(double f_cyc_per_voxel, const fy_physics *p);
 double fy_unsharp_transfer(double f_cyc_per_voxel, const fy_physics *p);
