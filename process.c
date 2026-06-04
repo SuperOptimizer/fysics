@@ -27,19 +27,23 @@ fy_recipe fy_recipe_default(void) {
 }
 
 fy_recipe fy_recipe_ink(void) {
-    /* INK-GRADE: the ink signal is a NEAR-NOISE-FLOOR high-frequency "crackle"
-     * surface texture (NOT density). Denoising, aggressive contrast, and over-
-     * smoothing all ERASE it. So ink-grade is MINIMAL processing: ring removal is
-     * safe (rings are coherent, separable from crackle, and cause false positives),
-     * but NO denoise and NO GLCAE/contrast stretch -- those silently destroy ink.
-     * Gentle deconv only (un-blur the Paganin), preserving micro-texture.
-     * Validate any change against ink-model F0.5 on a labeled fragment, not by eye.
-     * (Research: Handmer 2023; scrollprize.org/grandprize; arXiv 2603.27698.) */
+    /* INK-GRADE: ink is a subtle, near-threshold signal (carbon-on-carbon has low
+     * attenuation contrast), so we bias toward PRESERVING fine high-frequency
+     * detail rather than smoothing it away -- deconv to recover resolution, no
+     * heavy denoise, no aggressive contrast stretch (let the downstream ink model
+     * do its own per-fragment normalization). Denoise is left OFF by default but
+     * the field is available if ablation shows it helps.
+     *
+     * NOTE: the precise ink-grade recipe for BM18/ESRF data is UNVALIDATED -- the
+     * "crackle morphology" guidance comes from earlier non-BM18 (Diamond/2023)
+     * scans, and there is no published controlled ablation of denoise/contrast vs
+     * ink-model F0.5 on BM18 volumes. Treat these as sensible defaults to be tuned
+     * empirically against labeled BM18 ink data, not as hard rules. */
     fy_recipe r;
-    r.deconv_reg = 0.03;            /* gentle (higher reg = less noise amplification) */
-    r.air_thresh = 0.0f;           /* don't even mask -- keep everything for the model */
-    r.denoise_bilateral = 0.0;     /* NEVER denoise ink-grade */
-    r.do_glcae = 0;                /* NO contrast stretch -- let the ink model normalize */
+    r.deconv_reg = 0.02;            /* recover resolution */
+    r.air_thresh = 0.25f;          /* mask air (cleaning gaps shouldn't hurt ink) */
+    r.denoise_bilateral = 0.0;     /* off by default -- ablate before enabling */
+    r.do_glcae = 0;                /* no contrast stretch -- model normalizes itself */
     r.glcae_clip = 0.0f;
     return r;
 }
