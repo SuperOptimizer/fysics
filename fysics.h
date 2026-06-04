@@ -114,6 +114,11 @@ int fy_nlm_denoise(const float *in, float *out, int nz, int ny, int nx,
                    double h, int search_radius, int patch_radius);
 int fy_bilateral_denoise(const float *in, float *out, int nz, int ny, int nx,
                          double sigma_spatial, double sigma_range, int radius);
+/* Guided filter: O(N) edge-preserving denoise (box-filter based, ~100x faster than
+ * bilateral, no gradient reversal). eps = range (smaller preserves more texture),
+ * radius r. The recommended FAST default for streaming large volumes. */
+int fy_guided_denoise(const float *in, float *out, int nz, int ny, int nx,
+                      int radius, double eps);
 
 
 /* ---- ring-artifact removal (heuristic, not a physics inverse) ----

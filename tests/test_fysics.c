@@ -147,8 +147,8 @@ static void test_process_recipe(void){
     CHECK(finite,"fy_process output finite");
     // profiles
     fy_recipe ink=fy_recipe_ink(), seg=fy_recipe_segment();
-    CHECK(ink.do_glcae==1 && seg.do_glcae==0,"ink/segment profiles differ (glcae)");
-    CHECK(seg.denoise_bilateral>0 && ink.denoise_bilateral==0,"ink keeps texture, seg denoises");
+    CHECK(ink.do_glcae==0 && seg.do_glcae==0,"ink-grade does NOT GLCAE (preserves crackle)");
+    CHECK(seg.denoise_bilateral>0 && ink.denoise_bilateral==0,"ink keeps texture (no denoise), seg denoises");
     free(in);free(out);
 }
 
