@@ -219,6 +219,18 @@ static void test_zdrift(void){
     free(v);
 }
 
+
+static void test_auto_thresh(void){
+    fy_hist_state s; fy_hist_init(&s);
+    for(int i=0;i<256;i++){
+        long air=(long)(100000*exp(-(i-25.0)*(i-25.0)/200.0));
+        long pap=(long)(120000*exp(-(i-160.0)*(i-160.0)/2000.0));
+        s.hist[i]=air+pap; s.total+=air+pap;
+    }
+    float th=fy_auto_air_thresh(&s);
+    CHECK(th>0.1f && th<0.5f,"Otsu auto air-threshold lands in the valley");
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -232,6 +244,7 @@ int main(void) {
     test_gureyev_deconv();
     test_fsc();
     test_zdrift();
+    test_auto_thresh();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

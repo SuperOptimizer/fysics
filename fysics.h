@@ -66,6 +66,9 @@ void fy_norm_apply_u8(const unsigned char *in, float *out, size_t n,
 /* global GLCAE stage: compute the lambda-blended mapping once from the global
  * histogram, then apply the 256-entry lookup per chunk in pass 2. */
 void fy_glcae_global_finalize(const fy_hist_state *s, int *mapping_out /*[256]*/);
+/* auto air/papyrus threshold (Otsu) from the volume's histogram -- per-volume,
+ * not a hardcoded constant. Returns a [0,1] fraction for fy_recipe.air_thresh. */
+float fy_auto_air_thresh(const fy_hist_state *s);
 void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
                               const int *mapping);
 

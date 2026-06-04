@@ -98,3 +98,30 @@ void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
     float inv = 1.0f / (float)(L - 1);
     for (size_t i = 0; i < n; i++) out[i] = mapping[in[i]] * inv;
 }
+
+/* ---- auto air/papyrus threshold (Otsu) from the global histogram ----
+ * Replaces a hardcoded threshold: finds the intensity that best separates the two
+ * modes (air vs papyrus) by maximizing between-class variance (Otsu's method) over
+ * the volume's actual histogram. Returns the threshold as a [0,1] fraction (u8/255),
+ * matching the air_thresh convention. */
+float fy_auto_air_thresh(const fy_hist_state *s) {
+    long total = s->total;
+    if (total <= 0) return 0.15f;
+    /* total intensity */
+    double sumAll = 0;
+    for (int i = 0; i < 256; i++) sumAll += (double)i * s->hist[i];
+    double wB = 0, sumB = 0, maxVar = -1;
+    int best = 38; /* ~0.15*255 fallback */
+    for (int t = 0; t < 256; t++) {
+        wB += s->hist[t];
+        if (wB == 0) continue;
+        double wF = total - wB;
+        if (wF == 0) break;
+        sumB += (double)t * s->hist[t];
+        double mB = sumB / wB;
+        double mF = (sumAll - sumB) / wF;
+        double var = wB * wF * (mB - mF) * (mB - mF);
+        if (var > maxVar) { maxVar = var; best = t; }
+    }
+    return (float)best / 255.0f;
+}
