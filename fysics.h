@@ -13,6 +13,8 @@
 #ifndef FYSICS_H
 #define FYSICS_H
 
+#include <stddef.h>   /* size_t */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -33,6 +35,37 @@ int  fy_next_pow2(int n);
 void fy_fft1d(float *re, float *im, int n, int sign);          /* sign -1 fwd, +1 inv */
 void fy_fft3d(float *re, float *im, int nz, int ny, int nx, int sign);
 void fy_fft3d_normalize(float *re, float *im, int nz, int ny, int nx);
+
+/* ======================================================================
+ * STREAMING for WHOLE-VOLUME processing at 20TB+ (dense u8).
+ * fysics does the per-chunk MATH; the CALLER owns chunk iteration + I/O.
+ *   LOCAL ops (deconv/denoise/mask): process one chunk (+halo) independently.
+ *   GLOBAL ops (normalize/GLCAE-global): TWO-PASS --
+ *     pass1: fy_hist_accumulate_u8() over all chunks (tiny RAM)
+ *     finalize: compute the mapping ONCE from the global histogram
+ *     pass2: fy_*_apply_u8() per chunk with that mapping.
+ * ====================================================================== */
+typedef struct { long hist[256]; long total; } fy_hist_state;
+
+void fy_u8_to_float(const unsigned char *in, float *out, size_t n);
+void fy_float_to_u8(const float *in, unsigned char *out, size_t n);
+
+void fy_hist_init(fy_hist_state *s);
+void fy_hist_accumulate_u8(fy_hist_state *s, const unsigned char *chunk, size_t n);
+void fy_hist_merge(fy_hist_state *dst, const fy_hist_state *src);  /* parallel accum */
+int  fy_hist_percentile_u8(const fy_hist_state *s, double pct);
+
+/* global normalization (consistent intensity across the whole volume) */
+void fy_norm_finalize(const fy_hist_state *s, double lo_pct, double hi_pct,
+                      unsigned char *lo_out, unsigned char *hi_out);
+void fy_norm_apply_u8(const unsigned char *in, float *out, size_t n,
+                      unsigned char lo, unsigned char hi);
+
+/* global GLCAE stage: compute the lambda-blended mapping once from the global
+ * histogram, then apply the 256-entry lookup per chunk in pass 2. */
+void fy_glcae_global_finalize(const fy_hist_state *s, int *mapping_out /*[256]*/);
+void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
+                              const int *mapping);
 
 /* ---- one-call recipe: the validated processing chain ----
  * mask air (on the raw, clean valley) -> deconvolve -> re-mask (keep air clean)

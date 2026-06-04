@@ -152,6 +152,24 @@ static void test_process_recipe(void){
     free(in);free(out);
 }
 
+
+static void test_streaming_global(void){
+    /* chunked two-pass GLCAE-global == whole-volume (the 20TB design) */
+    int n=8*32*32; unsigned char*vol=malloc(n);
+    for(int i=0;i<n;i++) vol[i]=(unsigned char)((i*7)%256);
+    fy_hist_state st; fy_hist_init(&st);
+    for(int z=0;z<8;z+=2) fy_hist_accumulate_u8(&st, vol+z*32*32, 2*32*32);
+    int mp[256]; fy_glcae_global_finalize(&st,mp);
+    float*oc=malloc(4*n);
+    for(int z=0;z<8;z+=2) fy_glcae_global_apply_u8(vol+z*32*32, oc+z*32*32, 2*32*32, mp);
+    fy_hist_state s2; fy_hist_init(&s2); fy_hist_accumulate_u8(&s2,vol,n);
+    int mp2[256]; fy_glcae_global_finalize(&s2,mp2);
+    float*ow=malloc(4*n); fy_glcae_global_apply_u8(vol,ow,n,mp2);
+    double md=0; for(int i=0;i<n;i++){double d=fabs(oc[i]-ow[i]);if(d>md)md=d;}
+    CHECK(md<1e-6,"streaming GLCAE-global == whole-volume (chunked correctness)");
+    free(vol);free(oc);free(ow);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -161,6 +179,7 @@ int main(void) {
     test_nlm_denoises();
     test_bilateral_denoises();
     test_process_recipe();
+    test_streaming_global();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

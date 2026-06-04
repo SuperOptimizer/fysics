@@ -56,21 +56,39 @@ static double optimize_lambda(const double *h_i, const double *h_u) {
     return 0.5 * (a + b);
 }
 
-/* build the global mapping CDF from the lambda-blended histogram */
+/* GLCAE global mapping from a normalized histogram h_i (sums to 1). Shared by the
+ * per-slice path and the whole-volume streaming path. */
+static void glcae_mapping_from_normhist(const double *h_i, int *t_out) {
+    double h_u[L];
+    for (int i = 0; i < L; i++) h_u[i] = 1.0 / L;
+    double lam = optimize_lambda(h_i, h_u);
+    double h_tilde[L], cum = 0;
+    for (int i = 0; i < L; i++)
+        h_tilde[i] = (1.0 / (1.0 + lam)) * h_i[i] + (lam / (1.0 + lam)) * h_u[i];
+    for (int i = 0; i < L; i++) { cum += h_tilde[i]; int v = (int)ceil((L - 1) * cum + 0.5); t_out[i] = v < 0 ? 0 : (v > L - 1 ? L - 1 : v); }
+}
+
+/* build the global mapping CDF from a normalized [0,1] image (per-slice path) */
 static void global_mapping(const float *img01, size_t n, int *t_out) {
-    double h_i[L], h_u[L];
-    for (int i = 0; i < L; i++) { h_i[i] = 0; h_u[i] = 1.0 / L; }
+    double h_i[L];
+    for (int i = 0; i < L; i++) h_i[i] = 0;
     for (size_t k = 0; k < n; k++) {
         int b = (int)(img01[k] * (L - 1) + 0.5f);
         if (b < 0) b = 0; if (b >= L) b = L - 1;
         h_i[b] += 1.0;
     }
     for (int i = 0; i < L; i++) h_i[i] /= (double)n;
-    double lam = optimize_lambda(h_i, h_u);
-    double h_tilde[L], cum = 0;
-    for (int i = 0; i < L; i++)
-        h_tilde[i] = (1.0 / (1.0 + lam)) * h_i[i] + (lam / (1.0 + lam)) * h_u[i];
-    for (int i = 0; i < L; i++) { cum += h_tilde[i]; int v = (int)ceil((L - 1) * cum + 0.5); t_out[i] = v < 0 ? 0 : (v > L - 1 ? L - 1 : v); }
+    glcae_mapping_from_normhist(h_i, t_out);
+}
+
+/* WHOLE-VOLUME streaming entry: build the GLCAE global mapping from an integer
+ * histogram (256 bins) accumulated over the entire volume. Called once in the
+ * two-pass streaming pipeline (stream.c). */
+void fy_global_glcae_mapping_from_hist(const long *hist, long total, int *t_out) {
+    double h_i[L];
+    double inv = total > 0 ? 1.0 / (double)total : 0.0;
+    for (int i = 0; i < L; i++) h_i[i] = hist[i] * inv;
+    glcae_mapping_from_normhist(h_i, t_out);
 }
 
 /* fusion weight: local contrast (|Laplacian|) x brightness gaussian around mid */
