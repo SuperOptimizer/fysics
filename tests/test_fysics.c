@@ -231,6 +231,28 @@ static void test_auto_thresh(void){
     CHECK(th>0.1f && th<0.5f,"Otsu auto air-threshold lands in the valley");
 }
 
+static void test_sheetness(void){
+    int nz=32,ny=32,nx=32; size_t n=(size_t)nz*ny*nx;
+    float*in=malloc(4*n),*out=malloc(4*n);
+    /* thin bright sheet (single z-plane) on dark bg -> after blur, a plate */
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++)
+        in[((size_t)z*ny+y)*nx+x]=(z==16)?0.8f:0.05f;
+    fy_sheetness(in,out,nz,ny,nx,2.0,0.5,0.5,-1,1);
+    float on=out[((size_t)16*ny+16)*nx+16], off=out[((size_t)8*ny+16)*nx+16];
+    CHECK(on>0.5f && off<0.05f, "sheetness lights up plate, dark off it");
+    /* selectivity: a tube and a blob must score far lower than a sheet */
+    for(size_t i=0;i<n;i++)in[i]=0.05f;
+    for(int x=0;x<nx;x++) in[((size_t)16*ny+16)*nx+x]=0.8f;
+    fy_sheetness(in,out,nz,ny,nx,2.0,0.5,0.5,-1,1);
+    float tube=out[((size_t)16*ny+16)*nx+16];
+    for(size_t i=0;i<n;i++)in[i]=0.05f;
+    in[((size_t)16*ny+16)*nx+16]=0.8f;
+    fy_sheetness(in,out,nz,ny,nx,2.0,0.5,0.5,-1,1);
+    float blob=out[((size_t)16*ny+16)*nx+16];
+    CHECK(on>2.0f*tube && on>2.0f*blob, "sheetness selective (sheet >> tube,blob)");
+    free(in);free(out);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -245,6 +267,7 @@ int main(void) {
     test_fsc();
     test_zdrift();
     test_auto_thresh();
+    test_sheetness();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

@@ -205,6 +205,19 @@ void fy_zdrift_finalize(const double *sums, const long *counts, int nz, float *f
 void fy_zdrift_apply(float *chunk, int nz_slab, int ny, int nx, int z0, const float *factor);
 int  fy_correct_zdrift(float *vol, int nz, int ny, int nx, float papyrus_thresh);
 
+
+/* ---- sheetness filter (Frangi plate detector) -- for SEGMENTATION/UNWRAPPING ----
+ * Responds to plate/sheet-like geometry (papyrus sheets); helps separate adjacent
+ * sheets. NOT for ink (emphasizes geometry over faint ink texture). Output 0..1.
+ * TUNING: sigma must match sheet thickness in voxels (the key knob, ~2-4 at 2.4um);
+ * use multiscale for varying thickness. alpha,beta=0.5 defaults; c<=0 auto. bright=1
+ * for bright sheets on dark air. Local op -> streamable with halo ~3*sigma. */
+int fy_sheetness(const float *in, float *out, int nz, int ny, int nx,
+                 double sigma, double alpha, double beta, double c, int bright);
+int fy_sheetness_multiscale(const float *in, float *out, int nz, int ny, int nx,
+                            const double *sigmas, int ns, double alpha, double beta,
+                            double c, int bright);
+
 /* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);
