@@ -77,8 +77,11 @@ int fy_musica2d(const float *in, float *out, int ny, int nx,
         /* descend: coarser base becomes the next level's input */
         memcpy(cur, next, sizeof(float) * n);
     }
-    /* result = coarsest residual base (low-freq, untouched) + gained details */
+    /* result = coarsest residual base (low-freq, untouched) + gained details.
+     * ZERO-AWARE: pixels that were exactly 0 in the input (masked air) stay 0 --
+     * we never contrast-enhance the air, and the black gaps are preserved. */
     for (size_t i = 0; i < n; i++) {
+        if (in[i] == 0.0f) { out[i] = 0.0f; continue; }
         float v = cur[i] + acc[i];
         out[i] = v < 0 ? 0 : (v > 1 ? 1 : v);
     }
