@@ -274,6 +274,27 @@ static void test_estimate_noise(void){
     free(v); free(v2);
 }
 
+static void test_compact(void){
+    int nz=48,ny=48,nx=48; size_t n=(size_t)nz*ny*nx;
+    float *v=malloc(4*n), *out=malloc(4*n);
+    /* OVERSAMPLED volume: only low frequencies -> downsample 2x should be ~lossless */
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++)
+        v[((size_t)z*ny+y)*nx+x]=(float)(0.5+0.3*sin(x*0.15)*cos(y*0.13)*sin(z*0.12));
+    int oz,oy,ox;
+    int rc=fy_downsample(v,out,nz,ny,nx,2.0,&oz,&oy,&ox);
+    CHECK(rc==0 && oz==24 && oy==24 && ox==24, "downsample 2x gives half-size grid");
+    /* oversampled (smooth) volume -> recommends a shrink */
+    double f_smooth=fy_recommend_downsample(v,nz,ny,nx,0.03);
+    CHECK(f_smooth>1.0, "oversampled volume -> recommends downsample >1x");
+    /* HIGH-frequency volume (detail at Nyquist) -> NOT compactible */
+    float *hf=malloc(4*n);
+    unsigned s=77;
+    for(int i=0;i<(int)n;i++){ s=s*1103515245u+12345u; hf[i]=0.5f+0.4f*(((s>>16)&1)?1:-1); } /* checkerboard-ish */
+    double f_hf=fy_recommend_downsample(hf,nz,ny,nx,0.03);
+    CHECK(f_hf < f_smooth, "high-freq volume less compactible than smooth one");
+    free(v);free(out);free(hf);
+}
+
 static void test_gat_and_quality(void){
     /* GAT forward->inverse round-trips exactly */
     size_t n=1000; float *in=malloc(4*n),*t=malloc(4*n),*back=malloc(4*n);
@@ -721,6 +742,7 @@ int main(void) {
     test_sheetness();
     test_dewindow();
     test_estimate_noise();
+    test_compact();
     test_gat_and_quality();
     test_deltabeta_scale();
     test_warp_identity();

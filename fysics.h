@@ -434,6 +434,28 @@ int fy_register_full(const float *fixed, const float *moving,
                      float *ux, float *uy, float *uz,
                      int n_iters, double field_sigma, double step);
 
+/* ---- compaction: downsample OVERSAMPLED volumes (lossless of resolved detail) ----
+ * Measured: fine (~1.1um) scroll volumes are ~2x oversampled -- their resolved detail
+ * fits a coarser grid, so downsampling ~1.75-2x/axis loses ~nothing (8x fewer voxels,
+ * ~18TB saved on one 1.1um volume). Mid/coarse (>=2.4um) volumes are critically sampled
+ * -- do NOT compact them. ORDER MATTERS: if deblurring, deblur at FULL resolution FIRST,
+ * then downsample (downsampling discards the high-freq band the deblur restores --
+ * deblur-then-downsample keeps ~86% of restored contrast vs ~21% for downsample-raw).
+ *
+ * Anti-aliased downsample by an arbitrary factor (gaussian blur sigma~0.5*factor, then
+ * trilinear decimate). out size = ceil(dim/factor); pass back via onz/ony/onx. */
+int fy_downsample(const float *in, float *out, int nz, int ny, int nx,
+                  double factor, int *onz, int *ony, int *onx);
+
+/* Recommend the largest SAFE downsample factor for THIS volume from the data: sweeps
+ * factors, measures the round-trip (downsample->upsample) L2 error over TEXTURED
+ * regions only (flat/air regions can't lose detail and would mislead), and returns the
+ * largest factor whose worst-textured-region error stays <= err_budget (e.g. 0.03).
+ * Returns 1.0 if the volume is critically sampled (no safe shrink). Use the WORST-case
+ * (not average) so no textured region loses detail. */
+double fy_recommend_downsample(const float *in, int nz, int ny, int nx,
+                               double err_budget);
+
 #ifdef __cplusplus
 }
 #endif
