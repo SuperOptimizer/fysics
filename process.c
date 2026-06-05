@@ -27,10 +27,12 @@
  * later only if ablation shows it's needed. */
 fy_recipe fy_recipe_default(void) {
     fy_recipe r;
-    r.deconv_reg = 0.015;          /* punchy -- recover resolution */
+    r.deconv_reg = 0.015;          /* measured knee (reg sweep, 90 cubes) */
+    r.auto_deltabeta = 1;          /* partial inversion on fine volumes (measured) */
     r.air_thresh = 0.15f;          /* mask air (lower = keep more dim papyrus) */
     r.air_fill = 0.0f;             /* ZERO out the air (black gaps), before contrast */
-    r.denoise_bilateral = 0.05;    /* light guided denoise (eps), tames deconv noise */
+    r.denoise_bilateral = 0.05;    /* fallback guided eps if auto_denoise is off */
+    r.auto_denoise = 1;            /* set eps from measured per-volume noise (recommended) */
     r.do_musica = 1;               /* MUSICA contrast ON, gentle (see musica_p) */
     r.musica_p = 0.9f;             /* gentle (closer to 1 = milder boost) */
     r.do_glcae = 0;                /* legacy GLCAE off; prefer MUSICA */
@@ -56,9 +58,14 @@ int fy_process(const float *in, float *out, int nz, int ny, int nx,
         fy_papyrus_mask(in, mask, nz, ny, nx, t * 0.6f, t * 1.4f, 0, 0, 1);
     }
 
-    /* 2. deconvolve */
+    /* 2. deconvolve. This RESTORES high-frequency CONTRAST that the Paganin low-pass
+     * suppressed (a sharpness/contrast restoration -- it does NOT recover resolution;
+     * FRC confirms no SNR-limited resolution gain). auto_deltabeta uses partial
+     * inversion on fine volumes (full delta_beta over-inverts them; measured). */
     if (r->deconv_reg > 0.0) {
-        fy_deconvolve(cur, buf, nz, ny, nx, p, r->deconv_reg);
+        fy_physics pp = *p;
+        if (r->auto_deltabeta) pp.delta_beta *= fy_auto_deltabeta_scale(p);
+        fy_deconvolve(cur, buf, nz, ny, nx, &pp, r->deconv_reg);
         memcpy(out, buf, sizeof(float) * n);
         cur = out;
     } else {
@@ -66,12 +73,24 @@ int fy_process(const float *in, float *out, int nz, int ny, int nx,
         cur = out;
     }
 
-    /* 3. optional denoise (guided filter -- fast O(N), no gradient reversal) */
-    if (r->denoise_bilateral > 0.0) {
+    /* 3. optional denoise (guided filter -- fast O(N), no gradient reversal).
+     * auto_denoise sets eps from the volume's MEASURED noise (the level varies
+     * 1.5-3.3x scroll-to-scroll, so it must be estimated per-volume, not hardcoded). */
+    {
         double eps = r->denoise_bilateral * r->denoise_bilateral;
-        fy_guided_denoise(cur, buf, nz, ny, nx, 2, eps);
-        memcpy(out, buf, sizeof(float) * n);
-        cur = out;
+        int do_denoise = (r->denoise_bilateral > 0.0);
+        if (r->auto_denoise) {
+            fy_noise_model nm;
+            if (fy_estimate_noise(cur, nz, ny, nx, 5, 10.0, 0.4, &nm) == 0) {
+                eps = fy_guided_eps_for_noise(nm.noise_ref);
+                do_denoise = 1;
+            }
+        }
+        if (do_denoise) {
+            fy_guided_denoise(cur, buf, nz, ny, nx, 2, eps);
+            memcpy(out, buf, sizeof(float) * n);
+            cur = out;
+        }
     }
 
     /* 4. ZERO OUT THE AIR (before contrast) -- we don't want to contrast-enhance

@@ -51,18 +51,43 @@ double fy_recon_transfer(double f_cyc_per_voxel, const fy_physics *p) {
 
 /* Noise-safe regularization for fy_deconvolve.
  *
- * NOTE (measured, PHerc0139, 2026-06): an FRC even/odd-split test showed the high-
- * frequency content of these volumes is COHERENT SIGNAL out to ~0.9 Nyquist (FRC ~0.95),
- * not a noise floor -- so the Wiener inverse amplifying it by w^2 is correct, not a bug.
- * The Wiener gain w=H/(H^2+reg) is already self-limiting (peaks at 1/(2*sqrt(reg))), and
- * on real data it stays < ~4 for every tested volume. There is therefore no need to
- * scale reg up for "strong-filter" volumes; doing so would just blur away real detail.
- * We keep a single conservative base, and the per-frequency gain clamp
- * (FY_MAX_DECONV_GAIN) in the filter loop is the only hard safety rail -- it never fires
- * on the measured data but bounds pathological metadata. */
+ * NOTE (measured, 90 cubes / 18 volumes, 2026-06): reg = 0.015 sits at a sensible knee.
+ * A reg sweep showed dropping to 0.005 only marginally improves the texture/noise ratio
+ * (~+0.1-0.2) but roughly DOUBLES flat-region noise amplification (to 5.5-7x); stronger
+ * reg collapses the contrast restoration. So a single conservative base is right -- the
+ * real per-volume lever is delta_beta scaling (see fy_auto_deltabeta_scale), not reg.
+ * The per-frequency gain clamp (FY_MAX_DECONV_GAIN) in the filter loop is the hard
+ * safety rail against pathological metadata. */
 double fy_auto_reg(const fy_physics *p, double base) {
     (void)p;
     return base > 0.0 ? base : 0.015;
+}
+
+/* Regime-dependent delta_beta scaling for the deconvolution (Gureyev-analog partial
+ * inversion). Measured (90 cubes, 18 volumes): inverting the FULL metadata delta_beta
+ * OVER-inverts fine/strong-filter volumes -- it over-boosts the mid-band, starves the
+ * top band, and amplifies flat-region noise more than it lifts texture (texture/noise
+ * ratio < 1). Backing off to ~0.25-0.5x delta_beta on those volumes simultaneously
+ * raises texture gain, lowers noise, AND rescues the high band. On coarse/mild-filter
+ * volumes (~8.6-9.4um) the full delta_beta is already well matched -- reducing it just
+ * weakens a good deblur. The discriminator is the recon low-pass strength at Nyquist,
+ * H_nyq = fy_paganin_transfer(0.5, p): strong filter -> tiny H_nyq -> scale down.
+ * Measured H_nyq: 1.1um=0.0008, 2.4um=0.0021, 9.4um=0.0084 (fine sits ~4-10x lower).
+ *   H_nyq <~ 0.0025 (fine 1.1-4.3um) -> 0.35  (partial inversion)
+ *   H_nyq  ~ 0.02-0.04 (medium/coarse) -> ramp 0.35..1.0
+ *   H_nyq >~ 0.04 (coarse 8.6-9.4um)  -> 1.0   (full inversion)
+ * Returns a multiplier in [0.25, 1.0] to apply to p->delta_beta before deconvolving. */
+double fy_auto_deltabeta_scale(const fy_physics *p) {
+    double Hnyq = fy_paganin_transfer(0.5, p);
+    if (!isfinite(Hnyq) || Hnyq <= 0) return 1.0;
+    const double H_lo = 0.0025;  /* at/below: fine, over-inverted regime (1.1-4.3um) */
+    const double H_hi = 0.0070;  /* at/above: coarse, full inversion is right (8.6-9.4um) */
+    const double S_lo = 0.35;    /* partial-inversion scale for fine volumes */
+    if (Hnyq <= H_lo) return S_lo;
+    if (Hnyq >= H_hi) return 1.0;
+    /* linear ramp between */
+    double t = (Hnyq - H_lo) / (H_hi - H_lo);
+    return S_lo + t * (1.0 - S_lo);
 }
 
 int fy_kernel_halo(const fy_physics *p) {

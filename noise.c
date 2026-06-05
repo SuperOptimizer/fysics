@@ -190,3 +190,13 @@ int fy_estimate_noise(const float *in, int nz, int ny, int nx,
     free(sum); free(sqsum); free(tmp); free(isq);
     return 0;
 }
+
+/* Detail-safe guided-filter eps from an estimated noise level. The measured knee is
+ * eps ~= 0.014*var(data); var ~ (k*noise_ref)^2 with k~3 reproduces it. Floored to a
+ * small positive value so a near-zero noise estimate still yields a valid (gentle) eps. */
+double fy_guided_eps_for_noise(double noise_ref) {
+    double k = 3.0;
+    double eps = (k * noise_ref) * (k * noise_ref);
+    if (!(eps > 1e-8)) eps = 1e-8;
+    return eps;
+}

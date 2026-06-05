@@ -268,7 +268,21 @@ static void test_estimate_noise(void){
     fy_noise_model nm2;
     fy_estimate_noise(v2,nz,ny,nx,5,10.0,0.5,&nm2);
     CHECK(nm2.noise_ref > nm.noise_ref, "noisier volume -> higher estimated noise (monotone)");
+    /* eps mapping: higher noise -> larger eps, monotone & positive */
+    double e1=fy_guided_eps_for_noise(nm.noise_ref), e2=fy_guided_eps_for_noise(nm2.noise_ref);
+    CHECK(e1>0 && e2>e1, "guided eps grows with noise level");
     free(v); free(v2);
+}
+
+static void test_deltabeta_scale(void){
+    /* fine/strong-filter volume (small H_nyq) -> partial inversion (<1);
+     * coarse/mild-filter volume (large H_nyq) -> full inversion (~1). */
+    fy_physics fine = {500,59,200,1.129,2.5,4.0,0.0};   /* 1.129um, strong filter */
+    fy_physics coarse = {1000,113,1200,9.362,1.2,4.0,0.0}; /* 9.362um */
+    double sf=fy_auto_deltabeta_scale(&fine), sc=fy_auto_deltabeta_scale(&coarse);
+    CHECK(sf>=0.25 && sf<0.6, "fine volume -> partial delta_beta inversion (~0.35)");
+    CHECK(sc>0.9, "coarse volume -> full delta_beta inversion (~1.0)");
+    CHECK(sc>sf, "coarse inverts more fully than fine (regime ordering)");
 }
 
 static void test_dewindow(void){
@@ -326,6 +340,7 @@ int main(void) {
     test_sheetness();
     test_dewindow();
     test_estimate_noise();
+    test_deltabeta_scale();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

@@ -98,9 +98,15 @@ void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
  * disables a stage. Operates on a tile (with halo for deconv correctness).
  */
 typedef struct {
-    double deconv_reg;       /* Wiener strength (0.02-0.03 good; <=0 skips deconv) */
+    double deconv_reg;       /* Wiener strength (0.015 = measured knee; <=0 skips deconv) */
+    int    auto_deltabeta;   /* 1 -> scale delta_beta per regime (fy_auto_deltabeta_scale):
+                              * partial inversion on fine volumes, full on coarse. Recommended. */
     float  air_thresh;       /* papyrus/air intensity threshold (0=skip masking) */
     double denoise_bilateral;/* guided-denoise eps (<=0 skips; 0.05 light) */
+    int    auto_denoise;     /* 1 -> set guided eps from the volume's MEASURED noise
+                              * (fy_estimate_noise + fy_guided_eps_for_noise); overrides
+                              * denoise_bilateral. Self-calibrates per volume (the noise
+                              * level varies 1.5-3.3x scroll-to-scroll). Recommended. */
     int    do_glcae;         /* 1 -> GLCAE contrast (legacy; prefer MUSICA) */
     float  glcae_clip;       /* CLAHE clip limit for GLCAE (default 2.0) */
     int    do_musica;        /* 1 -> MUSICA multiscale contrast (preferred) */
@@ -127,6 +133,14 @@ double fy_recon_transfer(double f_cyc_per_voxel, const fy_physics *p); /* pagani
  * Wiener gain peaks near the signal/noise crossover instead of blowing up.
  * base ~ 0.015 reproduces the hand-tuned default on the fine volumes. */
 double fy_auto_reg(const fy_physics *p, double base);
+
+/* Regime-dependent delta_beta scaling (Gureyev-analog partial inversion).
+ * Measured (90 cubes, 18 volumes): fully inverting the metadata delta_beta OVER-inverts
+ * fine/strong-filter volumes (<=~4.3um) -- backing off to ~0.25-0.5x raises texture,
+ * lowers noise, and rescues the high band; coarse volumes (~8.6-9.4um) want full
+ * inversion. Returns a multiplier in [0.25,1.0] to apply to p->delta_beta before
+ * deconvolving (e.g. fy_physics q=*p; q.delta_beta *= fy_auto_deltabeta_scale(p);). */
+double fy_auto_deltabeta_scale(const fy_physics *p);
 
 /* ---- main kernel: Wiener deconvolution of the recon transfer ----
  * Sharpens `vol` (nz*ny*nx, row-major, x fastest) in place-or-out.
@@ -189,6 +203,18 @@ typedef struct {
 int fy_estimate_noise(const float *in, int nz, int ny, int nx,
                       int win, double flat_pct, double ref_intensity,
                       fy_noise_model *out);
+
+/* Map an estimated noise level to a DETAIL-SAFE guided-filter eps. Measured (145
+ * cubes): the detail-safe knee is eps ~= 0.014 * var of the data; expressed via the
+ * noise level, eps ~= (k * noise_ref)^2 keeps mid-band detail >=95% while removing the
+ * noise-floor portion. k~3 reproduces the measured knee. Use as:
+ *   fy_noise_model nm; fy_estimate_noise(vol,...,&nm);
+ *   fy_guided_denoise(vol,out,nz,ny,nx, 2, fy_guided_eps_for_noise(nm.noise_ref));
+ * NOTE (measured): clean denoising is fundamentally limited -- at the detail-safe
+ * setting only ~12-25% of noise is removed; pushing harder eats real detail. Guided
+ * filter is the recommended denoiser (BM4D is ~10% better but ~150x slower; whitening
+ * and TV both HURT -- do not use them). */
+double fy_guided_eps_for_noise(double noise_ref);
 
 /* ---- denoising (complements deconvolution; deconv amplifies noise) ----
  * NLM: non-local means, edge/texture preserving (papyrus is self-similar -> ideal).
