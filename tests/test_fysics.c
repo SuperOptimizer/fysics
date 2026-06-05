@@ -894,7 +894,93 @@ static void test_fuse_denoises(void) {
     free(low);free(high);free(fine);free(coarse);free(fused);free(hb);
 }
 
+/* ---- phase correlation: recover a KNOWN sub-voxel shift -------------------- */
+/* Build `moving` as `fixed` circularly shifted by a SUB-VOXEL (dz,dy,dx) using the
+ * Fourier shift theorem (multiply spectrum by exp(-i 2pi (k.s/N))) -- this is an
+ * EXACT band-limited sub-voxel translation, the proper ground truth for a sub-
+ * pixel phase-correlation test. `fixed` is broadband (random) texture, like real
+ * CT papyrus; phase correlation is a broadband estimator (a low-frequency-only
+ * field gives a broad, bias-prone peak -- not representative). */
+static void fourier_shift(const float *in, float *out, int nz,int ny,int nx,
+                          double sz,double sy,double sx) {
+    size_t N=(size_t)nz*ny*nx;
+    float *re=malloc(4*N),*im=calloc(N,4);
+    for (size_t i=0;i<N;i++) re[i]=in[i];
+    fy_fft3d(re,im,nz,ny,nx,-1);
+    for (int z=0;z<nz;z++) for (int y=0;y<ny;y++) for (int x=0;x<nx;x++) {
+        int kz=(z<=nz/2)?z:z-nz, ky=(y<=ny/2)?y:y-ny, kx=(x<=nx/2)?x:x-nx;
+        double ph = -2.0*M_PI*((double)kz*sz/nz + (double)ky*sy/ny + (double)kx*sx/nx);
+        double c=cos(ph), s=sin(ph);
+        size_t i=((size_t)z*ny+y)*nx+x;
+        float r=re[i], m=im[i];
+        re[i]=(float)(r*c - m*s); im[i]=(float)(r*s + m*c);
+    }
+    fy_fft3d(re,im,nz,ny,nx,+1);
+    fy_fft3d_normalize(re,im,nz,ny,nx);
+    for (size_t i=0;i<N;i++) out[i]=re[i];
+    free(re);free(im);
+}
+static void test_phase_correlate_subvoxel(void) {
+    int nz=32,ny=32,nx=32,n=nz*ny*nx;   /* pow2: exact circular shift */
+    float *f=malloc(4*n),*m=malloc(4*n);
+    /* broadband random texture, mildly smoothed (band-limited) */
+    unsigned int seed=12345;
+    for (int i=0;i<n;i++){ seed=seed*1103515245u+12345u; f[i]=(float)((seed>>9)&8191)/8191.0f; }
+    float *tmp=malloc(4*n);
+    for (int z=0;z<nz;z++) for (int y=0;y<ny;y++) for (int x=0;x<nx;x++){
+        int xm=(x-1+nx)%nx, xp=(x+1)%nx;
+        tmp[(z*ny+y)*nx+x]=(f[(z*ny+y)*nx+xm]+2*f[(z*ny+y)*nx+x]+f[(z*ny+y)*nx+xp])/4;
+    }
+    memcpy(f,tmp,4*n);
+    struct { double z,y,x; } cases[3] = { {0.5,-0.25,0.0}, {0.33,0.66,-0.4}, {-0.7,0.2,0.85} };
+    double worst=0;
+    for (int i=0;i<3;i++) {
+        fourier_shift(f,m,nz,ny,nx,cases[i].z,cases[i].y,cases[i].x);
+        double s[3], pk;
+        int rc = fy_phase_correlate(f,m,nz,ny,nx,s,&pk,0);  /* circular -> no window */
+        double e = fabs(s[0]-cases[i].z)+fabs(s[1]-cases[i].y)+fabs(s[2]-cases[i].x);
+        printf("     [pc] true(% .2f % .2f % .2f) got(% .3f % .3f % .3f) L1err=%.3f peak=%.3f rc=%d\n",
+               cases[i].z,cases[i].y,cases[i].x, s[0],s[1],s[2], e, pk, rc);
+        if (e>worst) worst=e;
+    }
+    CHECK(worst < 0.15, "phase_correlate recovers sub-voxel shift (<0.05 vox/axis avg)");
+    /* contrast invariance: scale+offset moving, shift must still be recovered */
+    fourier_shift(f,m,nz,ny,nx,0.4,-0.6,0.5);
+    for (int i=0;i<n;i++) m[i] = 0.3f*m[i] + 0.4f;  /* affine intensity change */
+    double s[3],pk; fy_phase_correlate(f,m,nz,ny,nx,s,&pk,0);
+    double e = fabs(s[0]-0.4)+fabs(s[1]+0.6)+fabs(s[2]-0.5);
+    printf("     [pc] contrast-changed moving: got(% .3f % .3f % .3f) L1err=%.3f\n", s[0],s[1],s[2], e);
+    CHECK(e < 0.15, "phase_correlate is robust to brightness/contrast change");
+    free(f);free(m);free(tmp);
+}
+
+/* ---- mutual information: peaks at correct alignment ----------------------- */
+static void test_mutual_information_peaks(void) {
+    int nz=32,ny=32,nx=32,n=nz*ny*nx;
+    float *fixed=malloc(4*n), *moving=malloc(4*n);
+    make_textured_vol(fixed,nz,ny,nx);
+    /* moving = a NONLINEAR remap of fixed (sqrt) -> NCC's linear assumption is
+     * violated but MI should not care; build it as a copy then remap below. */
+    for (int i=0;i<n;i++) moving[i] = sqrtf(fixed[i] > 0 ? fixed[i] : 0);
+    double I[12]={1,0,0,0, 0,1,0,0, 0,0,1,0};
+    double mi0 = fy_mutual_information(fixed,moving,nz,ny,nx,I,32);
+    /* shifted by 3 voxels in x -> misaligned -> MI should drop */
+    double S[12]={1,0,0,0, 0,1,0,0, 0,0,1,3.0};
+    double mis = fy_mutual_information(fixed,moving,nz,ny,nx,S,32);
+    printf("     [mi] aligned MI=%.4f  shifted(3vox) MI=%.4f nats\n", mi0, mis);
+    CHECK(mi0 > mis + 0.05, "MI is higher at correct alignment than when shifted");
+    /* and MI of identical images > MI of independent noise */
+    float *noise=malloc(4*n);
+    unsigned int seed=99;
+    for (int i=0;i<n;i++){ seed=seed*1103515245u+12345u; noise[i]=(float)((seed>>9)&1023)/1023.0f; }
+    double mi_noise = fy_mutual_information(fixed,noise,nz,ny,nx,I,32);
+    printf("     [mi] self(nonlin-remap) MI=%.4f  vs independent-noise MI=%.4f\n", mi0, mi_noise);
+    CHECK(mi0 > mi_noise, "MI(dependent) > MI(independent noise)");
+    free(fixed);free(moving);free(noise);
+}
+
 int main(void) {
+    test_fft_vs_dft();
     test_fft_vs_dft();
     test_fft_roundtrip();
     test_paganin_transfer();
@@ -930,6 +1016,8 @@ int main(void) {
     test_similarity_from_points();
     test_affine_ransac_outliers();
     test_fuse_denoises();
+    test_phase_correlate_subvoxel();
+    test_mutual_information_peaks();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
