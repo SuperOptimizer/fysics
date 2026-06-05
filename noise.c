@@ -200,3 +200,48 @@ double fy_guided_eps_for_noise(double noise_ref) {
     if (!(eps > 1e-8)) eps = 1e-8;
     return eps;
 }
+
+/* ---- generalized Anscombe transform (variance stabilization) ---- */
+void fy_gat_forward(const float *in, float *out, size_t n, double g, double b) {
+    if (g <= 1e-9) {
+        /* additive-noise limit: GAT degenerates; just pass through (stable already) */
+        for (size_t i = 0; i < n; i++) out[i] = in[i];
+        return;
+    }
+    double c = b + 0.375 * g * g;
+    double scale = 2.0 / g;
+    for (size_t i = 0; i < n; i++) {
+        double a = g * in[i] + c;
+        out[i] = (float)(scale * sqrt(a > 0 ? a : 0));
+    }
+}
+void fy_gat_inverse(const float *in, float *out, size_t n, double g, double b) {
+    if (g <= 1e-9) { for (size_t i = 0; i < n; i++) out[i] = in[i]; return; }
+    /* exact (unbiased) inverse of the forward above */
+    double q = 0.25 * g, off = b / g + 0.375 * g;
+    for (size_t i = 0; i < n; i++) {
+        double t = in[i];
+        out[i] = (float)(q * t * t - off);
+    }
+}
+
+/* ---- quality denoise: NLM in the GAT-stabilized domain (self-calibrating) ---- */
+int fy_denoise_quality(const float *in, float *out, int nz, int ny, int nx) {
+    size_t n = (size_t)nz * ny * nx;
+    /* estimate noise model from the data (ref_intensity 0.4 in [0,1]-ish range) */
+    fy_noise_model nm;
+    if (fy_estimate_noise(in, nz, ny, nx, 5, 10.0, 0.4, &nm) != 0) return 1;
+    float *stab = malloc(sizeof(float) * n);
+    float *den = malloc(sizeof(float) * n);
+    if (!stab || !den) { free(stab); free(den); return 1; }
+    /* GAT -> stabilized noise std ~= 1 (when g>0); for additive case use noise_ref */
+    fy_gat_forward(in, stab, n, nm.g, nm.b);
+    double h = (nm.g > 1e-9) ? 1.0 : (nm.noise_ref > 0 ? nm.noise_ref : 0.05);
+    /* small-window NLM (search_radius=1, patch_radius=1) -- the measured sweet spot */
+    if (fy_nlm_denoise(stab, den, nz, ny, nx, h, 1, 1) != 0) {
+        free(stab); free(den); return 1;
+    }
+    fy_gat_inverse(den, out, n, nm.g, nm.b);
+    free(stab); free(den);
+    return 0;
+}

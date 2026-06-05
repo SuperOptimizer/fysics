@@ -274,6 +274,33 @@ static void test_estimate_noise(void){
     free(v); free(v2);
 }
 
+static void test_gat_and_quality(void){
+    /* GAT forward->inverse round-trips exactly */
+    size_t n=1000; float *in=malloc(4*n),*t=malloc(4*n),*back=malloc(4*n);
+    for(size_t i=0;i<n;i++) in[i]=0.01f+0.0009f*i;  /* spread of intensities */
+    double g=0.02,b=1e-4;
+    fy_gat_forward(in,t,n,g,b);
+    fy_gat_inverse(t,back,n,g,b);
+    double maxe=0; for(size_t i=0;i<n;i++){double e=fabs(back[i]-in[i]); if(e>maxe)maxe=e;}
+    CHECK(maxe<1e-4, "GAT forward->inverse round-trips");
+    free(in);free(t);free(back);
+    /* quality denoise reduces error vs clean on a noisy textured volume */
+    int nz=24,ny=24,nx=24; size_t m=(size_t)nz*ny*nx;
+    float *clean=malloc(4*m),*noisy=malloc(4*m),*out=malloc(4*m);
+    unsigned s=4242;
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        double v=0.4+0.25*sin(x*0.5)*cos(y*0.4);
+        clean[((size_t)z*ny+y)*nx+x]=(float)v;
+        s=s*1103515245u+12345u; double nse=((s>>16)&0x7fff)/32768.0-0.5;
+        noisy[((size_t)z*ny+y)*nx+x]=(float)(v+0.06*nse);
+    }
+    int rc=fy_denoise_quality(noisy,out,nz,ny,nx);
+    CHECK(rc==0,"fy_denoise_quality runs");
+    double en=0,eo=0; for(size_t i=0;i<m;i++){double a=noisy[i]-clean[i],bb=out[i]-clean[i];en+=a*a;eo+=bb*bb;}
+    CHECK(eo<en,"quality denoise reduces error vs clean");
+    free(clean);free(noisy);free(out);
+}
+
 static void test_deltabeta_scale(void){
     /* fine/strong-filter volume (small H_nyq) -> partial inversion (<1);
      * coarse/mild-filter volume (large H_nyq) -> full inversion (~1). */
@@ -694,6 +721,7 @@ int main(void) {
     test_sheetness();
     test_dewindow();
     test_estimate_noise();
+    test_gat_and_quality();
     test_deltabeta_scale();
     test_warp_identity();
     test_warp_translation();

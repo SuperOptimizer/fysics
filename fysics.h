@@ -219,6 +219,26 @@ int fy_estimate_noise(const float *in, int nz, int ny, int nx,
  * and TV both HURT -- do not use them). */
 double fy_guided_eps_for_noise(double noise_ref);
 
+/* ---- generalized Anscombe variance-stabilizing transform (GAT) ----
+ * The noise is signal-dependent (var = g*I + b). GAT remaps intensities so the noise
+ * variance becomes ~constant (~1), letting ONE denoiser strength work across the whole
+ * intensity range. Exact closed-form forward + inverse (algebraic inverse, not the
+ * biased Anscombe approximation). g,b come from fy_estimate_noise. If g~0 (additive
+ * noise) GAT reduces to a scale -- harmless.
+ *   forward: T = (2/g)*sqrt(g*I + b + 3/8 g^2)   (g>0)
+ *   inverse: I = (g/4)*T^2 - b/g - (3/8)*g       (the exact unbiased inverse) */
+void fy_gat_forward(const float *in, float *out, size_t n, double g, double b);
+void fy_gat_inverse(const float *in, float *out, size_t n, double g, double b);
+
+/* ---- quality denoise tier: NLM in the GAT (stabilized) domain ----
+ * Measured (4 voxel sizes): estimate the noise model, GAT-stabilize, run small-window
+ * non-local-means (search_radius=1, patch_radius=1) at strength ~the stabilized noise
+ * (~1), inverse-GAT. Cuts structure-leak ~half vs the guided filter (0.5 -> 0.23) at
+ * ~2.4s/cube -- ~55x faster than full BM4D for nearly its quality. Self-calibrating:
+ * estimates (g,b,noise_ref) from the data. Use this as the "quality" denoise; use
+ * fy_guided_denoise (with fy_guided_eps_for_noise) as the fast ~0.2s tier. */
+int fy_denoise_quality(const float *in, float *out, int nz, int ny, int nx);
+
 /* ---- denoising (complements deconvolution; deconv amplifies noise) ----
  * NLM: non-local means, edge/texture preserving (papyrus is self-similar -> ideal).
  *   h = filter strength (~noise level), search_radius S, patch_radius P.
