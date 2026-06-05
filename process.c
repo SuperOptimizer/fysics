@@ -75,7 +75,11 @@ int fy_process(const float *in, float *out, int nz, int ny, int nx,
 
     /* 3. optional denoise (guided filter -- fast O(N), no gradient reversal).
      * auto_denoise sets eps from the volume's MEASURED noise (the level varies
-     * 1.5-3.3x scroll-to-scroll, so it must be estimated per-volume, not hardcoded). */
+     * 1.5-3.3x scroll-to-scroll, so it must be estimated per-volume, not hardcoded).
+     * ORDER NOTE (measured): deblur->denoise vs denoise->deblur are ~equivalent with
+     * the self-calibrated eps, EXCEPT on high-amplification fine volumes (~1.1um, large
+     * unsharp_sigma) where denoise-FIRST wins ~12-13%. Not worth special-casing the
+     * default; revisit if such scans dominate. fy_denoise_quality is the cleaner tier. */
     {
         double eps = r->denoise_bilateral * r->denoise_bilateral;
         int do_denoise = (r->denoise_bilateral > 0.0);
