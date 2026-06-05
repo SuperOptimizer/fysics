@@ -98,6 +98,15 @@ region plus this margin, keep the inner region. Tiles ≤ 256³ recommended.
   ↑ (≈2.2×), (b) layering edge slope **not** amplified (≈1.0×) while a matched **plain**
   unsharp mask boosts it ≈2.6×, (c) texture/noise ↑ (≈1.26×) with flat-region noise
   barely moved.
-- **Real data** (`analysis/texture_test/`): a textured PHerc0139 cube; see
-  `analysis/texture_test/RESULTS.md` for the measured numbers, figures, the
-  plain-unsharp comparison, and peak RSS.
+- **Real data** (`analysis/texture_test/`): a textured PHerc0139 cube
+  (`128³`, mean 62 / std 41), `fy_texture_enhance_auto(strength=2)`, peak RSS 177 MB.
+  All three claims hold: in-plane texture power **↑1.23×**, texture/noise **↑1.05×**,
+  cross-sheet layering **1.02×** (not amplified) and flat-region noise **1.06×** (not
+  amplified). **Honest comparison to a plain unsharp mask:** by the raw selectivity ratio
+  (texture-gain ÷ layering-gain) plain unsharp actually scores *higher* on this cube
+  (its crackle is broadband), so the steered filter does **not** win that ratio and we do
+  not claim it does. Its real advantage is **restraint at matched lift**: forced to the
+  same ~1.43× texture gain, the steered filter adds only ~3 % excess layering and ~11 %
+  noise vs ~11 % layering / ~14 % noise for plain — a *layering-safe, noise-safe*
+  enhancer, modest but real on this data. Full numbers, figures and the matched-gain
+  table in `analysis/texture_test/RESULTS.md`.
