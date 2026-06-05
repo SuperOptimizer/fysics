@@ -315,6 +315,105 @@ int fy_sheetness_multiscale(const float *in, float *out, int nz, int ny, int nx,
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);
 
+
+/* ===== LAYER 1: affine resampler + intensity-based registration ============
+ * Register multiple CT scans of the SAME object taken at different
+ * resolution/energy/time (e.g. PHerc0139 1.129um vs 2.399um) so they can be
+ * fused. This layer is the GLOBAL affine part (scale from differing voxel size,
+ * rotation, translation, shear). Deformable warping (temperature/movement) is
+ * Layer 2 (Demons) -- the trilinear sampler below is factored out so a
+ * displacement-field warp can reuse it.
+ *
+ * Geometry: row-major, x fastest, idx=(z*ny+y)*nx+x. The 3x4 affine M (12
+ * doubles, row-major) maps OUTPUT voxel coords -> INPUT voxel coords (backward/
+ * pull warp), in (z,y,x) ordering. Translation column = M[3],M[7],M[11].
+ */
+
+/* Trilinear sample of `in` at continuous (z,y,x) in input-voxel units.
+ * Out-of-bounds (outside [0,n-1]) -> 0. The reusable interpolation primitive;
+ * Layer 2's displacement-field warp calls this directly. */
+float fy_sample_trilinear(const float *in, int nz, int ny, int nx,
+                          float z, float y, float x);
+
+/* Resample `in` (nz,ny,nx) into `out` (onz,ony,onx) under 3x4 affine M mapping
+ * output->input voxel coords. Trilinear; out-of-bounds -> 0. The workhorse:
+ * registration optimizes M, then warps the moving volume with it. */
+int fy_warp_affine(const float *in, float *out, int nz, int ny, int nx,
+                   const double *M, int onz, int ony, int onx);
+
+/* 2x anti-aliased downsample for an image PYRAMID (coarse-to-fine registration):
+ * gaussian blur (sigma~0.8) then decimate. `out` must hold (nz/2)*(ny/2)*(nx/2)
+ * floats; output dims are returned in *onz,*ony,*onx. */
+int fy_downsample2x(const float *in, float *out, int nz, int ny, int nx,
+                    int *onz, int *ony, int *onx);
+
+/* Normalized Cross-Correlation between `fixed` and `moving` warped by M, over
+ * the in-bounds overlap. Range [-1,1] (1=perfect); returns -2 if overlap is too
+ * small. NCC is invariant to affine intensity change (a*I+b) -> robust to the
+ * brightness/contrast difference between two energies (plain SSD is wrong here).
+ * TODO(MI): for truly different MODALITIES, Mutual Information is more robust;
+ * a histogram-based fy_mi_warped would slot in as an alternative metric here. */
+double fy_ncc_warped(const float *fixed, const float *moving,
+                     int nz, int ny, int nx, const double *M);
+
+/* Coarse-to-fine (pyramid) intensity registration: optimize the affine (or
+ * rigid: rotation+translation+isotropic-scale, 7 dof) to MAXIMIZE
+ * NCC(fixed, warp(moving, M)). fixed and moving share the grid (nz,ny,nx);
+ * resample differing-voxel-size scans onto a common grid first (or seed the
+ * scale into M_out). M_out is BOTH input (initial guess; identity for same grid,
+ * a scale-ratio diagonal for a known voxel ratio) and output (optimized 3x4 map
+ * output->input). rigid_only=1 for rigid+isotropic-scale, 0 for full affine.
+ * Returns 0 on success. */
+int fy_register_affine(const float *fixed, const float *moving,
+                       int nz, int ny, int nx, double *M_out, int rigid_only);
+
+/* ===== LAYER 2: deformable (non-rigid) registration via Demons ============
+ * After affine removes the global transform, two scans of the SAME scroll
+ * still differ by a SMOOTH physical warp (thermal/humidity expansion, creep,
+ * remounting). Demons recovers a per-voxel displacement field that pulls the
+ * affine-aligned moving volume onto the fixed one.
+ *
+ * Field convention: u=(uz,uy,ux) lives on the FIXED grid and is a PULL/backward
+ * displacement in voxel units. The warped moving is
+ *     warped(z,y,x) = moving( z+uz, y+uy, x+ux )
+ * via fy_sample_trilinear. A zero field is the identity warp.
+ */
+
+/* Resample `in` through a displacement field (uz,uy,ux), all on the (nz,ny,nx)
+ * grid: out(z,y,x) = trilinear-sample(in, z+uz, y+uy, x+ux). OOB -> 0. A zero
+ * field reproduces `in`. The deformable analogue of fy_warp_affine. */
+int fy_warp_field(const float *in, float *out, int nz, int ny, int nx,
+                  const float *ux, const float *uy, const float *uz);
+
+/* Coarse-to-fine Demons deformable registration. fixed & moving share the
+ * (nz,ny,nx) grid -- run affine first and pass the affine-aligned moving here.
+ * Variant: symmetric (active-forces) Thirion demons; each iteration computes the
+ * intensity-difference * gradient force (using BOTH fixed and moving gradients),
+ * adds it to the field, then Gaussian-smooths the whole field (regularization).
+ * Solved on an image pyramid (fy_downsample2x), coarse->fine with x2 field
+ * upsampling, for capture range + smoothness.
+ *   ux/uy/uz : in = initial field (pass zeros for fresh), out = recovered field.
+ *   n_iters  : iterations PER pyramid level (typical 50-150).
+ *   field_sigma : Gaussian regularization sigma in voxels (elasticity; larger =
+ *                 smoother/stiffer; typical 1.0-2.0).
+ *   step     : displacement step scale per iteration (typical 1.0-2.0).
+ * Returns 0 on success. */
+int fy_register_demons(const float *fixed, const float *moving,
+                       int nz, int ny, int nx,
+                       float *ux, float *uy, float *uz,
+                       int n_iters, double field_sigma, double step);
+
+/* Convenience: Layer 1 THEN Layer 2. Recovers the affine map M_out, warps moving
+ * onto the fixed grid with it, then recovers the residual deformation field
+ * ux/uy/uz on the affine-aligned pair. The fully-registered moving volume is
+ *   fy_warp_field( fy_warp_affine(moving, M_out), ux,uy,uz ).
+ * M_out is in/out (initial guess / affine result); ux/uy/uz are pre-allocated
+ * (nz*ny*nx each) and zeroed internally. Returns 0 on success. */
+int fy_register_full(const float *fixed, const float *moving,
+                     int nz, int ny, int nx, double *M_out, int rigid_only,
+                     float *ux, float *uy, float *uz,
+                     int n_iters, double field_sigma, double step);
+
 #ifdef __cplusplus
 }
 #endif

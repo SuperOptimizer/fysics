@@ -323,6 +323,360 @@ static void test_sheetness(void){
     free(in);free(out);
 }
 
+/* ============ registration (register.c) ================================== */
+
+/* structured test volume: a few gaussian blobs + low-freq sinusoid so NCC has
+ * gradient to follow. Asymmetric so rotations/translations are distinguishable. */
+static void make_struct_vol(float *v, int nz, int ny, int nx) {
+    float blobs[6][4] = { /* z,y,x,sigma (fractions of dim) */
+        {0.30f,0.30f,0.35f,0.10f}, {0.65f,0.40f,0.55f,0.08f},
+        {0.45f,0.70f,0.30f,0.12f}, {0.55f,0.55f,0.72f,0.07f},
+        {0.25f,0.60f,0.62f,0.09f}, {0.72f,0.28f,0.40f,0.06f},
+    };
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        double fz = (double)z/nz, fy = (double)y/ny, fx = (double)x/nx;
+        double val = 0.15 + 0.10*sin(6.0*fx)*cos(5.0*fy + 0.5)*sin(4.0*fz);
+        for (int b = 0; b < 6; b++) {
+            double dz=fz-blobs[b][0], dy=fy-blobs[b][1], dx=fx-blobs[b][2];
+            double s=blobs[b][3];
+            val += 0.8*exp(-(dz*dz+dy*dy+dx*dx)/(2*s*s));
+        }
+        if (val > 1.0) val = 1.0;
+        v[(z*ny+y)*nx+x] = (float)val;
+    }
+}
+
+/* build a 3x4 affine (output->input map) for rotation about center + iso scale
+ * + translation. angles in radians (about z,y,x), s = iso scale, t = (z,y,x). */
+static void build_M(double *M, double rz,double ry,double rx,double s,
+                    double tz,double ty,double tx, double cz,double cy,double cx) {
+    double Cz=cos(rz),Sz=sin(rz),Cy=cos(ry),Sy=sin(ry),Cx=cos(rx),Sx=sin(rx);
+    double Rz[9]={Cz,-Sz,0, Sz,Cz,0, 0,0,1};
+    double Ry[9]={Cy,0,Sy, 0,1,0, -Sy,0,Cy};
+    double Rx[9]={1,0,0, 0,Cx,-Sx, 0,Sx,Cx};
+    double Rzy[9],R[9];
+    for(int i=0;i<3;i++)for(int j=0;j<3;j++){double a=0;for(int k=0;k<3;k++)a+=Rz[i*3+k]*Ry[k*3+j];Rzy[i*3+j]=a;}
+    for(int i=0;i<3;i++)for(int j=0;j<3;j++){double a=0;for(int k=0;k<3;k++)a+=Rzy[i*3+k]*Rx[k*3+j];R[i*3+j]=a*s;}
+    double cc[3]={cz,cy,cx},t[3]={tz,ty,tx};
+    for(int i=0;i<3;i++){
+        M[i*4+0]=R[i*3+0]; M[i*4+1]=R[i*3+1]; M[i*4+2]=R[i*3+2];
+        double Rc=R[i*3+0]*cc[0]+R[i*3+1]*cc[1]+R[i*3+2]*cc[2];
+        M[i*4+3]=cc[i]-Rc+t[i];
+    }
+}
+
+/* invert a 3x4 affine (treats it as 4x4 with [0 0 0 1]). out maps the other way. */
+static int invert_M(const double *M, double *inv) {
+    double a=M[0],b=M[1],c=M[2], d=M[4],e=M[5],f=M[6], g=M[8],h=M[9],i=M[10];
+    double det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+    if (fabs(det)<1e-12) return 1;
+    double id=1.0/det;
+    double L[9];
+    L[0]=(e*i-f*h)*id; L[1]=(c*h-b*i)*id; L[2]=(b*f-c*e)*id;
+    L[3]=(f*g-d*i)*id; L[4]=(a*i-c*g)*id; L[5]=(c*d-a*f)*id;
+    L[6]=(d*h-e*g)*id; L[7]=(b*g-a*h)*id; L[8]=(a*e-b*d)*id;
+    double t[3]={M[3],M[7],M[11]};
+    for(int r=0;r<3;r++){
+        inv[r*4+0]=L[r*3+0]; inv[r*4+1]=L[r*3+1]; inv[r*4+2]=L[r*3+2];
+        inv[r*4+3]=-(L[r*3+0]*t[0]+L[r*3+1]*t[1]+L[r*3+2]*t[2]);
+    }
+    return 0;
+}
+
+/* mean abs diff over the interior (avoid the zero-padded border) of two vols */
+static double interior_mad(const float *a, const float *b, int nz,int ny,int nx, int m) {
+    double s=0; long c=0;
+    for(int z=m;z<nz-m;z++)for(int y=m;y<ny-m;y++)for(int x=m;x<nx-m;x++){
+        s+=fabs((double)a[(z*ny+y)*nx+x]-b[(z*ny+y)*nx+x]); c++;
+    }
+    return c? s/c : 0;
+}
+
+static void test_warp_identity(void) {
+    int nz=24,ny=24,nx=24,n=nz*ny*nx;
+    float *in=malloc(4*n),*out=malloc(4*n);
+    make_struct_vol(in,nz,ny,nx);
+    double I[12]={1,0,0,0, 0,1,0,0, 0,0,1,0};
+    fy_warp_affine(in,out,nz,ny,nx,I,nz,ny,nx);
+    double mad=interior_mad(in,out,nz,ny,nx,0);
+    CHECK(mad<1e-6, "warp_affine identity reproduces input");
+    free(in);free(out);
+}
+
+static void test_warp_translation(void) {
+    int nz=24,ny=24,nx=24,n=nz*ny*nx;
+    float *in=malloc(4*n),*out=malloc(4*n);
+    make_struct_vol(in,nz,ny,nx);
+    /* output->input shift of +3 in x: out[x] = in[x+3], i.e. content moves -3 */
+    double M[12]={1,0,0,0, 0,1,0,0, 0,0,1,3};
+    fy_warp_affine(in,out,nz,ny,nx,M,nz,ny,nx);
+    /* check out at (z,y,x) equals in at (z,y,x+3) for interior */
+    double maxe=0;
+    for(int z=5;z<nz-5;z++)for(int y=5;y<ny-5;y++)for(int x=5;x<nx-8;x++){
+        double e=fabs((double)out[(z*ny+y)*nx+x]-in[(z*ny+y)*nx+(x+3)]);
+        if(e>maxe)maxe=e;
+    }
+    CHECK(maxe<1e-5, "warp_affine integer translation shifts exactly");
+    free(in);free(out);
+}
+
+static void test_warp_roundtrip(void) {
+    int nz=28,ny=28,nx=28,n=nz*ny*nx;
+    float *in=malloc(4*n),*mid=malloc(4*n),*back=malloc(4*n);
+    make_struct_vol(in,nz,ny,nx);
+    double cz=(nz-1)*0.5,cy=(ny-1)*0.5,cx=(nx-1)*0.5;
+    double M[12],Minv[12];
+    build_M(M, 0.10,0.05,0.07, 1.05, 1.5,-2.0,1.0, cz,cy,cx);
+    invert_M(M,Minv);
+    fy_warp_affine(in,mid,nz,ny,nx,M,nz,ny,nx);
+    fy_warp_affine(mid,back,nz,ny,nx,Minv,nz,ny,nx);
+    double mad=interior_mad(in,back,nz,ny,nx,5);
+    CHECK(mad<0.03, "warp_affine round-trip (M then M^-1) recovers input");
+    free(in);free(mid);free(back);
+}
+
+static void test_downsample2x(void) {
+    int nz=32,ny=32,nx=32,n=nz*ny*nx;
+    float *in=malloc(4*n);
+    make_struct_vol(in,nz,ny,nx);
+    int dz,dy,dx;
+    float *out=malloc(4*(n/8));
+    int rc=fy_downsample2x(in,out,nz,ny,nx,&dz,&dy,&dx);
+    CHECK(rc==0 && dz==16 && dy==16 && dx==16, "downsample2x halves dims");
+    /* range preserved (anti-alias shouldn't blow up or zero the signal) */
+    float mn=1e9f,mx=-1e9f;
+    for(int i=0;i<dz*dy*dx;i++){if(out[i]<mn)mn=out[i];if(out[i]>mx)mx=out[i];}
+    CHECK(mx>0.5f && mn>=0.0f && mx<=1.01f, "downsample2x preserves dynamic range");
+    free(in);free(out);
+}
+
+static void test_ncc_self(void) {
+    int nz=24,ny=24,nx=24,n=nz*ny*nx;
+    float *a=malloc(4*n),*b=malloc(4*n);
+    make_struct_vol(a,nz,ny,nx);
+    double I[12]={1,0,0,0, 0,1,0,0, 0,0,1,0};
+    double self=fy_ncc_warped(a,a,nz,ny,nx,I);
+    CHECK(self>0.999, "NCC of a volume with itself == 1");
+    /* affine intensity change b = 0.4*a + 0.2 -> NCC must STILL be ~1 */
+    for(int i=0;i<n;i++) b[i]=0.4f*a[i]+0.2f;
+    double inv=fy_ncc_warped(a,b,nz,ny,nx,I);
+    CHECK(inv>0.999, "NCC invariant to affine intensity change (a*I+b)");
+    free(a);free(b);
+}
+
+/* core helper: recover a known transform. Returns recovery errors via pointers.
+ * We apply Mknown (the transform that GENERATED moving from fixed) and check the
+ * recovered M_out matches Mknown's INVERSE warp -- equivalently, that warping
+ * moving by M_out reproduces fixed. We measure residual NCC + image error. */
+static void run_recovery(int rigid, double angle, double scale, double tx,
+                         double gamma_contrast,
+                         double *ncc_out, double *mad_out) {
+    int nz=64,ny=64,nx=64,n=nz*ny*nx;
+    float *fixed=malloc(4*n),*moving=malloc(4*n),*warped=malloc(4*n);
+    make_struct_vol(fixed,nz,ny,nx);
+    double cz=(nz-1)*0.5,cy=(ny-1)*0.5,cx=(nx-1)*0.5;
+    /* Mgen maps moving-grid -> fixed-grid; we generate moving by sampling fixed
+     * at Mgen^-1... simplest: define moving(x) = fixed(Mgen . x) via warp with
+     * Mgen as the output->input map. Then fixed = warp(moving, Mgen^-1). The
+     * registration should recover M_out ~ Mgen^-1. */
+    double Mgen[12], Mtrue[12];
+    build_M(Mgen, angle, angle*0.6, angle*0.8, scale, tx, -tx*0.7, tx*0.5, cz,cy,cx);
+    fy_warp_affine(fixed,moving,nz,ny,nx,Mgen,nz,ny,nx);
+    invert_M(Mgen,Mtrue);   /* the transform registration should find */
+
+    /* optional contrast change on moving to test multimodal robustness */
+    if (gamma_contrast > 0) {
+        for(int i=0;i<n;i++){ float v=moving[i]; if(v<0)v=0; moving[i]=powf(v,(float)gamma_contrast)*0.7f+0.05f; }
+    }
+
+    double M_out[12]={1,0,0,0, 0,1,0,0, 0,0,1,0};   /* identity init, same grid */
+    fy_register_affine(fixed,moving,nz,ny,nx,M_out,rigid);
+
+    fy_warp_affine(moving,warped,nz,ny,nx,M_out,nz,ny,nx);
+    *ncc_out = fy_ncc_warped(fixed,moving,nz,ny,nx,M_out);
+    *mad_out = interior_mad(fixed,warped,nz,ny,nx,6);
+    (void)Mtrue;
+    free(fixed);free(moving);free(warped);
+}
+
+static void test_register_rigid(void) {
+    double ncc,mad;
+    run_recovery(1, 0.08, 1.0, 2.5, 0.0, &ncc,&mad);
+    printf("     [rigid] recovered NCC=%.4f  interior MAD=%.4f\n", ncc, mad);
+    CHECK(ncc>0.98, "register rigid recovers transform (NCC>0.98)");
+    CHECK(mad<0.05, "register rigid: warped moving matches fixed (MAD<0.05)");
+}
+
+static void test_register_affine(void) {
+    double ncc,mad;
+    run_recovery(0, 0.08, 1.06, 2.5, 0.0, &ncc,&mad);
+    printf("     [affine] recovered NCC=%.4f  interior MAD=%.4f\n", ncc, mad);
+    CHECK(ncc>0.98, "register affine recovers transform (NCC>0.98)");
+    CHECK(mad<0.05, "register affine: warped moving matches fixed (MAD<0.05)");
+}
+
+static void test_register_contrast(void) {
+    double ncc,mad;
+    /* moving has gamma=1.8 + rescale: very different contrast from fixed */
+    run_recovery(1, 0.07, 1.0, 2.0, 1.8, &ncc,&mad);
+    printf("     [contrast/multimodal] recovered NCC=%.4f  interior MAD(vs orig contrast)=%.4f\n", ncc, mad);
+    /* MAD here compares warped (gamma'd) moving to original fixed -> intensities
+     * differ by design; geometry is what we test, via NCC. */
+    CHECK(ncc>0.97, "register robust to contrast change (NCC>0.97, multimodal-ready)");
+}
+
+/* ============ LAYER 2: deformable / Demons =============================== */
+
+/* a textured volume: blobs + several octaves of sinusoid so there is gradient
+ * EVERYWHERE (Demons needs texture; flat regions suffer the aperture problem). */
+static void make_textured_vol(float *v, int nz, int ny, int nx) {
+    make_struct_vol(v, nz, ny, nx);
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        double fz=(double)z/nz, fy=(double)y/ny, fx=(double)x/nx;
+        double t = 0.06*sin(18.0*fx)*sin(15.0*fy)
+                 + 0.05*cos(13.0*fz+1.0)*sin(11.0*fx)
+                 + 0.04*sin(21.0*fy+0.3)*cos(17.0*fz);
+        double val = v[(z*ny+y)*nx+x] + t;
+        if (val < 0) val = 0; if (val > 1) val = 1;
+        v[(z*ny+y)*nx+x] = (float)val;
+    }
+}
+
+/* build a known SMOOTH (low-frequency sinusoidal) displacement field, pull
+ * convention, amplitude `amp` voxels. This is the field that GENERATES moving
+ * from fixed: moving(x) = fixed(x + u(x)) ... but we want the registration to
+ * recover the field that pulls moving back to fixed. We instead define moving =
+ * warp_field(fixed, +u) and let demons recover ~ +u (so warp_field(moving,u_rec)
+ * reproduces fixed). */
+static void make_true_field(float *ux, float *uy, float *uz, int nz,int ny,int nx, double amp) {
+    for (int z=0; z<nz; z++) for (int y=0; y<ny; y++) for (int x=0; x<nx; x++) {
+        double fz=(double)z/nz, fy=(double)y/ny, fx=(double)x/nx;
+        size_t i=(z*ny+y)*nx+x;
+        ux[i]=(float)(amp*sin(2.0*M_PI*fy)*cos(2.0*M_PI*fz));
+        uy[i]=(float)(amp*sin(2.0*M_PI*fx)*cos(1.0*M_PI*fz));
+        uz[i]=(float)(amp*0.7*sin(2.0*M_PI*fx)*sin(1.5*M_PI*fy));
+    }
+}
+
+static double pearson(const float *a, const float *b, size_t n) {
+    double sa=0,sb=0,saa=0,sbb=0,sab=0;
+    for(size_t i=0;i<n;i++){sa+=a[i];sb+=b[i];saa+=(double)a[i]*a[i];sbb+=(double)b[i]*b[i];sab+=(double)a[i]*b[i];}
+    double ma=sa/n,mb=sb/n,cov=sab/n-ma*mb,va=saa/n-ma*ma,vb=sbb/n-mb*mb;
+    double d=sqrt(va*vb); return d<1e-12?0.0:cov/d;
+}
+
+/* mean |gradient| magnitude of a field component (smoothness proxy) */
+static double field_grad_mag(const float *u, int nz,int ny,int nx) {
+    double s=0; long c=0;
+    for(int z=1;z<nz-1;z++)for(int y=1;y<ny-1;y++)for(int x=1;x<nx-1;x++){
+        size_t i=(z*ny+y)*nx+x;
+        double gx=0.5*(u[i+1]-u[i-1]);
+        double gy=0.5*(u[i+nx]-u[i-nx]);
+        double gz=0.5*(u[i+nx*ny]-u[i-nx*ny]);
+        s+=sqrt(gx*gx+gy*gy+gz*gz); c++;
+    }
+    return c? s/c : 0;
+}
+
+static void test_warp_field_identity(void) {
+    int nz=24,ny=24,nx=24; size_t n=(size_t)nz*ny*nx;
+    float *in=malloc(4*n),*out=malloc(4*n);
+    float *zx=calloc(n,4),*zy=calloc(n,4),*zz=calloc(n,4);
+    make_textured_vol(in,nz,ny,nx);
+    fy_warp_field(in,out,nz,ny,nx,zx,zy,zz);
+    double mad=interior_mad(in,out,nz,ny,nx,0);
+    CHECK(mad<1e-6, "warp_field with zero field == identity");
+    free(in);free(out);free(zx);free(zy);free(zz);
+}
+
+static void test_demons_known_warp(void) {
+    int nz=64,ny=64,nx=64; size_t n=(size_t)nz*ny*nx;
+    float *fixed=malloc(4*n),*moving=malloc(4*n),*warped=malloc(4*n);
+    float *tx=malloc(4*n),*ty=malloc(4*n),*tz=malloc(4*n);     /* true field */
+    float *ux=calloc(n,4),*uy=calloc(n,4),*uz=calloc(n,4);     /* recovered  */
+    make_textured_vol(fixed,nz,ny,nx);
+    make_true_field(tx,ty,tz,nz,ny,nx, 4.0);                   /* ~4 vox max */
+    fy_warp_field(fixed,moving,nz,ny,nx,tx,ty,tz);             /* moving=fixed(x+u) */
+
+    double mad_before=interior_mad(fixed,moving,nz,ny,nx,6);
+    double I[12]={1,0,0,0,0,1,0,0,0,0,1,0};
+    double ncc_before=fy_ncc_warped(fixed,moving,nz,ny,nx,I);
+
+    fy_register_demons(fixed,moving,nz,ny,nx,ux,uy,uz, 80, 1.5, 1.5);
+    fy_warp_field(moving,warped,nz,ny,nx,ux,uy,uz);
+
+    double mad_after=interior_mad(fixed,warped,nz,ny,nx,6);
+    double ncc_after=pearson(fixed,warped,n);
+    /* field recovery: the recovered PULL field that maps moving->fixed is the
+     * INVERSE of the field that generated moving (moving=fixed(x+u_true)), so
+     * u_rec ~ -u_true. We test the magnitude of the correlation. */
+    double fc = pearson(ux,tx,n);   /* x-component; expect strongly NEGATIVE */
+    printf("     [demons known-warp] NCC %.4f->%.4f  MAD %.4f->%.4f  field-corr(x)=%.3f (expect <0, |.| high)\n",
+           ncc_before,ncc_after,mad_before,mad_after,fc);
+    CHECK(ncc_after>ncc_before+0.01, "demons raises NCC vs unregistered");
+    CHECK(ncc_after>0.97, "demons reaches high NCC on textured known warp");
+    CHECK(mad_after<0.6*mad_before, "demons cuts intensity MAD substantially");
+    CHECK(fabs(fc)>0.5, "recovered field correlates with true field (x-comp, inverse sign)");
+    free(fixed);free(moving);free(warped);free(tx);free(ty);free(tz);
+    free(ux);free(uy);free(uz);
+}
+
+static void test_demons_regularization(void) {
+    int nz=48,ny=48,nx=48; size_t n=(size_t)nz*ny*nx;
+    float *fixed=malloc(4*n),*moving=malloc(4*n);
+    float *tx=malloc(4*n),*ty=malloc(4*n),*tz=malloc(4*n);
+    make_textured_vol(fixed,nz,ny,nx);
+    make_true_field(tx,ty,tz,nz,ny,nx, 3.0);
+    fy_warp_field(fixed,moving,nz,ny,nx,tx,ty,tz);
+
+    float *ax=calloc(n,4),*ay=calloc(n,4),*az=calloc(n,4);
+    float *bx=calloc(n,4),*by=calloc(n,4),*bz=calloc(n,4);
+    fy_register_demons(fixed,moving,nz,ny,nx,ax,ay,az, 60, 0.7, 1.5);  /* loose */
+    fy_register_demons(fixed,moving,nz,ny,nx,bx,by,bz, 60, 2.5, 1.5);  /* stiff */
+    double g_loose=field_grad_mag(ax,nz,ny,nx);
+    double g_stiff=field_grad_mag(bx,nz,ny,nx);
+    printf("     [demons regularization] grad(sigma=0.7)=%.4f  grad(sigma=2.5)=%.4f\n",g_loose,g_stiff);
+    CHECK(g_stiff<g_loose, "larger field_sigma -> smoother (lower-gradient) field");
+    CHECK(g_stiff<0.5, "stiff field stays smooth/bounded (no tearing)");
+    free(fixed);free(moving);free(tx);free(ty);free(tz);
+    free(ax);free(ay);free(az);free(bx);free(by);free(bz);
+}
+
+static void test_register_full_affine_plus_demons(void) {
+    int nz=64,ny=64,nx=64; size_t n=(size_t)nz*ny*nx;
+    float *fixed=malloc(4*n),*moving=malloc(4*n);
+    float *aff_only=malloc(4*n),*full=malloc(4*n);
+    float *tx=malloc(4*n),*ty=malloc(4*n),*tz=malloc(4*n);
+    float *ux=calloc(n,4),*uy=calloc(n,4),*uz=calloc(n,4);
+    make_textured_vol(fixed,nz,ny,nx);
+    /* moving = affine(fixed) THEN smooth deformation: build a combined moving */
+    double cz=(nz-1)*0.5,cy=(ny-1)*0.5,cx=(nx-1)*0.5;
+    double Mgen[12];
+    build_M(Mgen, 0.06,0.04,0.05, 1.03, 2.0,-1.5,1.0, cz,cy,cx);
+    float *affd=malloc(4*n);
+    fy_warp_affine(fixed,affd,nz,ny,nx,Mgen,nz,ny,nx);    /* affine part */
+    make_true_field(tx,ty,tz,nz,ny,nx, 3.0);
+    fy_warp_field(affd,moving,nz,ny,nx,tx,ty,tz);          /* + deformation */
+
+    /* affine alone */
+    double M_aff[12]={1,0,0,0,0,1,0,0,0,0,1,0};
+    fy_register_affine(fixed,moving,nz,ny,nx,M_aff,0);
+    fy_warp_affine(moving,aff_only,nz,ny,nx,M_aff,nz,ny,nx);
+    double ncc_aff=pearson(fixed,aff_only,n);
+
+    /* affine + demons via fy_register_full */
+    double M_full[12]={1,0,0,0,0,1,0,0,0,0,1,0};
+    fy_register_full(fixed,moving,nz,ny,nx,M_full,0, ux,uy,uz, 80,1.5,1.5);
+    fy_warp_affine(moving,affd,nz,ny,nx,M_full,nz,ny,nx);
+    fy_warp_field(affd,full,nz,ny,nx,ux,uy,uz);
+    double ncc_full=pearson(fixed,full,n);
+
+    printf("     [affine vs affine+demons] NCC affine=%.4f  affine+demons=%.4f\n",ncc_aff,ncc_full);
+    CHECK(ncc_full>ncc_aff+0.005, "affine+demons beats affine alone on affine+deformable warp");
+    free(fixed);free(moving);free(aff_only);free(full);free(affd);
+    free(tx);free(ty);free(tz);free(ux);free(uy);free(uz);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -341,6 +695,18 @@ int main(void) {
     test_dewindow();
     test_estimate_noise();
     test_deltabeta_scale();
+    test_warp_identity();
+    test_warp_translation();
+    test_warp_roundtrip();
+    test_downsample2x();
+    test_ncc_self();
+    test_register_rigid();
+    test_register_affine();
+    test_register_contrast();
+    test_warp_field_identity();
+    test_demons_known_warp();
+    test_demons_regularization();
+    test_register_full_affine_plus_demons();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
