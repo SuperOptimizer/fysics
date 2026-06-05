@@ -1063,6 +1063,28 @@ static void test_coherence_diffusion_gap(void) {
     free(clean);free(noisy);free(ced);free(gauss);
 }
 
+static void test_coherence_diffusion_auto(void) {
+    /* auto path runs end-to-end on a two-sheet+gap volume, denoises, keeps the gap */
+    int nz=40,ny=40,nx=40; size_t n=(size_t)nz*ny*nx;
+    float *in=malloc(4*n), *out=malloc(4*n);
+    unsigned s=271;
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        /* two bright x-y sheets at z=16 and z=22 (gap at z=19) */
+        double v=(z==16||z==22)?0.8:0.1;
+        s=s*1103515245u+12345u; double nse=((s>>16)&0x7fff)/32768.0-0.5;
+        in[((size_t)z*ny+y)*nx+x]=(float)(v+0.05*nse);
+    }
+    int rc=fy_coherence_diffusion_auto(in,out,nz,ny,nx,2);
+    CHECK(rc==0,"fy_coherence_diffusion_auto runs");
+    int finite=1; for(size_t i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
+    CHECK(finite,"auto CED output finite");
+    /* gap (z=19) stays darker than sheets (z=16) */
+    double gap=0,sheet=0; int c=0;
+    for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){gap+=out[((size_t)19*ny+y)*nx+x];sheet+=out[((size_t)16*ny+y)*nx+x];c++;}
+    CHECK(gap/c < 0.7*(sheet/c), "auto CED keeps the inter-sheet gap (gap<<sheet)");
+    free(in);free(out);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_vs_dft();
@@ -1103,6 +1125,7 @@ int main(void) {
     test_phase_correlate_subvoxel();
     test_mutual_information_peaks();
     test_coherence_diffusion_gap();
+    test_coherence_diffusion_auto();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
