@@ -1085,6 +1085,157 @@ static void test_coherence_diffusion_auto(void) {
     free(in);free(out);
 }
 
+/* ---- IN-PLANE TEXTURE ENHANCER ----
+ * Volume: a thick bright SHEET (slab perpendicular to z, normal = +z) that carries a
+ * fine IN-PLANE ripple (high-freq sinusoid along x, within the sheet plane) = the
+ * "crackle" texture. PLUS a cross-sheet intensity STEP (background jumps across z) =
+ * the layering we must NOT amplify. PLUS noise everywhere. We assert:
+ *   (a) in-plane texture-band energy INCREASES after the filter;
+ *   (b) the cross-sheet step is NOT amplified (~unchanged/suppressed -- a plain unsharp
+ *       mask would boost it, the steered one must not);
+ *   (c) noise-only regions are NOT blown up: texture/noise ratio IMPROVES (gating). */
+static void test_texture_enhance(void) {
+    int nz=48,ny=48,nx=48; size_t n=(size_t)nz*ny*nx;
+    float *vol=malloc(4*n), *out=malloc(4*n);
+    /* sheet occupies z in [18,30]; background below/above. In-plane ripple along x with
+     * period ~3 vox (fine texture). Cross-sheet step: background = 0.15 for z<24, 0.45
+     * for z>=24 (a layering step ACROSS the sheet normal). Sheet base brightness 0.7. */
+    double tex_period = 3.0;            /* fine in-plane texture period (vox)        */
+    double tex_amp    = 0.06;           /* faint texture amplitude                  */
+    /* Layout along z (the sheet-normal axis):
+     *   z<10        : background 0.15
+     *   z in [10,18): background 0.45   <- a CLEAN cross-sheet (layering) STEP at z=10,
+     *                                       a pure edge along the normal, away from sheet
+     *   z in [18,30): bright sheet 0.70 + fine in-plane ripple (the texture)
+     *   z>=30       : background 0.45
+     * The step at z=10 is the layering edge we must NOT amplify. */
+    unsigned int seed=99173u;
+    for (int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        int in_sheet = (z>=18 && z<30);
+        double base = (z<10)? 0.15 : 0.45;         /* cross-sheet layering step @z=10 */
+        double v = base;
+        if (in_sheet) {
+            /* bright sheet + fine in-plane ripple (function of x and y, NOT z) */
+            double ripple = tex_amp*sin(2.0*M_PI*x/tex_period)
+                          + tex_amp*0.6*sin(2.0*M_PI*y/tex_period);
+            v = 0.70 + ripple;
+        }
+        seed=seed*1103515245u+12345u;
+        double nse=((double)((seed>>9)&1023)/1023.0-0.5)*0.06;  /* +/-0.03 noise */
+        vol[((size_t)z*ny+y)*nx+x]=(float)(v+nse);
+    }
+
+    /* explicit call: sigma small, rho integrates within the sheet, gain=2.5, inplane
+     * low-pass radius 2.5 (> texture half-period so the ripple lands in the detail
+     * band), noise_floor = -1 (auto-derive gate from the detail's MAD -- the
+     * recommended self-calibrating mode). */
+    int rc=fy_texture_enhance(vol,out,nz,ny,nx, 0.7, 2.5, 2.5, 2.5, -1.0);
+    CHECK(rc==0,"fy_texture_enhance returns 0");
+    int finite=1; for(size_t i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
+    CHECK(finite,"texture-enhance output finite");
+
+    /* ---- (a) in-plane texture-band energy: variance along x within a sheet row,
+     * AVERAGED over rows, measured on a band-passed signal (subtract a length-5 moving
+     * mean to isolate the fine ripple from the slow trend). Center y,z to avoid halo. */
+    #define TEXBAND(buf) ({ double tot=0; int rows=0; \
+        for(int z=20;z<28;z++)for(int y=8;y<ny-8;y++){ \
+            double e=0; int c=0; \
+            for(int x=4;x<nx-4;x++){ \
+                double s=0; for(int t=-2;t<=2;t++) s+=buf[((size_t)z*ny+y)*nx+(x+t)]; \
+                double hp=buf[((size_t)z*ny+y)*nx+x]-s/5.0; \
+                e+=hp*hp; c++; } \
+            tot+=e/c; rows++; } tot/rows; })
+    double tex_in = TEXBAND(vol), tex_out = TEXBAND(out);
+    printf("     [tex] in-plane texture-band energy: in=%.6f -> out=%.6f (%.2fx)\n",
+           tex_in, tex_out, tex_out/tex_in);
+    CHECK(tex_out > 1.3*tex_in, "in-plane texture-band energy INCREASES (>1.3x)");
+
+    /* ---- compute a PLAIN (non-steered) isotropic unsharp mask at MATCHED gain for the
+     * comparison: it sharpens the cross-sheet edge too (it low-passes across the normal).
+     * The steered version must NOT (it only low-passes in-plane). */
+    float *plain=malloc(4*n), *lp=malloc(4*n);
+    memcpy(lp,vol,4*n);
+    /* isotropic 5x5x5 box low-pass, applied twice (~matched to inplane_scale reach) */
+    for(int pass=0;pass<2;pass++){ float *tmp=malloc(4*n); memcpy(tmp,lp,4*n);
+        for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){ double s=0;int c=0;
+            for(int dz=-2;dz<=2;dz++)for(int dy=-2;dy<=2;dy++)for(int dx=-2;dx<=2;dx++){
+                int zz=z+dz<0?0:(z+dz>=nz?nz-1:z+dz),yy=y+dy<0?0:(y+dy>=ny?ny-1:y+dy),xx=x+dx<0?0:(x+dx>=nx?nx-1:x+dx);
+                s+=tmp[((size_t)zz*ny+yy)*nx+xx];c++; }
+            lp[((size_t)z*ny+y)*nx+x]=(float)(s/c); }
+        free(tmp); }
+    for(size_t i=0;i<n;i++) plain[i]=(float)(vol[i]+2.5*(vol[i]-lp[i]));  /* gain 2.5 */
+
+    /* ---- (b) cross-sheet (layering) STEP RESPONSE at the z=10 background edge. The
+     * step is along the sheet NORMAL (z). We measure the max |z-gradient| across the edge
+     * (peak slope), averaged over the background xy-plane. A plain unsharp SHARPENS this
+     * edge (gradient up); the steered filter must leave it ~unchanged (not amplified). */
+    #define ZEDGE(buf) ({ double best=0; \
+        for(int zc=8;zc<=12;zc++){ double m=0;int c=0; \
+            for(int y=8;y<ny-8;y++)for(int x=8;x<nx-8;x++){ \
+                m+=fabs((double)buf[((size_t)(zc+1)*ny+y)*nx+x]-(double)buf[((size_t)(zc-1)*ny+y)*nx+x]); c++; } \
+            m/=c; if(m>best)best=m; } best; })
+    double step_in   = ZEDGE(vol);
+    double step_out  = ZEDGE(out);
+    double step_plain= ZEDGE(plain);
+    printf("     [tex] cross-sheet edge slope: in=%.4f -> steered=%.4f (%.2fx), plain-unsharp=%.4f (%.2fx)\n",
+           step_in, step_out, step_out/step_in, step_plain, step_plain/step_in);
+    CHECK(step_out < 1.15*step_in, "cross-sheet layering edge NOT amplified by steered filter (<1.15x)");
+    CHECK(step_out < 0.85*step_plain, "steered preserves layering FAR better than a plain unsharp mask");
+
+    /* ---- (c) texture/noise ratio: noise = std in a FLAT background slab (z=13..17,
+     * uniform 0.45 background -- no sheet, no ripple, no step). texture/noise must
+     * IMPROVE. */
+    #define NOISESTD(buf) ({ double m=0,m2=0;int c=0; \
+        for(int z=13;z<18;z++)for(int y=8;y<ny-8;y++)for(int x=8;x<nx-8;x++){ \
+            double v=buf[((size_t)z*ny+y)*nx+x]; m+=v;m2+=v*v;c++; } m/=c; sqrt(m2/c-m*m); })
+    double noise_in = NOISESTD(vol), noise_out = NOISESTD(out);
+    double tnr_in  = sqrt(tex_in)/(noise_in+1e-9);
+    double tnr_out = sqrt(tex_out)/(noise_out+1e-9);
+    /* and the plain unsharp's noise for reference */
+    double noise_plain = NOISESTD(plain);
+    printf("     [tex] flat-region noise std: in=%.5f -> steered=%.5f, plain=%.5f\n",
+           noise_in, noise_out, noise_plain);
+    printf("     [tex] texture/noise ratio: in=%.3f -> out=%.3f (%.2fx)\n",
+           tnr_in, tnr_out, tnr_out/tnr_in);
+    CHECK(tnr_out > 1.2*tnr_in, "texture/noise ratio IMPROVES (>1.2x) -- gating works");
+    CHECK(noise_out < 1.5*noise_in, "noise not blown up (gating caps flat-region amplification)");
+
+    free(plain);free(lp);
+    free(vol);free(out);
+    #undef TEXBAND
+    #undef ZEDGE
+    #undef NOISESTD
+}
+
+static void test_texture_enhance_auto(void) {
+    /* auto path runs end-to-end and lifts in-plane texture without exploding. */
+    int nz=44,ny=44,nx=44; size_t n=(size_t)nz*ny*nx;
+    float *in=malloc(4*n), *out=malloc(4*n);
+    unsigned s=4242u;
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        int in_sheet=(z>=18 && z<26);
+        double base=(z<22)?0.2:0.4;
+        double v=base;
+        if(in_sheet) v=0.7 + 0.06*sin(2.0*M_PI*x/3.0) + 0.04*sin(2.0*M_PI*y/3.0);
+        s=s*1103515245u+12345u; double nse=((s>>16)&0x7fff)/32768.0-0.5;
+        in[((size_t)z*ny+y)*nx+x]=(float)(v+0.04*nse);
+    }
+    int rc=fy_texture_enhance_auto(in,out,nz,ny,nx,2);
+    CHECK(rc==0,"fy_texture_enhance_auto runs");
+    int finite=1; for(size_t i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
+    CHECK(finite,"auto texture-enhance output finite");
+    /* in-plane texture-band energy up inside the sheet */
+    #define TB(buf) ({ double tot=0;int rows=0; \
+        for(int z=20;z<25;z++)for(int y=8;y<ny-8;y++){ double e=0;int c=0; \
+            for(int x=4;x<nx-4;x++){ double sm=0; for(int t=-2;t<=2;t++) sm+=buf[((size_t)z*ny+y)*nx+(x+t)]; \
+                double hp=buf[((size_t)z*ny+y)*nx+x]-sm/5.0; e+=hp*hp;c++; } tot+=e/c;rows++; } tot/rows; })
+    double tin=TB(in), tout=TB(out);
+    printf("     [tex-auto] texture-band energy: in=%.6f -> out=%.6f (%.2fx)\n", tin,tout,tout/tin);
+    CHECK(tout > tin, "auto: in-plane texture-band energy increases");
+    #undef TB
+    free(in);free(out);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_vs_dft();
@@ -1126,6 +1277,8 @@ int main(void) {
     test_mutual_information_peaks();
     test_coherence_diffusion_gap();
     test_coherence_diffusion_auto();
+    test_texture_enhance();
+    test_texture_enhance_auto();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
