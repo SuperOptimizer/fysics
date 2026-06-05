@@ -979,6 +979,90 @@ static void test_mutual_information_peaks(void) {
     free(fixed);free(moving);free(noise);
 }
 
+/* Coherence-enhancing diffusion: two parallel bright sheets separated by a thin
+ * dark gap, plus noise. CED must (a) drop the noise on the sheets AND (b) keep the
+ * dark gap dark (NOT merge the layers). A plain isotropic blur would fill the gap. */
+static void test_coherence_diffusion_gap(void) {
+    int nz=48,ny=48,nx=48,n=nz*ny*nx;
+    float *clean=malloc(4*n), *noisy=malloc(4*n), *ced=malloc(4*n), *gauss=malloc(4*n);
+    /* two bright sheets perpendicular to x: a plane at x=22 and x=26 (3-vox gap at
+     * x=23,24,25 stays dark). Sheets span all y,z (planar -> coherent). */
+    int s1=22, s2=26;
+    for (int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        float v=0.1f;                         /* dark background */
+        if (x==s1-1||x==s1||x==s1+1) v=0.9f;  /* sheet 1 (3 vox thick) */
+        if (x==s2-1||x==s2||x==s2+1) v=0.9f;  /* sheet 2 */
+        clean[((size_t)z*ny+y)*nx+x]=v;
+    }
+    /* add noise */
+    unsigned int seed=1234567u;
+    for (int i=0;i<n;i++){ seed=seed*1103515245u+12345u;
+        float r=((float)((seed>>9)&1023)/1023.0f - 0.5f)*0.30f;
+        noisy[i]=clean[i]+r; }
+
+    double sigma=0.7, rho=3.0, tau=0.10, alpha=0.001; int iters=10;
+    int rc=fy_coherence_diffusion(noisy,ced,nz,ny,nx,sigma,rho,tau,iters,alpha);
+    CHECK(rc==0, "fy_coherence_diffusion returns 0");
+
+    /* matched-smoothing Gaussian blur for comparison (fills the gap -> the bad case).
+     * sigma chosen ~ along-sheet smoothing reach; reuse fy_sheetness path? just do a
+     * separable gaussian via the public guided? simplest: small explicit gaussian.   */
+    /* approximate a matched isotropic gaussian using repeated 3-pt smoothing */
+    memcpy(gauss,noisy,4*n);
+    for (int pass=0; pass<8; pass++){
+        float *tmp=malloc(4*n); memcpy(tmp,gauss,4*n);
+        for (int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+            int xm=x>0?x-1:0,xp=x<nx-1?x+1:nx-1;
+            int ym=y>0?y-1:0,yp=y<ny-1?y+1:ny-1;
+            int zm=z>0?z-1:0,zp=z<nz-1?z+1:nz-1;
+            size_t i=((size_t)z*ny+y)*nx+x;
+            gauss[i]=(tmp[((size_t)z*ny+y)*nx+xm]+tmp[((size_t)z*ny+y)*nx+xp]
+                     +tmp[((size_t)z*ny+ym)*nx+x]+tmp[((size_t)z*ny+yp)*nx+x]
+                     +tmp[((size_t)zm*ny+y)*nx+x]+tmp[((size_t)zp*ny+y)*nx+x]
+                     +tmp[i])/7.0f;
+        }
+        free(tmp);
+    }
+
+    /* (a) sheet-interior noise: std over the interior of sheet 1 (x=s1), central yz. */
+    #define INTERIOR(buf,xc) ({ double m=0,m2=0; int c=0; \
+        for(int z=8;z<nz-8;z++)for(int y=8;y<ny-8;y++){ \
+            double v=buf[((size_t)z*ny+y)*nx+(xc)]; m+=v;m2+=v*v;c++;} \
+        m/=c; sqrt(m2/c-m*m); })
+    double noisy_std=INTERIOR(noisy,s1);
+    double ced_std  =INTERIOR(ced,s1);
+    printf("     [ced] sheet-interior std: noisy=%.4f -> CED=%.4f\n", noisy_std, ced_std);
+    CHECK(ced_std < 0.6*noisy_std, "CED drops sheet-interior noise substantially (>40%)");
+
+    /* (b) GAP PRESERVATION: gap center is x=24. Contrast = sheet_mean - gap_min over
+     * the central region. CED must keep the gap dark; Gaussian fills it. */
+    #define GAPMIN(buf) ({ double mn=1e9; \
+        for(int z=12;z<nz-12;z++)for(int y=12;y<ny-12;y++){ \
+            double v=buf[((size_t)z*ny+y)*nx+24]; if(v<mn)mn=v;} mn; })
+    #define GAPMEAN(buf) ({ double m=0;int c=0; \
+        for(int z=12;z<nz-12;z++)for(int y=12;y<ny-12;y++){ \
+            m+=buf[((size_t)z*ny+y)*nx+24];c++;} m/c; })
+    #define SHEETMEAN(buf,xc) ({ double m=0;int c=0; \
+        for(int z=12;z<nz-12;z++)for(int y=12;y<ny-12;y++){ \
+            m+=buf[((size_t)z*ny+y)*nx+(xc)];c++;} m/c; })
+    double clean_gap=GAPMEAN(clean), clean_sheet=SHEETMEAN(clean,s1);
+    double ced_gap=GAPMEAN(ced),     ced_sheet=SHEETMEAN(ced,s1);
+    double gau_gap=GAPMEAN(gauss),   gau_sheet=SHEETMEAN(gauss,s1);
+    double clean_contrast=clean_sheet-clean_gap;
+    double ced_contrast  =ced_sheet-ced_gap;
+    double gau_contrast  =gau_sheet-gau_gap;
+    printf("     [ced] gap-mean: clean=%.3f CED=%.3f gauss=%.3f\n",clean_gap,ced_gap,gau_gap);
+    printf("     [ced] sheet-vs-gap contrast: clean=%.3f CED=%.3f(%.0f%%) gauss=%.3f(%.0f%%)\n",
+           clean_contrast, ced_contrast, 100*ced_contrast/clean_contrast,
+           gau_contrast, 100*gau_contrast/clean_contrast);
+    /* CED retains most of the gap contrast (>70% of clean) */
+    CHECK(ced_contrast > 0.70*clean_contrast, "CED PRESERVES the inter-sheet gap (>70% contrast retained)");
+    /* and is decisively better at it than matched gaussian blur */
+    CHECK(ced_contrast > 1.3*gau_contrast, "CED preserves the gap far better than a matched Gaussian blur");
+
+    free(clean);free(noisy);free(ced);free(gauss);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_vs_dft();
@@ -1018,6 +1102,7 @@ int main(void) {
     test_fuse_denoises();
     test_phase_correlate_subvoxel();
     test_mutual_information_peaks();
+    test_coherence_diffusion_gap();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
