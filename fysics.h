@@ -387,6 +387,52 @@ double fy_ncc_warped(const float *fixed, const float *moving,
 int fy_register_affine(const float *fixed, const float *moving,
                        int nz, int ny, int nx, double *M_out, int rigid_only);
 
+/* ===== SUB-VOXEL TRANSLATION + MULTIMODAL METRIC (phasecorr.c) ============
+ * The local-patch refinement that bootstraps a coarse landmark seed to sub-voxel
+ * on the self-similar laminar scroll. Plain intensity NCC is non-discriminative
+ * GLOBALLY (papyrus is self-similar) but a SINGLE textured patch is not
+ * self-similar with itself under a small shift, so a LOCAL metric on a textured
+ * patch is sharp. Two tools provide that locally:
+ *   - fy_phase_correlate: sub-voxel translation via the Fourier shift theorem.
+ *     Robust to contrast/brightness differences (cross-energy) because the
+ *     cross-power spectrum is normalized to unit magnitude -- only phase (=shift)
+ *     survives. Use it to measure the residual local displacement of a patch.
+ *   - fy_mutual_information: the gold-standard MULTIMODAL similarity. NCC assumes
+ *     a LINEAR intensity relation between the two scans; MI assumes only a
+ *     statistical dependence, so it is sharp even when the two energies map
+ *     intensity nonlinearly. */
+
+/* Sub-voxel translation between two SAME-SIZE volumes via phase correlation.
+ * Returns the shift (dz,dy,dx) such that moving(p) ~ fixed(p - shift), i.e. the
+ * displacement that, applied to `moving`, aligns it onto `fixed` (moving is
+ * `fixed` shifted by +shift). Dims need NOT be powers of two -- the volume is
+ * internally zero-padded (after mean-removal + a separable Hann window to kill
+ * edge wrap-around) to the next pow2. The cross-power spectrum peak is localized
+ * to integer voxel, then refined to sub-voxel by 1-D parabolic interpolation on
+ * the three samples straddling the peak along each axis.
+ *   shift  : out, 3 doubles (dz,dy,dx) in voxels.
+ *   peak   : optional out, the normalized correlation peak height in [0,1]
+ *            (a match-confidence; reject patches below a threshold). May be NULL.
+ *   window : 1 = apply Hann window (recommended for non-periodic patches),
+ *            0 = none (use when the patch is already apodized/periodic).
+ * Returns 0 on success, 1 on bad args / degenerate (flat) input. */
+int fy_phase_correlate(const float *fixed, const float *moving,
+                       int nz, int ny, int nx,
+                       double *shift, double *peak, int window);
+
+/* Mutual Information between `fixed` and `moving` warped by M, over the in-bounds
+ * overlap, from a joint intensity histogram (nbins x nbins). Both images are
+ * scaled to [0,nbins) using their OWN overlap min/max (so MI is invariant to any
+ * monotonic-affine intensity change of either image, like NCC, but unlike NCC it
+ * does NOT assume the relation is linear -- it captures arbitrary statistical
+ * dependence, the reason MI is the multimodal gold standard).
+ *   MI = sum p(a,b) log( p(a,b) / (p(a) p(b)) ), in NATS; 0 = independent,
+ *   larger = more dependent (better aligned). Returns -1.0 if overlap < 32 voxels.
+ *   nbins : 32-64 typical (too many -> sparse histogram noise; too few -> blurred).
+ * Same geometry/overlap convention as fy_ncc_warped. */
+double fy_mutual_information(const float *fixed, const float *moving,
+                            int nz, int ny, int nx, const double *M, int nbins);
+
 /* ===== LAYER 2: deformable (non-rigid) registration via Demons ============
  * After affine removes the global transform, two scans of the SAME scroll
  * still differ by a SMOOTH physical warp (thermal/humidity expansion, creep,
