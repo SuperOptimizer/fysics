@@ -35,6 +35,33 @@ void fy_float_to_u8(const float *in, unsigned char *out, size_t n) {
     }
 }
 
+/* ---- recover physical attenuation from the per-volume u8 export window ----
+ * Exact linear inverse of nabu's export windowing (see fysics.h). Per-voxel and
+ * streaming-friendly: no global state, process any chunk independently. */
+void fy_u8_to_phys(const unsigned char *in, float *out, size_t n,
+                   double f32_min, double f32_max) {
+    float lo = (float)f32_min;
+    float scale = (float)((f32_max - f32_min) / 255.0);
+    for (size_t i = 0; i < n; i++) out[i] = lo + in[i] * scale;
+}
+
+void fy_phys_to_u8(const float *in, unsigned char *out, size_t n,
+                   double f32_min, double f32_max) {
+    double span = f32_max - f32_min;
+    float inv = (span != 0.0) ? (float)(255.0 / span) : 0.0f;
+    float lo = (float)f32_min;
+    for (size_t i = 0; i < n; i++) {
+        float v = (in[i] - lo) * inv + 0.5f;
+        out[i] = v < 0 ? 0 : (v > 255 ? 255 : (unsigned char)v);
+    }
+}
+
+float fy_phys_to_u8_level(double phys, double f32_min, double f32_max) {
+    double span = f32_max - f32_min;
+    if (span == 0.0) return 0.0f;
+    return (float)((phys - f32_min) / span * 255.0);
+}
+
 /* ================= GLOBAL: histogram-based ops (two-pass) ================= */
 /* State accumulates a 256-bin histogram of u8 values over the whole volume.
  * Tiny + mergeable, so passes can even be parallelized (accumulate per thread,

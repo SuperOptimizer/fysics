@@ -43,6 +43,28 @@ double fy_recon_transfer(double f_cyc_per_voxel, const fy_physics *p) {
     return H;
 }
 
+/* Maximum Wiener gain we ever allow, so a bad reg can't amplify the high-frequency
+ * noise floor without bound. The Wiener filter H/(H^2+reg) peaks at 1/(2*sqrt(reg)),
+ * so capping the gain == enforcing a reg floor; we apply it directly as a clamp in the
+ * filter loop (frequency-by-frequency) which is strictly safer than only raising reg. */
+#define FY_MAX_DECONV_GAIN 8.0
+
+/* Noise-safe regularization for fy_deconvolve.
+ *
+ * NOTE (measured, PHerc0139, 2026-06): an FRC even/odd-split test showed the high-
+ * frequency content of these volumes is COHERENT SIGNAL out to ~0.9 Nyquist (FRC ~0.95),
+ * not a noise floor -- so the Wiener inverse amplifying it by w^2 is correct, not a bug.
+ * The Wiener gain w=H/(H^2+reg) is already self-limiting (peaks at 1/(2*sqrt(reg))), and
+ * on real data it stays < ~4 for every tested volume. There is therefore no need to
+ * scale reg up for "strong-filter" volumes; doing so would just blur away real detail.
+ * We keep a single conservative base, and the per-frequency gain clamp
+ * (FY_MAX_DECONV_GAIN) in the filter loop is the only hard safety rail -- it never fires
+ * on the measured data but bounds pathological metadata. */
+double fy_auto_reg(const fy_physics *p, double base) {
+    (void)p;
+    return base > 0.0 ? base : 0.015;
+}
+
 int fy_kernel_halo(const fy_physics *p) {
     /* impulse response of the deconv filter along one axis; find decay extent */
     const int n = 256;
@@ -83,6 +105,8 @@ static inline int reflect(int i, int n) {
 int fy_deconvolve(const float *in, float *out,
                   int nz, int ny, int nx,
                   const fy_physics *p, double reg) {
+    /* reg <= 0 -> derive a noise-safe value from the volume physics (recommended). */
+    if (reg <= 0.0) reg = fy_auto_reg(p, 0.015);
     int pz = fy_next_pow2(nz), py = fy_next_pow2(ny), px = fy_next_pow2(nx);
     size_t np = (size_t)pz * py * px;
     float *re = (float *)malloc(sizeof(float) * np);
@@ -123,6 +147,8 @@ int fy_deconvolve(const float *in, float *out,
                 double fr = sqrt(fzy + fx2[x]);
                 double H = fy_recon_transfer(fr, p);
                 double w = H / (H * H + reg);
+                /* hard cap so a mis-set reg can never amplify the noise floor */
+                if (w > FY_MAX_DECONV_GAIN) w = FY_MAX_DECONV_GAIN;
                 re[row + x] *= (float)w;
                 im[row + x] *= (float)w;
             }

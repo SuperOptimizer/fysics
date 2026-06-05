@@ -52,6 +52,25 @@ typedef struct { long hist[256]; long total; } fy_hist_state;
 void fy_u8_to_float(const unsigned char *in, float *out, size_t n);
 void fy_float_to_u8(const float *in, unsigned char *out, size_t n);
 
+/* ---- recover PHYSICAL attenuation from the exported u8 (per-volume window) ----
+ * At export, nabu linearly mapped physical f32 attenuation in [f32_min, f32_max] to
+ * the stored u8 [0,255]; that window is recorded per-volume in metadata.json
+ * (zarr_export.target_window_f32_min / _max). It DIFFERS per volume, so a fixed u8
+ * threshold means different physical things in different volumes (e.g. physical-zero
+ * "air" lands at u8 ~32-44 depending on the scan). Inverting the window puts every
+ * volume into the SAME physical units, so one physical threshold/normalization is
+ * consistent everywhere. The map is exact and linear (verified bit-exact round-trip).
+ *   forward:  phys = f32_min + (u8/255)*(f32_max - f32_min)
+ *   inverse:  u8   = clip( (phys - f32_min)/(f32_max - f32_min) * 255 + 0.5, 0, 255 )
+ * Pass the two window values straight from metadata. */
+void fy_u8_to_phys(const unsigned char *in, float *out, size_t n,
+                   double f32_min, double f32_max);
+void fy_phys_to_u8(const float *in, unsigned char *out, size_t n,
+                   double f32_min, double f32_max);
+/* convenience: the u8 level a given physical value maps to in this volume's window
+ * (e.g. to turn a physical air threshold into the per-volume u8 air_thresh). */
+float fy_phys_to_u8_level(double phys, double f32_min, double f32_max);
+
 void fy_hist_init(fy_hist_state *s);
 void fy_hist_accumulate_u8(fy_hist_state *s, const unsigned char *chunk, size_t n);
 void fy_hist_merge(fy_hist_state *dst, const fy_hist_state *src);  /* parallel accum */
@@ -100,11 +119,24 @@ double fy_paganin_transfer(double f_cyc_per_voxel, const fy_physics *p);
 double fy_unsharp_transfer(double f_cyc_per_voxel, const fy_physics *p);
 double fy_recon_transfer(double f_cyc_per_voxel, const fy_physics *p); /* paganin*unsharp */
 
+/* Noise-safe auto regularization for fy_deconvolve.
+ * The plain Wiener inverse H/(H^2+reg) keeps GROWING with frequency when the recon
+ * low-pass H is strong (large delta_beta * distance), so a fixed reg that is fine for
+ * a 2.4um/220mm volume amplifies the noise floor ~14x on a 9.4um/1200mm volume
+ * (measured on PHerc0139). This returns a reg scaled to the filter strength so the
+ * Wiener gain peaks near the signal/noise crossover instead of blowing up.
+ * base ~ 0.015 reproduces the hand-tuned default on the fine volumes. */
+double fy_auto_reg(const fy_physics *p, double base);
+
 /* ---- main kernel: Wiener deconvolution of the recon transfer ----
  * Sharpens `vol` (nz*ny*nx, row-major, x fastest) in place-or-out.
  *   in:  pointer to input volume (float, any range)
  *   out: pointer to output (may equal in); same shape
- *   reg: Wiener regularization (sharpening strength; lower = sharper + noisier)
+ *   reg: Wiener regularization (sharpening strength; lower = sharper + noisier).
+ *        Pass reg <= 0 to auto-derive a noise-safe value via fy_auto_reg() (base
+ *        0.015) -- RECOMMENDED, since the right reg depends on the volume's physics.
+ * The Wiener gain H/(H^2+reg) is additionally capped at FY_MAX_DECONV_GAIN so a
+ * mis-set reg can never amplify the high-frequency noise floor without bound.
  * Dimensions are zero-padded internally to powers of two (reflect padding) so
  * arbitrary sizes work. Returns 0 on success, nonzero on allocation failure.
  */

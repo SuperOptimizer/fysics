@@ -231,6 +231,22 @@ static void test_auto_thresh(void){
     CHECK(th>0.1f && th<0.5f,"Otsu auto air-threshold lands in the valley");
 }
 
+static void test_dewindow(void){
+    /* exact linear round-trip u8 -> physical -> u8 (per-volume window) */
+    double f0=-0.03, f1=0.21;
+    unsigned char u8[256]; for(int i=0;i<256;i++) u8[i]=(unsigned char)i;
+    float phys[256]; unsigned char back[256];
+    fy_u8_to_phys(u8, phys, 256, f0, f1);
+    fy_phys_to_u8(phys, back, 256, f0, f1);
+    int maxerr=0; for(int i=0;i<256;i++){int e=abs((int)back[i]-(int)u8[i]); if(e>maxerr)maxerr=e;}
+    CHECK(maxerr==0, "u8<->phys window round-trips exactly");
+    /* physical endpoints land where expected */
+    CHECK(fabs(phys[0]-f0)<1e-6 && fabs(phys[255]-f1)<1e-6, "phys window maps 0..255 -> f0..f1");
+    /* a fixed physical value maps to different u8 levels under different windows */
+    float a=fy_phys_to_u8_level(0.0,-0.03,0.145), b=fy_phys_to_u8_level(0.0,-0.03,0.21);
+    CHECK(fabs(a-b)>1.0, "fixed physical level -> different u8 per volume (the whole point)");
+}
+
 static void test_sheetness(void){
     int nz=32,ny=32,nx=32; size_t n=(size_t)nz*ny*nx;
     float*in=malloc(4*n),*out=malloc(4*n);
@@ -268,6 +284,7 @@ int main(void) {
     test_zdrift();
     test_auto_thresh();
     test_sheetness();
+    test_dewindow();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
