@@ -381,6 +381,48 @@ int fy_coherence_diffusion_auto(const float *in, float *out, int nz, int ny, int
 /* Recommended per-side halo (voxels) to feed a tile so the result is seam-free. */
 int fy_coherence_diffusion_halo(double sigma, double rho, int n_iters);
 
+/* ===== IN-PLANE (surface-tangent) TEXTURE ENHANCER ========================
+ * COMPLEMENT of coherence diffusion: where CED SMOOTHS along sheets, this
+ * HIGH-PASSES along sheets. It LIFTS the fine in-plane "crackle" surface texture
+ * on papyrus (the faint texture ink sits in, per Vesuvius Grand Prize findings)
+ * while SUPPRESSING cross-sheet/layering variation and NOT amplifying noise.
+ *
+ * It is a STEERED, NOISE-GATED unsharp mask built on the SAME orientation field as
+ * CED (structure tensor J_rho, eigen-decomposed -> sheet normal + two in-plane
+ * tangents): low-pass ONLY within the tangent plane, detail = u - inplane_lowpass,
+ * soft-threshold (core) the detail at the noise level, out = u + gain*cored_detail.
+ * The in-plane (not isotropic) low-pass is why a cross-sheet STEP (layering) is NOT
+ * boosted while in-plane texture IS -- a plain unsharp mask boosts the step too.
+ *
+ * HONEST SCOPE: NOT an ink detector and not validated as one (no ink labels). It is
+ * the right transform IF ink is an in-plane texture signal; the proven, MEASURABLE
+ * claims are: in-plane texture-band energy up, texture/noise ratio up (gating),
+ * cross-sheet/layering variation NOT amplified.
+ *
+ * Explicit knobs: sigma (gradient presmooth, ~0.6-1), rho (orientation integration
+ * scale, ~2-4), gain (>0, ~0.5-3), inplane_scale (steered low-pass radius in vox,
+ * ~1.5-4: the texture band is detail finer than this within the plane), noise_floor
+ * (detail magnitude below this is soft-thresholded/cored; in detail-signal units.
+ * noise_floor==0 disables gating; noise_floor<0 is a SENTINEL = auto-derive the gate
+ * from the detail's own robust scale (1.4826*MAD), the recommended self-calibrating
+ * mode -- it measures the detail-band noise directly rather than mapping an absolute
+ * intensity-domain noise model that the bright sheets/layering would corrupt).
+ * Returns 0 on success, 1 on alloc failure. */
+int fy_texture_enhance(const float *in, float *out, int nz, int ny, int nx,
+                       double sigma, double rho, double gain,
+                       double inplane_scale, double noise_floor);
+/* AUTO-CALIBRATED "enhance in-plane texture over noise and over layering" -- no-knobs
+ * entry point. Derives sigma & noise_floor from the volume's measured noise
+ * (fy_estimate_noise for sigma; the gate is set from the detail's own MAD), rho from the
+ * measured cross-sheet layer spacing (autocorrelation), inplane_scale from the measured
+ * in-plane texture scale (in-plane autocorrelation), and gain from `strength`
+ * (1=gentle/0.8, 2=normal/1.5, 3=strong/2.5). Recommended call. */
+int fy_texture_enhance_auto(const float *in, float *out, int nz, int ny, int nx,
+                            int strength);
+/* Recommended per-side halo (voxels) to feed a tile so the result is seam-free:
+ * 3*sigma (presmooth) + 3*rho (integration box) + ceil(inplane_scale) + margin. */
+int fy_texture_enhance_halo(double sigma, double rho, double inplane_scale);
+
 /* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
  * Process a viewed region plus this margin, then keep only the inner region. */
 int fy_kernel_halo(const fy_physics *p);
