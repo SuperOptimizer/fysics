@@ -27,7 +27,9 @@
  *   2) zero-pad into the next-pow2 cube (fy_fft3d needs powers of two),
  *   3) form the normalized cross-power spectrum and inverse-FFT it,
  *   4) find the integer-voxel peak, unwrap it to a signed shift, and refine to
- *      sub-voxel by 1-D parabolic interpolation along each axis.
+ *      sub-voxel by the Foroosh (2002) phase-correlation estimator along each
+ *      axis (the model-correct inverse of the Dirichlet peak sampling; a parabola
+ *      assumes a smooth peak and biases toward the integer).
  *
  * Returned shift (dz,dy,dx) is the displacement that aligns `moving` onto
  * `fixed`: moving(p) ~ fixed(p - shift). (If moving = roll(fixed, +s) then we
@@ -39,6 +41,21 @@ static void hann1d(float *w, int n) {
     if (n == 1) { w[0] = 1.0f; return; }
     for (int i = 0; i < n; i++)
         w[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / (float)(n - 1));
+}
+
+/* Foroosh sub-voxel offset along one axis from the peak sample c0 and its two
+ * neighbours (cm at -1, cp at +1). The phase-correlation Dirichlet main lobe
+ * gives |delta| = cs/(cs +/- c0) toward the LARGER neighbour cs; pick the root in
+ * [-1,1]. Returns the signed offset in (-1,1) of the true peak from c0. */
+static double foroosh_off(double cm, double c0, double cp) {
+    double cs; double sgn;
+    if (cp >= cm) { cs = cp; sgn = +1.0; } else { cs = cm; sgn = -1.0; }
+    if (cs <= 0.0) return 0.0;                 /* both neighbours non-positive */
+    double d1 = cs / (cs + c0);
+    double d2 = cs / (cs - c0);
+    double d = (fabs(d1) <= fabs(d2)) ? d1 : d2;
+    if (d > 1.0) d = 1.0; else if (d < -1.0) d = -1.0;
+    return sgn * fabs(d);
 }
 
 int fy_phase_correlate(const float *fixed, const float *moving,
@@ -90,143 +107,62 @@ int fy_phase_correlate(const float *fixed, const float *moving,
     fy_fft3d(fr, fi, pz, py, px, -1);
     fy_fft3d(mr, mi, pz, py, px, -1);
 
-    /* Two cross-power spectra of C = conj(F)*M = (fr-i fi)(mr+i mi):
-     *   real = fr*mr + fi*mi ;  imag = fr*mi - fi*mr
-     * (a) PHASE-ONLY R = C/|C| -> a near-delta correlation surface, sharp integer
-     *     peak + robust to contrast (magnitude discarded). Stored in (fr,fi).
-     * (b) UN-NORMALIZED C (whitened only mildly) -> a SMOOTH band-limited peak whose
-     *     true max sits at the sub-voxel shift WITHOUT the Dirichlet real/imag
-     *     ambiguity of the phase-only surface. Stored in (cr2,ci2) for the
-     *     upsampled-DFT sub-voxel refine. */
-    float *cr2 = malloc(sizeof(float)*pn);
-    float *ci2 = malloc(sizeof(float)*pn);
-    if (!cr2 || !ci2) { free(fr);free(fi);free(mr);free(mi);free(cr2);free(ci2); return 1; }
+    /* Normalized cross-power spectrum R = conj(F)*M / |conj(F)*M|, stored in
+     * (fr,fi). conj(F)*M = (fr-i fi)(mr+i mi): real = fr*mr+fi*mi, imag = fr*mi-fi*mr.
+     * Normalizing to unit magnitude keeps ONLY the phase ramp (=the shift) and
+     * discards spectral magnitude -> robust to brightness/contrast (cross-energy). */
     double maxmag = 0.0;
     for (size_t i = 0; i < pn; i++) {
         float cr = fr[i]*mr[i] + fi[i]*mi[i];
         float ci = fr[i]*mi[i] - fi[i]*mr[i];
-        cr2[i] = cr; ci2[i] = ci;                 /* (b) un-normalized */
         float mag = sqrtf(cr*cr + ci*ci);
         if (mag > maxmag) maxmag = mag;
-        if (mag > 1e-12f) { fr[i] = cr/mag; fi[i] = ci/mag; }  /* (a) phase-only */
+        if (mag > 1e-12f) { fr[i] = cr/mag; fi[i] = ci/mag; }
         else { fr[i] = 0.0f; fi[i] = 0.0f; }
     }
+    free(mr); free(mi);
     if (maxmag < 1e-20) {  /* one image flat -> no phase info */
-        free(fr); free(fi); free(mr); free(mi); free(cr2); free(ci2);
+        free(fr); free(fi);
         shift[0]=shift[1]=shift[2]=0.0; if (peak) *peak = 0.0; return 1;
     }
-    free(mr); free(mi);
 
-    /* integer-voxel peak from the PHASE-ONLY surface (sharp). */
-    float *cr = malloc(sizeof(float)*pn);
-    float *ci = malloc(sizeof(float)*pn);
-    if (!cr || !ci) { free(fr);free(fi);free(cr2);free(ci2);free(cr);free(ci); return 1; }
-    memcpy(cr, fr, sizeof(float)*pn);
-    memcpy(ci, fi, sizeof(float)*pn);
-    fy_fft3d(cr, ci, pz, py, px, +1);
+    /* inverse FFT -> phase-correlation surface in fr (real; ci negligible). */
+    fy_fft3d(fr, fi, pz, py, px, +1);
+    fy_fft3d_normalize(fr, fi, pz, py, px);
 
-    size_t pk = 0; float best = cr[0];
-    for (size_t i = 1; i < pn; i++) if (cr[i] > best) { best = cr[i]; pk = i; }
+    /* integer-voxel peak */
+    size_t pk = 0; float best = fr[0];
+    for (size_t i = 1; i < pn; i++) if (fr[i] > best) { best = fr[i]; pk = i; }
     int kz = (int)(pk / ((size_t)py*px));
     int ky = (int)((pk / px) % py);
     int kx = (int)(pk % px);
-    /* unwrap integer index to signed shift on the padded grid */
-    int iz = (kz > pz/2) ? kz - pz : kz;
-    int iy = (ky > py/2) ? ky - py : ky;
-    int ix = (kx > px/2) ? kx - px : kx;
-    free(cr); free(ci);
 
-    /* ---- sub-voxel refine: UPSAMPLED-DFT (Guizar-Sicairos) ------------------
-     * Evaluate the inverse DFT of the UN-NORMALIZED cross-power C on a fine grid
-     * of step 1/usf spanning +/-1 voxel about the integer peak, via direct
-     * (matrix) DFT -- separable, so O(W^3*(pz+py+px)) not O(N^2). We refine on C
-     * (a smooth band-limited cross-correlation, |.| has its true max AT the
-     * shift) rather than the phase-only surface (a Dirichlet kernel whose
-     * real/imag split biases a sub-voxel max). The integer peak above (from the
-     * sharp phase-only surface) sets the search center. IDFT sample at continuous
-     * position d is sum_k C[k] exp(+i 2pi k d / p). */
-    const int usf = 50;         /* 1/50-voxel grid */
-    const double half = 1.0;    /* search +/-1.0 vox about the integer peak */
-    int W = (int)(2*half*usf) + 1;
-    /* precompute per-axis complex basis e[w][k] = exp(+i 2pi k d_w / p),
-     * d_w = (peak + (w-center)/usf). Build as separable 1-D DFT evaluators. */
-    /* To keep memory modest we evaluate the separable sum directly. Build, for
-     * each axis, tables of the sampled position. */
-    double bestv = -1e300, rdz=iz, rdy=iy, rdx=ix;
-    /* Precompute axis phase tables: za[w][kz] etc would be large; instead do the
-     * standard 3-stage separable contraction. Stage A: contract X. */
-    /* positions along each axis */
-    double *posz = malloc(sizeof(double)*W);
-    double *posy = malloc(sizeof(double)*W);
-    double *posx = malloc(sizeof(double)*W);
-    for (int w=0; w<W; w++) {
-        double off = (w - (W-1)/2)/(double)usf;
-        posz[w] = iz + off; posy[w] = iy + off; posx[w] = ix + off;
-    }
-    /* cz3[w][kz], etc.: exp(+i 2pi kz posz[w]/pz). Store as 2 floats interleaved. */
-    /* memory: W*p complex doubles per axis -> fine for W~301, p<=~512. */
-    double *Ezr = malloc(sizeof(double)*W*pz), *Ezi = malloc(sizeof(double)*W*pz);
-    double *Eyr = malloc(sizeof(double)*W*py), *Eyi = malloc(sizeof(double)*W*py);
-    double *Exr = malloc(sizeof(double)*W*px), *Exi = malloc(sizeof(double)*W*px);
-    if(!posz||!posy||!posx||!Ezr||!Ezi||!Eyr||!Eyi||!Exr||!Exi){
-        free(fr);free(fi);free(cr2);free(ci2);free(posz);free(posy);free(posx);
-        free(Ezr);free(Ezi);free(Eyr);free(Eyi);free(Exr);free(Exi);
-        shift[0]=iz;shift[1]=iy;shift[2]=ix; if(peak)*peak=(double)best/(double)pn; return 0;
-    }
-    for (int w=0; w<W; w++) for (int k=0;k<pz;k++){ double a=2.0*M_PI*k*posz[w]/pz; Ezr[w*pz+k]=cos(a);Ezi[w*pz+k]=sin(a);}
-    for (int w=0; w<W; w++) for (int k=0;k<py;k++){ double a=2.0*M_PI*k*posy[w]/py; Eyr[w*py+k]=cos(a);Eyi[w*py+k]=sin(a);}
-    for (int w=0; w<W; w++) for (int k=0;k<px;k++){ double a=2.0*M_PI*k*posx[w]/px; Exr[w*px+k]=cos(a);Exi[w*px+k]=sin(a);}
+    /* ---- sub-voxel refine: FOROOSH phase-correlation estimator --------------
+     * The phase-correlation peak is a Dirichlet kernel; for a sub-voxel shift the
+     * energy splits between the peak sample c0 and ONE neighbour cs. Foroosh
+     * (2002) showed the sub-voxel offset is delta = cs/(cs +/- c0) (pick the sign
+     * giving |delta|<=1), toward the larger neighbour. This is the model-correct
+     * inverse of the Dirichlet sampling (a parabola, which assumes a smooth peak,
+     * systematically biases toward the integer). Per-axis, using the in-line
+     * neighbours of the peak (wrap on the padded grid). */
+    #define PCV(zz,yy,xx) fr[((size_t)(zz)*py+(yy))*px+(xx)]
+    int zm=(kz-1+pz)%pz, zp=(kz+1)%pz;
+    int ym=(ky-1+py)%py, yp=(ky+1)%py;
+    int xm=(kx-1+px)%px, xp=(kx+1)%px;
+    double c0 = best;
+    double oz = foroosh_off(PCV(zm,ky,kx), c0, PCV(zp,ky,kx));
+    double oy = foroosh_off(PCV(kz,ym,kx), c0, PCV(kz,yp,kx));
+    double ox = foroosh_off(PCV(kz,ky,xm), c0, PCV(kz,ky,xp));
+    #undef PCV
 
-    /* Stage A: Ax[kz][ky][wx] = sum_kx R[kz,ky,kx] * Ex[wx,kx]  (contract X) */
-    double *Axr = malloc(sizeof(double)*(size_t)pz*py*W);
-    double *Axi = malloc(sizeof(double)*(size_t)pz*py*W);
-    /* Stage B: Bx[kz][wy][wx] = sum_ky Ax[kz,ky,wx]*Ey[wy,ky] */
-    double *Bxr = malloc(sizeof(double)*(size_t)pz*W*W);
-    double *Bxi = malloc(sizeof(double)*(size_t)pz*W*W);
-    if(!Axr||!Axi||!Bxr||!Bxi){
-        free(fr);free(fi);free(cr2);free(ci2);free(posz);free(posy);free(posx);
-        free(Ezr);free(Ezi);free(Eyr);free(Eyi);free(Exr);free(Exi);free(Axr);free(Axi);free(Bxr);free(Bxi);
-        shift[0]=iz;shift[1]=iy;shift[2]=ix; if(peak)*peak=(double)best/(double)pn; return 0;
-    }
-    for (int z=0; z<pz; z++) for (int y=0; y<py; y++) {
-        const float *Rr = cr2 + ((size_t)z*py+y)*px;
-        const float *Ri = ci2 + ((size_t)z*py+y)*px;
-        for (int wx=0; wx<W; wx++) {
-            const double *exr=Exr+wx*px, *exi=Exi+wx*px;
-            double sr=0, si=0;
-            for (int k=0;k<px;k++){ sr += Rr[k]*exr[k] - Ri[k]*exi[k]; si += Rr[k]*exi[k] + Ri[k]*exr[k]; }
-            Axr[((size_t)z*py+y)*W+wx]=sr; Axi[((size_t)z*py+y)*W+wx]=si;
-        }
-    }
-    for (int z=0; z<pz; z++) for (int wy=0; wy<W; wy++) {
-        const double *eyr=Eyr+wy*py, *eyi=Eyi+wy*py;
-        for (int wx=0; wx<W; wx++) {
-            double sr=0,si=0;
-            for (int y=0;y<py;y++){ double ar=Axr[((size_t)z*py+y)*W+wx], ai=Axi[((size_t)z*py+y)*W+wx];
-                sr += ar*eyr[y]-ai*eyi[y]; si += ar*eyi[y]+ai*eyr[y]; }
-            Bxr[((size_t)z*W+wy)*W+wx]=sr; Bxi[((size_t)z*W+wy)*W+wx]=si;
-        }
-    }
-    /* Stage C: contract Z and find argmax magnitude over (wz,wy,wx) */
-    for (int wz=0; wz<W; wz++) {
-        const double *ezr=Ezr+wz*pz, *ezi=Ezi+wz*pz;
-        for (int wy=0; wy<W; wy++) for (int wx=0; wx<W; wx++) {
-            double sr=0,si=0;
-            for (int z=0;z<pz;z++){ double br=Bxr[((size_t)z*W+wy)*W+wx], bi=Bxi[((size_t)z*W+wy)*W+wx];
-                sr += br*ezr[z]-bi*ezi[z]; si += br*ezi[z]+bi*ezr[z]; }
-            double mag = sr*sr + si*si;  /* |cross-correlation| at this sub-voxel pos */
-            if (mag > bestv) { bestv=mag; rdz=posz[wz]; rdy=posy[wy]; rdx=posx[wx]; }
-        }
-    }
-    shift[0]=rdz; shift[1]=rdy; shift[2]=rdx;
-    /* normalized peak height in [0,1]: the un-normalized IFFT value / N.
-     * For a clean single-shift match this approaches 1; lower = weaker match. */
-    if (peak) *peak = (double)best / (double)pn;
+    /* unwrap integer index to a signed shift on the padded grid, add sub-voxel */
+    double dz = (double)kz + oz; if (dz > pz/2) dz -= pz;
+    double dy = (double)ky + oy; if (dy > py/2) dy -= py;
+    double dx = (double)kx + ox; if (dx > px/2) dx -= px;
+    shift[0]=dz; shift[1]=dy; shift[2]=dx;
+    if (peak) *peak = best;   /* normalized corr peak in [0,1] (1 = perfect match) */
 
-    free(fr); free(fi); free(cr2); free(ci2);
-    free(posz);free(posy);free(posx);
-    free(Ezr);free(Ezi);free(Eyr);free(Eyi);free(Exr);free(Exi);
-    free(Axr);free(Axi);free(Bxr);free(Bxi);
+    free(fr); free(fi);
     return 0;
 }
 
