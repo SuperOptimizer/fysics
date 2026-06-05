@@ -158,6 +158,38 @@ int fy_deconvolve_gureyev(const float *in, float *out,
                           const fy_physics *p, double tikhonov);
 
 
+/* ---- per-volume noise model estimation (drive the denoisers from DATA) ----
+ * Measured across 145 cubes / 18 scrolls: the reconstructed-volume noise is
+ * (a) SIGNAL-DEPENDENT, var ~= g*intensity + b (Poisson origin reshaped by the u8
+ * export window), and (b) the level varies 1.5-3.3x scroll-to-scroll AT THE SAME
+ * resolution -- so it CANNOT be predicted from voxel size or hardcoded; it must be
+ * estimated per-volume. This estimates that curve from the volume's own data:
+ *   - local mean & variance in small windows;
+ *   - bin by intensity, take a LOW percentile of local variance per bin (the noise
+ *     floor; high local variance = edges/structure, rejected);
+ *   - robust (IRLS) line fit var = g*I + b.
+ * The line fit can be fragile (slope sometimes ill-conditioned), so the ROBUST,
+ * primary output is `noise_ref` = the estimated noise std at a reference intensity
+ * (`ref_intensity`, e.g. 0.4 in [0,1]); g,b are secondary. Feed `noise_ref` to the
+ * denoisers (NLM h, guided eps ~ noise_ref^2, bilateral sigma_range) so denoise
+ * strength self-calibrates per volume. Operates on a representative region/chunk;
+ * cheap and streaming-friendly (local arithmetic, one pass). */
+typedef struct {
+    double g;            /* var = g*I + b  (signal-dependence slope; may be ~0) */
+    double b;            /* variance intercept */
+    double noise_ref;    /* PRIMARY: noise STD at ref_intensity (robust) */
+    double ref_intensity;/* intensity the ref std is reported at */
+    int    n_bins_used;  /* how many intensity bins had enough flat samples */
+} fy_noise_model;
+
+/* Estimate the noise model from a volume (or representative chunk). win = local
+ * window edge (e.g. 5); flat_pct = percentile taken as the per-bin noise floor
+ * (e.g. 10); ref_intensity in the data's units (e.g. 0.4 for [0,1] float, or ~100
+ * for u8-scaled). Returns 0 on success. */
+int fy_estimate_noise(const float *in, int nz, int ny, int nx,
+                      int win, double flat_pct, double ref_intensity,
+                      fy_noise_model *out);
+
 /* ---- denoising (complements deconvolution; deconv amplifies noise) ----
  * NLM: non-local means, edge/texture preserving (papyrus is self-similar -> ideal).
  *   h = filter strength (~noise level), search_radius S, patch_radius P.

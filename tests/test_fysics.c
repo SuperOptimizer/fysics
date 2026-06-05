@@ -231,6 +231,46 @@ static void test_auto_thresh(void){
     CHECK(th>0.1f && th<0.5f,"Otsu auto air-threshold lands in the valley");
 }
 
+static void test_estimate_noise(void){
+    /* synthetic volume: smooth signal + KNOWN white noise of std sigma.
+     * The estimator should recover noise_ref close to sigma. */
+    int nz=48,ny=48,nx=48; size_t n=(size_t)nz*ny*nx;
+    float *v=malloc(4*n);
+    unsigned int rng=12345u;
+    double sigma=0.05;
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        /* slowly-varying signal in [0.2,0.8] so flat regions exist */
+        double s=0.5+0.3*sin(x*0.10)*cos(y*0.09);
+        /* box-muller-ish cheap gaussian from two uniforms */
+        rng=rng*1664525u+1013904223u; double u1=((rng>>8)&0xffffff)/(double)0x1000000;
+        rng=rng*1664525u+1013904223u; double u2=((rng>>8)&0xffffff)/(double)0x1000000;
+        if(u1<1e-9)u1=1e-9;
+        double g0=sqrt(-2*log(u1))*cos(6.283185307*u2);
+        v[((size_t)z*ny+y)*nx+x]=(float)(s+sigma*g0);
+    }
+    fy_noise_model nm;
+    int rc=fy_estimate_noise(v,nz,ny,nx,5,10.0,0.5,&nm);
+    CHECK(rc==0, "fy_estimate_noise runs");
+    /* recovered noise std within ~40% of truth (local-window est is approximate) */
+    CHECK(nm.noise_ref > 0.5*sigma && nm.noise_ref < 1.7*sigma,
+          "estimated noise_ref ~ true sigma");
+    /* higher-noise volume must estimate a higher level (monotone, the key property) */
+    float *v2=malloc(4*n); double sigma2=0.10;
+    rng=999u;
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        double s=0.5+0.3*sin(x*0.10)*cos(y*0.09);
+        rng=rng*1664525u+1013904223u; double u1=((rng>>8)&0xffffff)/(double)0x1000000;
+        rng=rng*1664525u+1013904223u; double u2=((rng>>8)&0xffffff)/(double)0x1000000;
+        if(u1<1e-9)u1=1e-9;
+        double g0=sqrt(-2*log(u1))*cos(6.283185307*u2);
+        v2[((size_t)z*ny+y)*nx+x]=(float)(s+sigma2*g0);
+    }
+    fy_noise_model nm2;
+    fy_estimate_noise(v2,nz,ny,nx,5,10.0,0.5,&nm2);
+    CHECK(nm2.noise_ref > nm.noise_ref, "noisier volume -> higher estimated noise (monotone)");
+    free(v); free(v2);
+}
+
 static void test_dewindow(void){
     /* exact linear round-trip u8 -> physical -> u8 (per-volume window) */
     double f0=-0.03, f1=0.21;
@@ -285,6 +325,7 @@ int main(void) {
     test_auto_thresh();
     test_sheetness();
     test_dewindow();
+    test_estimate_noise();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
