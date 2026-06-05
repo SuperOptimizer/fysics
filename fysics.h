@@ -158,10 +158,13 @@ int fy_deconvolve(const float *in, float *out,
                   int nz, int ny, int nx,
                   const fy_physics *p, double reg);
 
-/* ---- Gureyev-Paganin deconvolution (arXiv 2601.07225) -- published SOTA ----
- * Resolution recovery that goes beyond inverting the Paganin filter: it also
- * explicitly Tikhonov-deconvolves the Gaussian SYSTEM PSF (detector+source blur),
- * which the standard Paganin over-regularizes against. The combined Fourier filter:
+/* ---- Gureyev-Paganin deconvolution (arXiv 2601.07225) ----
+ * Goes beyond inverting the Paganin filter: it also explicitly Tikhonov-deconvolves
+ * the Gaussian SYSTEM PSF (detector+source blur), which the standard Paganin over-
+ * regularizes against. NOTE: like the plain deconv this restores high-frequency
+ * CONTRAST -- FRC testing (Poisson-thinning, 7+ volumes) showed NO SNR-limited
+ * resolution gain from any of these linear deblurs; treat as contrast/sharpness
+ * restoration, not resolution recovery. The combined Fourier filter:
  *   H(k) = (1 + b'*k^2) * [ G(k) / (G(k)^2 + gamma) ]
  * where (1 + b'*k^2) is the reduced-strength Paganin inverse (b' = paganin b minus
  * the PSF contribution) and G(k)=exp(-2 pi^2 sigma^2 k^2) is the Gaussian system

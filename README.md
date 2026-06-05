@@ -4,9 +4,17 @@ Fast CPU physics kernels for Vesuvius Challenge scroll volumes.
 
 Pure modern C (no SIMD intrinsics — clean auto-vectorizable code), CPU-only,
 dependency-free. Inverts the **known ESRF/nabu reconstruction operators** (Paganin
-single-distance phase-retrieval low-pass + unsharp mask) to **sharpen reconstructed
-volumes** — a physics deblur with no machine learning and no hallucination, since
-it analytically inverts a known transfer function.
+single-distance phase-retrieval low-pass + unsharp mask) to restore **contrast and
+sharpness** in reconstructed volumes — a physics deblur with no machine learning and
+no hallucination, since it analytically inverts a known transfer function.
+
+**Honest scope (FRC-verified):** this is **contrast / sharpness / normalization
+restoration**, *not* super-resolution. Poisson-thinning FRC across 7+ volumes shows
+the deblur amplifies the high-frequency band ~2.5–3× but produces **no SNR-limited
+resolution gain** — it restores the high-frequency *contrast* the Paganin low-pass
+suppressed (an 8–15× mid-band power lift), it does not recover detail below the noise
+floor. That contrast/legibility restoration is genuinely useful for viewing and for
+consistent downstream input; just don't expect new resolvable structure.
 
 Intended for import by viewers/tools (e.g. **vc3d**) as on-the-fly post-processing,
 or as batch preprocessing.
@@ -17,15 +25,33 @@ Be honest about what we can defensibly claim on ESRF/BM18 data:
 
 | operation | grounded? | where / how |
 |---|---|---|
-| **Paganin deconvolution** | ✅ **exact** | metadata gives `delta_beta`, energy, distance; we invert the *exact* nabu filter (verified to 1e-16). Apply to the reconstructed volume. |
-| **Unsharp accounting** | ✅ **exact** | metadata gives `coeff`/`sigma`; modeled in the net transfer. |
-| **NLM / bilateral denoise** | ✅ safe, generic | denoising is always valid; pairs with deconv (which amplifies noise). Strength tuned empirically (we don't have the exact noise model). Apply *after* deconv. |
-| FBP ramp filter inversion | ❌ not clean | applied in sinogram domain before backprojection — cannot be cleanly inverted from the reconstructed volume. **Not implemented.** |
-| ring-artifact removal | ⚠️ heuristic | residual rings have no metadata model; standard suppression is heuristic, not a physics inverse. (Could add, clearly labeled.) |
+| **Paganin deconvolution** | ✅ **exact** | metadata gives `delta_beta`, energy, distance; we invert the *exact* nabu filter (verified to 1e-16). Restores contrast (not resolution — see above). |
+| **Unsharp accounting** | ✅ **exact** | metadata gives `coeff`/`sigma`; modeled in the net transfer. Confirmed matching nabu; *matters* (22–37% of signal). |
+| **u8 → physical attenuation** | ✅ **exact** | metadata window (`target_window_f32_min/max`) inverted per-volume → consistent physical units across volumes (`fy_u8_to_phys`). |
+| **per-volume noise model** | ✅ measured | `fy_estimate_noise` fits `var=g·I+b` from the data; the level varies **1.5–3.3× scroll-to-scroll** so it must be estimated per-volume, not hardcoded. |
+| **partial delta_beta (fine vols)** | ✅ measured | full inversion over-inverts ≤4.3 µm volumes; `fy_auto_deltabeta_scale` backs off to ~0.35× (measured optimum). |
+| **guided / NLM denoise** | ✅ safe, generic | guided filter is the recommended denoiser; strength auto-set from the measured noise. Apply *after* deconv. |
+| FBP ramp filter inversion | ❌ not clean | sinogram-domain, pre-backprojection — not invertible from the reconstructed volume. **Not implemented.** |
+| ring-artifact removal | ⚠️ heuristic | residual rings have no metadata model; standard suppression is heuristic, not a physics inverse. |
 
-So fysics provides a **physics-exact Paganin deblur** + a **standard denoise pass**.
-The deblur is grounded in the metadata; the denoise is a safe complement. We do
-*not* claim to invert the FBP filter or rings as "physics."
+So fysics provides a **physics-exact Paganin deblur** (contrast restoration), a
+**per-volume-calibrated denoise**, and **exact physical-unit recovery**. The deblur
+and dewindow are grounded in the metadata; the denoise is a measured-from-data
+complement. We do *not* claim to invert the FBP filter or rings as "physics."
+
+### Ruled OUT empirically (don't re-add these)
+
+Measured across many volumes; each made results *worse* or wasn't worth it:
+
+- **Noise whitening** before denoise — the textbook colored-noise step. Leaks real
+  papyrus structure into the residual; *hurts* RMSE at every voxel size (3× confirmed).
+- **TV denoising** — erodes mid-band detail (drops to ~76%), eating the contrast the
+  deblur just restored. Use the guided filter instead.
+- **BM4D colored-noise (PSD) variant** — lost to plain BM4D on this data.
+- **Full BM4D** — ~10% better RMSE than guided but ~150× slower (~30 s/cube); not
+  worth it for streaming 20 TB. Guided is the pragmatic choice.
+- **Aggressive deconv (low reg) / full delta_beta on fine volumes** — over-amplifies
+  noise for no resolution gain. `reg=0.015` + `fy_auto_deltabeta_scale` is the knee.
 
 ## What it does
 
