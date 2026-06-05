@@ -207,6 +207,23 @@ int fy_estimate_noise(const float *in, int nz, int ny, int nx,
                       int win, double flat_pct, double ref_intensity,
                       fy_noise_model *out);
 
+/* ---- multi-energy spectral decomposition (per-voxel; needs co-registered input) ----
+ * Given N CO-REGISTERED energy volumes of the same object, already on a common
+ * physical-attenuation scale (fy_u8_to_phys per energy), output per-voxel material-
+ * contrast channels that surface material a single energy cannot:
+ *   slope_out (optional): log-log slope d ln mu / d ln E (Z proxy; more negative=higher Z)
+ *   highz_out (optional): high-Z contrast score in [0,1] (steep photoelectric slope AND
+ *             a confirming low-energy excess), gated so noise-dominated low-mu voxels=0.
+ * PURELY LOCAL (one voxel in/out, no halo) -> ideal vc3d streaming filter. The
+ * REGISTRATION of the energies to a common grid is a PREREQUISITE done upstream (see
+ * fy_phase_correlate / fy_register_affine). Validated on PHerc0343P: surfaces a real,
+ * coherent high-Z population invisible at any single energy. NOTE: this is material
+ * CONTRAST, not a calibrated material ID (don't claim "ink" without labels).
+ * mu_floor: gate; voxels with high-energy mu below it are noise -> scored 0. <=0 auto. */
+int fy_spectral_decompose(const float *const *mu, const double *energies, int n_energy,
+                          int nz, int ny, int nx,
+                          float *slope_out, float *highz_out, double mu_floor);
+
 /* Map an estimated noise level to a DETAIL-SAFE guided-filter eps. Measured (145
  * cubes): the detail-safe knee is eps ~= 0.014 * var of the data; expressed via the
  * noise level, eps ~= (k * noise_ref)^2 keeps mid-band detail >=95% while removing the

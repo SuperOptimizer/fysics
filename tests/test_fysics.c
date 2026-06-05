@@ -1085,6 +1085,51 @@ static void test_coherence_diffusion_auto(void) {
     free(in);free(out);
 }
 
+static void test_spectral_decompose(void){
+    /* synthetic 2-material volume at 4 energies. Papyrus: flat mu(E) (low-Z).
+     * Inclusion: steep photoelectric mu(E) ~ E^-3 (high-Z). Kernel must score the
+     * inclusion high-Z and papyrus ~0. */
+    int nz=8,ny=16,nx=16; size_t n=(size_t)nz*ny*nx;
+    double E[4]={43,62,77,89};
+    float *v[4]; for(int e=0;e<4;e++) v[e]=malloc(4*n);
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        size_t i=((size_t)z*ny+y)*nx+x;
+        int inclusion = (x>=6 && x<10 && y>=6 && y<10); /* central block = high-Z */
+        for(int e=0;e<4;e++){
+            double mu;
+            if(inclusion){
+                /* steep photoelectric ~ E^-3 (high-Z): high mu@43, near-floor mu@89,
+                 * matching the validated PHerc0343P high-Z signature */
+                mu = 0.20 * pow(43.0/E[e], 3.0) + 0.015;
+            } else {
+                /* papyrus: nearly flat ~0.07, tiny energy dependence */
+                mu = 0.07 * pow(43.0/E[e], 0.4);
+            }
+            v[e][i]=(float)mu;
+        }
+    }
+    float *slope=malloc(4*n), *highz=malloc(4*n);
+    const float* mup[4]={v[0],v[1],v[2],v[3]};
+    int rc=fy_spectral_decompose(mup,E,4,nz,ny,nx,slope,highz,0.01);
+    CHECK(rc==0,"fy_spectral_decompose runs");
+    /* mean high-Z score: inclusion >> papyrus */
+    double hi_in=0,hi_pap=0; int ci=0,cp=0;
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        size_t i=((size_t)z*ny+y)*nx+x; int inc=(x>=6&&x<10&&y>=6&&y<10);
+        if(inc){hi_in+=highz[i];ci++;} else {hi_pap+=highz[i];cp++;}
+    }
+    hi_in/=ci; hi_pap/=cp;
+    CHECK(hi_in > 0.3 && hi_pap < 0.1, "spectral: high-Z inclusion scores high, papyrus low");
+    /* slope: inclusion much steeper (more negative) than papyrus */
+    double sl_in=0,sl_pap=0; ci=cp=0;
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        size_t i=((size_t)z*ny+y)*nx+x; int inc=(x>=6&&x<10&&y>=6&&y<10);
+        if(inc){sl_in+=slope[i];ci++;} else {sl_pap+=slope[i];cp++;}
+    }
+    CHECK(sl_in/ci < sl_pap/cp - 0.5, "spectral: inclusion slope steeper (more negative) than papyrus");
+    for(int e=0;e<4;e++)free(v[e]); free(slope);free(highz);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_vs_dft();
@@ -1126,6 +1171,7 @@ int main(void) {
     test_mutual_information_peaks();
     test_coherence_diffusion_gap();
     test_coherence_diffusion_auto();
+    test_spectral_decompose();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
