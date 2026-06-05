@@ -434,6 +434,51 @@ int fy_register_full(const float *fixed, const float *moving,
                      float *ux, float *uy, float *uz,
                      int n_iters, double field_sigma, double step);
 
+/* ===== LANDMARK affine fit + MULTI-RESOLUTION FUSION (fuse.c) ==============
+ * Intensity NCC/MI is non-discriminative on the self-similar laminar scroll at a
+ * common COARSE scale, so the trustworthy registration of two same-scroll scans is
+ * LANDMARK/feature based: detect/match distinctive 3D points across the two scans,
+ * then fit the global transform from the matched pairs. fy_affine_from_points is
+ * that fit (with RANSAC for mismatch robustness). See FUSION.md. */
+
+/* Fit a 3x4 affine map dst<-src from N matched 3D point pairs.
+ *   src,dst : n*3 doubles in (z,y,x) order (match the index convention).
+ *   model   : 0 = full affine (12 dof, least squares), 1 = SIMILARITY
+ *             (rotation + single isotropic scale + translation, 7 dof, closed-form
+ *             Umeyama) -- the correct model for two scans of one rigid object
+ *             differing only by voxel-size ratio + remount pose.
+ *   ransac_iters  : >0 runs RANSAC (random minimal subsets, keep max-inlier model,
+ *                   refit on inliers) for robustness to wrong correspondences; 0
+ *                   does plain least squares on all points.
+ *   inlier_thresh : RANSAC inlier distance in dst voxel units (ignored if no RANSAC).
+ *   M_out   : 3x4 row-major result mapping a src point to its dst point
+ *             (q = M_out[:, :3] @ p + M_out[:, 3]). To PULL the src volume onto the
+ *             dst grid with fy_warp_affine (which wants a dst->src map), fit with
+ *             src=fixed/dst=moving, or invert M_out.
+ *   inlier_mask   : optional n ints (may be NULL), 1 = inlier.
+ *   resid_rms_out : optional RMS residual (dst units) over inliers.
+ * Returns 0 on success, 1 on failure (too few/degenerate points). */
+int fy_affine_from_points(const double *src, const double *dst, int n,
+                          int model, int ransac_iters, double inlier_thresh,
+                          double *M_out, int *inlier_mask, double *resid_rms_out);
+
+/* Fuse a FINE and a COARSE scan ALREADY resampled onto the SAME (nz,ny,nx) grid.
+ * Frequency-split at split_sigma (gaussian): HIGH band comes from the fine scan
+ * only; LOW band is an inverse-variance-weighted average of the two INDEPENDENT
+ * measurements (so the shared low/mid band is DENOISED -- the payoff of fusion).
+ * The coarse low band is intensity-matched (affine a*x+b least squares) to the fine
+ * low band first, so the energy/contrast difference doesn't bias the average.
+ *   var_fine,var_coarse : measured per-scan low-band noise variances; weights are
+ *     w_fine=var_coarse/(var_fine+var_coarse). If both <=0 -> plain 0.5/0.5 average.
+ *   high_gain : scale on the fine high band (1.0 keeps the fine detail as-is).
+ *   mask : optional u8 (!=0 = valid overlap); outside it out=fine (no fusion). NULL=all.
+ *   out = low_fused + high_gain*high_fine.
+ * Returns 0 on success. */
+int fy_fuse_multiscale(const float *fine, const float *coarse,
+                       const unsigned char *mask, int nz, int ny, int nx,
+                       double split_sigma, double var_fine, double var_coarse,
+                       double high_gain, float *out);
+
 /* ---- compaction: downsample OVERSAMPLED volumes (lossless of resolved detail) ----
  * Measured: fine (~1.1um) scroll volumes are ~2x oversampled -- their resolved detail
  * fits a coarser grid, so downsampling ~1.75-2x/axis loses ~nothing (8x fewer voxels,

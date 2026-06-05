@@ -30,13 +30,13 @@ if(FYSICS_VECREPORT)
 endif()
 
 # ---- the library vc3d imports ----
-add_library(fysics STATIC fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c compact.c)
+add_library(fysics STATIC fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c compact.c fuse.c)
 target_include_directories(fysics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(fysics PRIVATE ${FYSICS_OPT_FLAGS})
 target_link_libraries(fysics PUBLIC m)
 
 # also build a shared lib (some importers prefer it)
-add_library(fysics_shared SHARED fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c compact.c)
+add_library(fysics_shared SHARED fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c compact.c fuse.c)
 set_target_properties(fysics_shared PROPERTIES OUTPUT_NAME fysics)
 target_include_directories(fysics_shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(fysics_shared PRIVATE ${FYSICS_OPT_FLAGS})

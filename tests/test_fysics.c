@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int failures = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); failures++; } \
@@ -725,6 +726,174 @@ static void test_register_full_affine_plus_demons(void) {
     free(tx);free(ty);free(tz);free(ux);free(uy);free(uz);
 }
 
+/* ============ LANDMARK affine fit + multi-resolution fusion ============== */
+
+static double det33(const double *M) { /* linear part of a 3x4, leading 3 cols */
+    return M[0]*(M[5]*M[10]-M[6]*M[9]) - M[1]*(M[4]*M[10]-M[6]*M[8])
+         + M[2]*(M[4]*M[9]-M[5]*M[8]);
+}
+
+static void test_affine_from_points_exact(void) {
+    /* known full affine: dst = A p + t, exact fit must recover it to ~0 residual */
+    double A[9] = {0.47, -0.01, 0.02,  0.015, 0.46, -0.008,  -0.01, 0.012, 0.48};
+    double t[3] = {120.0, -33.0, 57.0};
+    int n = 12;
+    double src[36], dst[36];
+    unsigned int s = 7u;
+    for (int i = 0; i < n; i++) {
+        for (int a = 0; a < 3; a++) { s = s*1103515245u+12345u; src[i*3+a] = (double)((s>>9)%2000); }
+        for (int r = 0; r < 3; r++)
+            dst[i*3+r] = A[r*3+0]*src[i*3+0]+A[r*3+1]*src[i*3+1]+A[r*3+2]*src[i*3+2]+t[r];
+    }
+    double M[12], rms = -1;
+    int rc = fy_affine_from_points(src, dst, n, 0, 0, 0.0, M, NULL, &rms);
+    double aerr = 0;
+    for (int r = 0; r < 3; r++) {
+        aerr += fabs(M[r*4+0]-A[r*3+0])+fabs(M[r*4+1]-A[r*3+1])+fabs(M[r*4+2]-A[r*3+2]);
+        aerr += fabs(M[r*4+3]-t[r]) * 1e-3;
+    }
+    printf("     [affine_from_points] rms=%.3e  coeff_err=%.3e\n", rms, aerr);
+    CHECK(rc==0, "affine_from_points returns success");
+    CHECK(rms < 1e-6, "affine_from_points exact fit residual ~0");
+    CHECK(aerr < 1e-4, "affine_from_points recovers the known matrix");
+}
+
+static void test_similarity_from_points(void) {
+    /* known similarity: scale*R*p + t, with a real rotation. Fit must recover it
+     * AND keep equal singular values (no shear) -- the multi-res scan model. */
+    double th = 0.21, s = 0.4701;
+    double R[9] = { cos(th),-sin(th),0,  sin(th),cos(th),0,  0,0,1 };
+    double tt[3] = {200.0, 88.0, -45.0};
+    int n = 10;
+    double src[30], dst[30];
+    unsigned int sd = 99u;
+    for (int i = 0; i < n; i++) {
+        for (int a=0;a<3;a++){ sd=sd*1103515245u+12345u; src[i*3+a]=(double)((sd>>9)%1500); }
+        for (int r=0;r<3;r++)
+            dst[i*3+r]= s*(R[r*3+0]*src[i*3+0]+R[r*3+1]*src[i*3+1]+R[r*3+2]*src[i*3+2]) + tt[r];
+    }
+    double M[12], rms=-1;
+    int rc = fy_affine_from_points(src, dst, n, 1, 0, 0.0, M, NULL, &rms);
+    double d = det33(M);
+    double scale_est = cbrt(fabs(d));
+    printf("     [similarity] rms=%.3e  est_scale=%.5f (true %.5f)\n", rms, scale_est, s);
+    CHECK(rc==0, "similarity fit returns success");
+    CHECK(rms < 1e-5, "similarity exact fit residual ~0");
+    CHECK(fabs(scale_est - s) < 1e-3, "similarity recovers the isotropic scale");
+}
+
+static void test_affine_ransac_outliers(void) {
+    /* 16 good correspondences + 6 gross outliers. RANSAC must reject outliers and
+     * recover the clean transform; plain LS would be corrupted. */
+    double A[9] = {0.5,0,0, 0,0.5,0, 0,0,0.5};
+    double t[3] = {10,20,30};
+    int n = 22;
+    double src[66], dst[66];
+    unsigned int s = 3u;
+    for (int i = 0; i < n; i++) {
+        for (int a=0;a<3;a++){ s=s*1103515245u+12345u; src[i*3+a]=(double)((s>>9)%1000); }
+        for (int r=0;r<3;r++)
+            dst[i*3+r]=A[r*3+0]*src[i*3+0]+A[r*3+1]*src[i*3+1]+A[r*3+2]*src[i*3+2]+t[r];
+        if (i >= 16) { /* corrupt the last 6 with large random offsets */
+            for (int r=0;r<3;r++){ s=s*1103515245u+12345u; dst[i*3+r]+=(double)((int)((s>>9)%800)-400);}
+        }
+    }
+    double Mls[12], Mr[12], rms_ls=-1, rms_r=-1; int inl[22];
+    fy_affine_from_points(src, dst, n, 0, 0, 0.0, Mls, NULL, &rms_ls);  /* plain LS */
+    int rc = fy_affine_from_points(src, dst, n, 0, 200, 2.0, Mr, inl, &rms_r); /* RANSAC */
+    int ninl = 0; for (int i=0;i<n;i++) ninl+=inl[i];
+    /* coeff error of RANSAC vs truth */
+    double aerr=0; for (int r=0;r<3;r++) for(int c=0;c<3;c++) aerr+=fabs(Mr[r*4+c]-A[r*3+c]);
+    printf("     [ransac] LS_rms=%.2f  RANSAC_rms=%.3e  inliers=%d/22  coeff_err=%.2e\n",
+           rms_ls, rms_r, ninl, aerr);
+    CHECK(rc==0, "ransac affine returns success");
+    CHECK(ninl==16, "ransac identifies exactly the 16 inliers");
+    CHECK(rms_r < 1e-6, "ransac residual ~0 on the clean inliers");
+    CHECK(aerr < 1e-4, "ransac recovers the clean transform despite outliers");
+    CHECK(rms_ls > 10.0, "plain least-squares IS corrupted by the outliers (control)");
+}
+
+static void test_fuse_denoises(void) {
+    /* Synthetic: a smooth low-freq "structure" + a fine high-freq detail. Make two
+     * INDEPENDENT noisy realizations sharing the same low band (fine: low+high+noise1;
+     * coarse: low+noise2, NO high band). Fusion must (a) lower the low-band noise vs
+     * the fine scan alone, and (b) keep the fine high-freq detail. */
+    int nz=48,ny=48,nx=48; size_t N=(size_t)nz*ny*nx;
+    float *low=malloc(4*N),*high=malloc(4*N);
+    float *fine=malloc(4*N),*coarse=malloc(4*N),*fused=malloc(4*N);
+    /* ground-truth low (smooth) and high (fine ripples) */
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        size_t i=(z*ny+y)*nx+x;
+        double fz=(double)z/nz,fy=(double)y/ny,fx=(double)x/nx;
+        low[i]=(float)(0.5+0.25*sin(3.0*fx*2*M_PI)*cos(2.0*fy*2*M_PI)*sin(1.5*fz*2*M_PI+0.4));
+        high[i]=(float)(0.12*sin(10.0*fx*2*M_PI)*sin(9.0*fy*2*M_PI+0.7));
+    }
+    /* two independent noise fields */
+    unsigned int s1=11u,s2=777u;
+    double sig=0.04;
+    for(size_t i=0;i<N;i++){
+        s1=s1*1103515245u+12345u; double n1=((double)((s1>>9)%10000)/10000.0-0.5)*2*1.732*sig;
+        s2=s2*1103515245u+12345u; double n2=((double)((s2>>9)%10000)/10000.0-0.5)*2*1.732*sig;
+        fine[i]=(float)(low[i]+high[i]+n1);
+        coarse[i]=(float)(low[i]+n2);   /* same low band, independent noise, no detail */
+    }
+    /* fuse: equal noise variances -> ~0.5/0.5 low-band average */
+    double v=sig*sig;
+    fy_fuse_multiscale(fine, coarse, NULL, nz,ny,nx, 3.0, v, v, 1.0, fused);
+
+    /* Measure LOW-BAND noise the way fusion defines it: low band = the same gaussian
+     * split (sigma=3) used inside the kernel, applied here as a wide box-blur proxy
+     * (radius 4 ~ sigma 2-3). noise = std of (lowpass(volume) - true_low_signal).
+     * Fusion averages two independent low bands -> ~1/sqrt(2) the noise of the fine
+     * low band alone. We compare fine-alone vs fused low-band error to true_low. */
+    /* Measure LOW-BAND noise: take (result - true_signal) -- this is pure noise since
+     * truth is noise-free -- and LOW-PASS it (the high band is undenoised by design, so
+     * we look only at the shared low band where fusion acts). fine's low-band noise is
+     * noise1; fused's is the 0.5/0.5 average of two INDEPENDENT noises -> lower std.
+     * Low-pass via 3 box-blur passes (radius 2 ~ gaussian sigma~2.8, matching split). */
+    float *rf=malloc(4*N),*rg=malloc(4*N),*tb=malloc(4*N);
+    for(size_t i=0;i<N;i++){ double truth=(double)low[i]+(double)high[i];
+        rf[i]=(float)(fine[i]-truth); rg[i]=(float)(fused[i]-truth); }
+    for(int pass=0;pass<2;pass++){
+        float *buf=(pass==0)?rf:rg;
+        for(int it=0;it<3;it++){
+            int rr=2;
+            for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+                double a=0;int cc=0;
+                for(int dz=-rr;dz<=rr;dz++)for(int dy=-rr;dy<=rr;dy++)for(int dx=-rr;dx<=rr;dx++){
+                    int zz=z+dz,yy=y+dy,xx=x+dx; if(zz<0||yy<0||xx<0||zz>=nz||yy>=ny||xx>=nx)continue;
+                    a+=buf[(zz*ny+yy)*nx+xx]; cc++; }
+                tb[(z*ny+y)*nx+x]=(float)(a/cc);
+            }
+            memcpy(buf,tb,N*4);
+        }
+    }
+    int R=6;
+    double err_fine=0, err_fused=0; long c=0;
+    for(int z=R;z<nz-R;z++)for(int y=R;y<ny-R;y++)for(int x=R;x<nx-R;x++){
+        size_t i=(z*ny+y)*nx+x;
+        err_fine+=(double)rf[i]*rf[i]; err_fused+=(double)rg[i]*rg[i]; c++;
+    }
+    err_fine=sqrt(err_fine/c); err_fused=sqrt(err_fused/c);
+    free(rf);free(rg);free(tb);
+    /* high-freq retention: the high band the kernel keeps is fine - gaussian(fine).
+     * Measure correlation of (fused minus its OWN wide blur) with the true high band. */
+    float *hb=malloc(4*N);
+    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
+        size_t i=(z*ny+y)*nx+x; double a=0; int cc=0;
+        for(int dz=-R;dz<=R;dz++)for(int dy=-R;dy<=R;dy++)for(int dx=-R;dx<=R;dx++){
+            int zz=z+dz,yy=y+dy,xx=x+dx; if(zz<0||yy<0||xx<0||zz>=nz||yy>=ny||xx>=nx)continue;
+            a+=fused[(zz*ny+yy)*nx+xx]; cc++; }
+        hb[i]=(float)(fused[i]-a/cc);
+    }
+    double hr=pearson(hb, high, N);
+    printf("     [fuse] low-band noise vs truth: fine-alone=%.5f  fused=%.5f  (ratio %.2f, ideal 0.71)  high-retention=%.3f\n",
+           err_fine, err_fused, err_fused/err_fine, hr);
+    CHECK(err_fused < err_fine*0.90, "fusion lowers low-band noise vs fine-alone (>10%)");
+    CHECK(hr > 0.5, "fusion retains the fine high-freq detail");
+    free(low);free(high);free(fine);free(coarse);free(fused);free(hb);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -757,6 +926,10 @@ int main(void) {
     test_demons_known_warp();
     test_demons_regularization();
     test_register_full_affine_plus_demons();
+    test_affine_from_points_exact();
+    test_similarity_from_points();
+    test_affine_ransac_outliers();
+    test_fuse_denoises();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }
