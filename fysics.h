@@ -367,6 +367,53 @@ double fy_ncc_warped(const float *fixed, const float *moving,
 int fy_register_affine(const float *fixed, const float *moving,
                        int nz, int ny, int nx, double *M_out, int rigid_only);
 
+/* ===== LAYER 2: deformable (non-rigid) registration via Demons ============
+ * After affine removes the global transform, two scans of the SAME scroll
+ * still differ by a SMOOTH physical warp (thermal/humidity expansion, creep,
+ * remounting). Demons recovers a per-voxel displacement field that pulls the
+ * affine-aligned moving volume onto the fixed one.
+ *
+ * Field convention: u=(uz,uy,ux) lives on the FIXED grid and is a PULL/backward
+ * displacement in voxel units. The warped moving is
+ *     warped(z,y,x) = moving( z+uz, y+uy, x+ux )
+ * via fy_sample_trilinear. A zero field is the identity warp.
+ */
+
+/* Resample `in` through a displacement field (uz,uy,ux), all on the (nz,ny,nx)
+ * grid: out(z,y,x) = trilinear-sample(in, z+uz, y+uy, x+ux). OOB -> 0. A zero
+ * field reproduces `in`. The deformable analogue of fy_warp_affine. */
+int fy_warp_field(const float *in, float *out, int nz, int ny, int nx,
+                  const float *ux, const float *uy, const float *uz);
+
+/* Coarse-to-fine Demons deformable registration. fixed & moving share the
+ * (nz,ny,nx) grid -- run affine first and pass the affine-aligned moving here.
+ * Variant: symmetric (active-forces) Thirion demons; each iteration computes the
+ * intensity-difference * gradient force (using BOTH fixed and moving gradients),
+ * adds it to the field, then Gaussian-smooths the whole field (regularization).
+ * Solved on an image pyramid (fy_downsample2x), coarse->fine with x2 field
+ * upsampling, for capture range + smoothness.
+ *   ux/uy/uz : in = initial field (pass zeros for fresh), out = recovered field.
+ *   n_iters  : iterations PER pyramid level (typical 50-150).
+ *   field_sigma : Gaussian regularization sigma in voxels (elasticity; larger =
+ *                 smoother/stiffer; typical 1.0-2.0).
+ *   step     : displacement step scale per iteration (typical 1.0-2.0).
+ * Returns 0 on success. */
+int fy_register_demons(const float *fixed, const float *moving,
+                       int nz, int ny, int nx,
+                       float *ux, float *uy, float *uz,
+                       int n_iters, double field_sigma, double step);
+
+/* Convenience: Layer 1 THEN Layer 2. Recovers the affine map M_out, warps moving
+ * onto the fixed grid with it, then recovers the residual deformation field
+ * ux/uy/uz on the affine-aligned pair. The fully-registered moving volume is
+ *   fy_warp_field( fy_warp_affine(moving, M_out), ux,uy,uz ).
+ * M_out is in/out (initial guess / affine result); ux/uy/uz are pre-allocated
+ * (nz*ny*nx each) and zeroed internally. Returns 0 on success. */
+int fy_register_full(const float *fixed, const float *moving,
+                     int nz, int ny, int nx, double *M_out, int rigid_only,
+                     float *ux, float *uy, float *uz,
+                     int n_iters, double field_sigma, double step);
+
 #ifdef __cplusplus
 }
 #endif

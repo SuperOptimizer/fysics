@@ -525,6 +525,158 @@ static void test_register_contrast(void) {
     CHECK(ncc>0.97, "register robust to contrast change (NCC>0.97, multimodal-ready)");
 }
 
+/* ============ LAYER 2: deformable / Demons =============================== */
+
+/* a textured volume: blobs + several octaves of sinusoid so there is gradient
+ * EVERYWHERE (Demons needs texture; flat regions suffer the aperture problem). */
+static void make_textured_vol(float *v, int nz, int ny, int nx) {
+    make_struct_vol(v, nz, ny, nx);
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        double fz=(double)z/nz, fy=(double)y/ny, fx=(double)x/nx;
+        double t = 0.06*sin(18.0*fx)*sin(15.0*fy)
+                 + 0.05*cos(13.0*fz+1.0)*sin(11.0*fx)
+                 + 0.04*sin(21.0*fy+0.3)*cos(17.0*fz);
+        double val = v[(z*ny+y)*nx+x] + t;
+        if (val < 0) val = 0; if (val > 1) val = 1;
+        v[(z*ny+y)*nx+x] = (float)val;
+    }
+}
+
+/* build a known SMOOTH (low-frequency sinusoidal) displacement field, pull
+ * convention, amplitude `amp` voxels. This is the field that GENERATES moving
+ * from fixed: moving(x) = fixed(x + u(x)) ... but we want the registration to
+ * recover the field that pulls moving back to fixed. We instead define moving =
+ * warp_field(fixed, +u) and let demons recover ~ +u (so warp_field(moving,u_rec)
+ * reproduces fixed). */
+static void make_true_field(float *ux, float *uy, float *uz, int nz,int ny,int nx, double amp) {
+    for (int z=0; z<nz; z++) for (int y=0; y<ny; y++) for (int x=0; x<nx; x++) {
+        double fz=(double)z/nz, fy=(double)y/ny, fx=(double)x/nx;
+        size_t i=(z*ny+y)*nx+x;
+        ux[i]=(float)(amp*sin(2.0*M_PI*fy)*cos(2.0*M_PI*fz));
+        uy[i]=(float)(amp*sin(2.0*M_PI*fx)*cos(1.0*M_PI*fz));
+        uz[i]=(float)(amp*0.7*sin(2.0*M_PI*fx)*sin(1.5*M_PI*fy));
+    }
+}
+
+static double pearson(const float *a, const float *b, size_t n) {
+    double sa=0,sb=0,saa=0,sbb=0,sab=0;
+    for(size_t i=0;i<n;i++){sa+=a[i];sb+=b[i];saa+=(double)a[i]*a[i];sbb+=(double)b[i]*b[i];sab+=(double)a[i]*b[i];}
+    double ma=sa/n,mb=sb/n,cov=sab/n-ma*mb,va=saa/n-ma*ma,vb=sbb/n-mb*mb;
+    double d=sqrt(va*vb); return d<1e-12?0.0:cov/d;
+}
+
+/* mean |gradient| magnitude of a field component (smoothness proxy) */
+static double field_grad_mag(const float *u, int nz,int ny,int nx) {
+    double s=0; long c=0;
+    for(int z=1;z<nz-1;z++)for(int y=1;y<ny-1;y++)for(int x=1;x<nx-1;x++){
+        size_t i=(z*ny+y)*nx+x;
+        double gx=0.5*(u[i+1]-u[i-1]);
+        double gy=0.5*(u[i+nx]-u[i-nx]);
+        double gz=0.5*(u[i+nx*ny]-u[i-nx*ny]);
+        s+=sqrt(gx*gx+gy*gy+gz*gz); c++;
+    }
+    return c? s/c : 0;
+}
+
+static void test_warp_field_identity(void) {
+    int nz=24,ny=24,nx=24; size_t n=(size_t)nz*ny*nx;
+    float *in=malloc(4*n),*out=malloc(4*n);
+    float *zx=calloc(n,4),*zy=calloc(n,4),*zz=calloc(n,4);
+    make_textured_vol(in,nz,ny,nx);
+    fy_warp_field(in,out,nz,ny,nx,zx,zy,zz);
+    double mad=interior_mad(in,out,nz,ny,nx,0);
+    CHECK(mad<1e-6, "warp_field with zero field == identity");
+    free(in);free(out);free(zx);free(zy);free(zz);
+}
+
+static void test_demons_known_warp(void) {
+    int nz=64,ny=64,nx=64; size_t n=(size_t)nz*ny*nx;
+    float *fixed=malloc(4*n),*moving=malloc(4*n),*warped=malloc(4*n);
+    float *tx=malloc(4*n),*ty=malloc(4*n),*tz=malloc(4*n);     /* true field */
+    float *ux=calloc(n,4),*uy=calloc(n,4),*uz=calloc(n,4);     /* recovered  */
+    make_textured_vol(fixed,nz,ny,nx);
+    make_true_field(tx,ty,tz,nz,ny,nx, 4.0);                   /* ~4 vox max */
+    fy_warp_field(fixed,moving,nz,ny,nx,tx,ty,tz);             /* moving=fixed(x+u) */
+
+    double mad_before=interior_mad(fixed,moving,nz,ny,nx,6);
+    double I[12]={1,0,0,0,0,1,0,0,0,0,1,0};
+    double ncc_before=fy_ncc_warped(fixed,moving,nz,ny,nx,I);
+
+    fy_register_demons(fixed,moving,nz,ny,nx,ux,uy,uz, 80, 1.5, 1.5);
+    fy_warp_field(moving,warped,nz,ny,nx,ux,uy,uz);
+
+    double mad_after=interior_mad(fixed,warped,nz,ny,nx,6);
+    double ncc_after=pearson(fixed,warped,n);
+    /* field recovery: the recovered PULL field that maps moving->fixed is the
+     * INVERSE of the field that generated moving (moving=fixed(x+u_true)), so
+     * u_rec ~ -u_true. We test the magnitude of the correlation. */
+    double fc = pearson(ux,tx,n);   /* x-component; expect strongly NEGATIVE */
+    printf("     [demons known-warp] NCC %.4f->%.4f  MAD %.4f->%.4f  field-corr(x)=%.3f (expect <0, |.| high)\n",
+           ncc_before,ncc_after,mad_before,mad_after,fc);
+    CHECK(ncc_after>ncc_before+0.01, "demons raises NCC vs unregistered");
+    CHECK(ncc_after>0.97, "demons reaches high NCC on textured known warp");
+    CHECK(mad_after<0.6*mad_before, "demons cuts intensity MAD substantially");
+    CHECK(fabs(fc)>0.5, "recovered field correlates with true field (x-comp, inverse sign)");
+    free(fixed);free(moving);free(warped);free(tx);free(ty);free(tz);
+    free(ux);free(uy);free(uz);
+}
+
+static void test_demons_regularization(void) {
+    int nz=48,ny=48,nx=48; size_t n=(size_t)nz*ny*nx;
+    float *fixed=malloc(4*n),*moving=malloc(4*n);
+    float *tx=malloc(4*n),*ty=malloc(4*n),*tz=malloc(4*n);
+    make_textured_vol(fixed,nz,ny,nx);
+    make_true_field(tx,ty,tz,nz,ny,nx, 3.0);
+    fy_warp_field(fixed,moving,nz,ny,nx,tx,ty,tz);
+
+    float *ax=calloc(n,4),*ay=calloc(n,4),*az=calloc(n,4);
+    float *bx=calloc(n,4),*by=calloc(n,4),*bz=calloc(n,4);
+    fy_register_demons(fixed,moving,nz,ny,nx,ax,ay,az, 60, 0.7, 1.5);  /* loose */
+    fy_register_demons(fixed,moving,nz,ny,nx,bx,by,bz, 60, 2.5, 1.5);  /* stiff */
+    double g_loose=field_grad_mag(ax,nz,ny,nx);
+    double g_stiff=field_grad_mag(bx,nz,ny,nx);
+    printf("     [demons regularization] grad(sigma=0.7)=%.4f  grad(sigma=2.5)=%.4f\n",g_loose,g_stiff);
+    CHECK(g_stiff<g_loose, "larger field_sigma -> smoother (lower-gradient) field");
+    CHECK(g_stiff<0.5, "stiff field stays smooth/bounded (no tearing)");
+    free(fixed);free(moving);free(tx);free(ty);free(tz);
+    free(ax);free(ay);free(az);free(bx);free(by);free(bz);
+}
+
+static void test_register_full_affine_plus_demons(void) {
+    int nz=64,ny=64,nx=64; size_t n=(size_t)nz*ny*nx;
+    float *fixed=malloc(4*n),*moving=malloc(4*n);
+    float *aff_only=malloc(4*n),*full=malloc(4*n);
+    float *tx=malloc(4*n),*ty=malloc(4*n),*tz=malloc(4*n);
+    float *ux=calloc(n,4),*uy=calloc(n,4),*uz=calloc(n,4);
+    make_textured_vol(fixed,nz,ny,nx);
+    /* moving = affine(fixed) THEN smooth deformation: build a combined moving */
+    double cz=(nz-1)*0.5,cy=(ny-1)*0.5,cx=(nx-1)*0.5;
+    double Mgen[12];
+    build_M(Mgen, 0.06,0.04,0.05, 1.03, 2.0,-1.5,1.0, cz,cy,cx);
+    float *affd=malloc(4*n);
+    fy_warp_affine(fixed,affd,nz,ny,nx,Mgen,nz,ny,nx);    /* affine part */
+    make_true_field(tx,ty,tz,nz,ny,nx, 3.0);
+    fy_warp_field(affd,moving,nz,ny,nx,tx,ty,tz);          /* + deformation */
+
+    /* affine alone */
+    double M_aff[12]={1,0,0,0,0,1,0,0,0,0,1,0};
+    fy_register_affine(fixed,moving,nz,ny,nx,M_aff,0);
+    fy_warp_affine(moving,aff_only,nz,ny,nx,M_aff,nz,ny,nx);
+    double ncc_aff=pearson(fixed,aff_only,n);
+
+    /* affine + demons via fy_register_full */
+    double M_full[12]={1,0,0,0,0,1,0,0,0,0,1,0};
+    fy_register_full(fixed,moving,nz,ny,nx,M_full,0, ux,uy,uz, 80,1.5,1.5);
+    fy_warp_affine(moving,affd,nz,ny,nx,M_full,nz,ny,nx);
+    fy_warp_field(affd,full,nz,ny,nx,ux,uy,uz);
+    double ncc_full=pearson(fixed,full,n);
+
+    printf("     [affine vs affine+demons] NCC affine=%.4f  affine+demons=%.4f\n",ncc_aff,ncc_full);
+    CHECK(ncc_full>ncc_aff+0.005, "affine+demons beats affine alone on affine+deformable warp");
+    free(fixed);free(moving);free(aff_only);free(full);free(affd);
+    free(tx);free(ty);free(tz);free(ux);free(uy);free(uz);
+}
+
 int main(void) {
     test_fft_vs_dft();
     test_fft_roundtrip();
@@ -551,6 +703,10 @@ int main(void) {
     test_register_rigid();
     test_register_affine();
     test_register_contrast();
+    test_warp_field_identity();
+    test_demons_known_warp();
+    test_demons_regularization();
+    test_register_full_affine_plus_demons();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

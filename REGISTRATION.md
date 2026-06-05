@@ -267,4 +267,177 @@ OMP_NUM_THREADS=1 OMP_THREAD_LIMIT=1 python3 tests/register_real_smoke.py
 * **Likely additions for Layer 2:** an optional foreground mask/weight in the
   metric, MI as an alternative metric, and a displacement-field warp entry point
   (`fy_warp_field`) alongside `fy_warp_affine`.
+
+---
+---
+
+# Volume Registration — Layer 2 (deformable / Demons)
+
+**Layer 2 of 3.** After affine has removed the *global* transform, two scans of
+the **same** scroll still differ by a **smooth physical warp** — thermal /
+humidity expansion, sample creep, slightly different mounting between scans. That
+residual is non-rigid and per-voxel; an affine cannot represent it. Layer 2
+recovers a **displacement field** `u(x) = (uz,uy,ux)` that pulls the
+affine-aligned moving volume the last mile onto the fixed one.
+
+All in `register.c` (declarations in `fysics.h`), built on Layer 1's
+`fy_sample_trilinear` and `fy_downsample2x`. Pure C, CPU-only, libc+libm.
+
+## API
+
+```c
+/* Resample `in` through a displacement field: out(z,y,x)=sample(in,z+uz,y+uy,x+ux).
+ * OOB -> 0. Zero field reproduces `in`. Deformable analogue of fy_warp_affine. */
+int fy_warp_field(const float *in, float *out, int nz,int ny,int nx,
+                  const float *ux,const float *uy,const float *uz);
+
+/* Coarse-to-fine symmetric Demons. fixed & moving share the grid (run affine
+ * first). ux/uy/uz: in=initial field (zeros for fresh), out=recovered field. */
+int fy_register_demons(const float *fixed,const float *moving, int nz,int ny,int nx,
+                       float *ux,float *uy,float *uz,
+                       int n_iters, double field_sigma, double step);
+
+/* Convenience: affine THEN demons. M_out = affine map; ux/uy/uz = residual field.
+ * Fully-registered moving = warp_field(warp_affine(moving,M_out), ux,uy,uz). */
+int fy_register_full(const float *fixed,const float *moving, int nz,int ny,int nx,
+                     double *M_out,int rigid_only, float *ux,float *uy,float *uz,
+                     int n_iters,double field_sigma,double step);
 ```
+
+### Field convention
+
+`u = (uz,uy,ux)` lives on the **fixed** grid and is a **pull / backward**
+displacement in **voxel** units (same idx convention `(z*ny+y)*nx+x`). The warped
+moving volume is `warped(z,y,x) = moving(z+uz, y+uy, x+ux)`, sampled with the same
+`fy_sample_trilinear`. A **zero field is the identity warp** (tested). Three
+separate float arrays (not interleaved) so each component smooths independently
+and the layout matches the per-component math.
+
+## The Demons variant
+
+Classic **Thirion demons** with **symmetric (active) forces** and a
+**fluid-then-elastic** Gaussian regularizer. Each iteration:
+
+1. Warp moving by the current field → `m`. (`f` = fixed.)
+2. Per-voxel **force** (Cachier's normalized, symmetric form):
+
+   ```
+   d = m - f
+   denom_f = |grad f|^2 + d^2/K^2      denom_m = |grad m|^2 + d^2/K^2
+   Δu = -step * d * ( grad f / denom_f  +  grad m / denom_m )
+   ```
+
+   * `grad f` is precomputed once (constant across iterations); `grad m` is
+     recomputed each iteration from the warped moving.
+   * Using **both** gradients (symmetric/active) roughly doubles the capture
+     range and convergence speed versus the original fixed-gradient-only demons.
+   * `K^2` = (fixed dynamic range)² normalizes the intensity term so `d^2/K^2`
+     is balanced against `|grad|^2`; it also **guards the aperture problem** — in
+     a flat region `|grad|→0`, the denominator floors the step instead of
+     exploding, so flat voxels simply don't move (which is correct: they're
+     unconstrained).
+3. **Regularize**: separable Gaussian-smooth each field component (sigma =
+   `field_sigma`, truncated at 3σ, edge-clamped). Smoothing the *update* is the
+   fluid model; smoothing the *accumulated* field is the elastic model — here we
+   smooth the accumulated field every iteration, which behaves as a stiff elastic
+   prior and is what keeps the deformation **smooth and tear-free**.
+
+**Pyramid (coarse-to-fine):** same policy as Layer 1 — up to 4 levels via
+`fy_downsample2x`, stop when a dim would drop below 16. Solve at the coarsest
+level (big capture range, cheap), then **upsample the field ×2 and double the
+displacement values** (trilinear, `upsample_field_2x`) and refine at the next
+finer level. `n_iters` runs at every level.
+
+## Validation results
+
+Tests in `tests/test_fysics.c` (`OMP_NUM_THREADS=1 ./build/test_fysics`).
+Synthetic **textured** volume (Layer 1 blobs + several sinusoid octaves so there
+is gradient everywhere — Demons needs texture). Known **smooth** warp = a
+low-frequency sinusoidal field, max ~3–4 voxels: `moving = fixed(x + u_true)`,
+and Demons must recover the **inverse** pull field `u_rec ≈ −u_true`.
+
+| test | numbers | result |
+|------|---------|--------|
+| `fy_warp_field` zero field == identity | MAD < 1e-6 | ✅ |
+| **known warp (64³, ~4 vox)** | NCC **0.874 → 0.970**, intensity MAD **0.042 → 0.017** (−59%) | ✅ |
+| field recovery (x-comp) | corr(u_rec, u_true) = **−0.94** (strong; sign is inverse by construction) | ✅ |
+| **regularization** | mean field-gradient: σ=0.7 → **0.334**, σ=2.5 → **0.211** (stiffer = smoother) | ✅ |
+| no tearing | stiff-field gradient stays bounded (< 0.5; field stays smooth, no folding) | ✅ |
+| **affine + demons vs affine alone** (64³, combined affine+deformable warp) | NCC **0.905 → 0.961** | ✅ |
+
+Honest reading of the numbers:
+
+* On a textured volume Demons recovers the smooth warp well: NCC into the high
+  0.90s and intensity MAD cut by ~60%. The recovered field correlates with the
+  true field at |0.94|, so it is genuinely recovering the *deformation*, not just
+  smearing intensities into agreement.
+* `field_sigma` does what it should: larger σ → measurably smoother field, and
+  the field never tears (gradient bounded, no folding) — the regularizer is
+  doing its job.
+* `fy_register_full` (affine then demons) beats affine alone by **+0.056 NCC**
+  on a warp that has *both* components, confirming Layer 1 → Layer 2 composition
+  is the right pipeline: affine can't touch the non-rigid part, demons mops it up.
+
+### Runtime (single-threaded, -Ofast -march=native)
+
+On a **128³** volume, 80 iters/level, σ=1.5, step=1.5: **~14 s**, NCC
+0.833 → 0.930. Dominated by the finest level (each iter = 1 field-warp + 1
+moving-gradient + 3 separable Gaussian smooths over the whole volume). Cheap
+speedups if needed: fewer finest-level iters, smaller `field_sigma` truncation,
+or cap refinement to the top 2 levels.
+
+## Parameter guidance
+
+| param | typical | effect |
+|-------|---------|--------|
+| `n_iters` | **50–150** per level | more = closer convergence, linear cost. 80 is a good default. |
+| `field_sigma` | **1.0–2.0** voxels | elasticity. Smaller = more flexible (can overfit/tear on noisy data); larger = stiffer/smoother (safer, may under-fit sharp deformation). Match to how non-rigid you expect the warp to be. |
+| `step` | **1.0–2.0** | per-iteration displacement scale. ~1.5 converges briskly without overshoot here; lower it if the field oscillates. |
+
+Run affine first, warp moving with the recovered `M`, then demons on the
+affine-aligned pair (or just call `fy_register_full`).
+
+## Known limitations / honest failure modes
+
+* **Aperture problem.** In flat / low-gradient regions there is no information to
+  drive the force, so the field there is determined only by the regularizer
+  (interpolated from textured neighbours). The recovered field is reliable where
+  there is texture and merely *smooth* where there isn't — which is why the
+  validation uses a textured volume and asserts **improvement**, not exact field
+  recovery. On real CT, air and uniform-material regions will not be registered
+  by their own content; they ride along on the smoothed field. This is inherent
+  to intensity-driven demons, not a bug.
+* **Capture range.** A single demons step moves ≲1 voxel; the pyramid extends
+  this to roughly a coarsest-level voxel (~2³ ≈ 8 full-res voxels of true
+  displacement with 4 levels). **Large** deformations beyond that need more
+  pyramid levels or must already be mostly removed by Layer 1. Demons cannot fix
+  a global rotation/scale — that's Layer 1's job.
+* **No diffeomorphism guarantee.** This is *additive* (classic) demons, not
+  diffeomorphic (no exp-map / inverse-consistency enforcement). The Gaussian
+  regularizer keeps the field smooth and, at the tested deformations, folding-
+  free, but it does **not** mathematically guarantee an invertible (positive-
+  Jacobian) map for arbitrarily large/stiff settings. If a downstream step needs
+  a guaranteed-invertible warp, a diffeomorphic (log-domain) demons is the
+  upgrade — the force and pyramid code here carry straight over.
+* **SSD-style force on intensity difference.** The demons force uses the raw
+  intensity difference `m − f`, so unlike Layer 1's NCC metric it is **not**
+  invariant to a brightness/contrast difference between scans. For two different
+  energies you must intensity-normalize (or histogram-match) the affine-aligned
+  moving to the fixed before running demons, or the contrast difference will be
+  (wrongly) interpreted as deformation. NCC/MI-driven or local-mean-corrected
+  demons is the fix; not implemented here.
+* **Same-grid assumption** (inherited from Layer 1): fixed and moving must be on
+  the same `(nz,ny,nx)` grid — resample first.
+
+## Is it ready for multi-resolution fusion?
+
+Mostly. The mechanics are solid: zero-field identity, monotone NEC improvement on
+known warps, correct field recovery, working regularization, and a clean
+affine→demons composition that beats affine alone. What fusion still needs before
+trusting it on **real** PHerc data: (1) **intensity normalization** between the
+two energies before the demons force (the contrast caveat above), (2) a
+**foreground mask** so air/mounting don't drive spurious deformation, and (3)
+validation on a pair that *actually covers the same physical region* (the Layer 1
+smoke test pair does not). With those, the pipeline `fy_register_full` →
+`fy_warp_affine` → `fy_warp_field` puts the moving scan into the fixed coordinate
+system voxel-for-voxel, which is exactly what fusion consumes.
