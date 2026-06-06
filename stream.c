@@ -152,3 +152,74 @@ float fy_auto_air_thresh(const fy_hist_state *s) {
     }
     return (float)best / 255.0f;
 }
+
+
+/* ---- segmentation-quality metrics (math in C; Python is glue) ----
+ * Computed from a 256-bin histogram so they're O(256), not O(N*thresholds).
+ * Build the histogram with fy_hist_accumulate_u8 (or pass counts directly). */
+
+/* Haralick-Shapiro bias-guarded Fisher discriminant J over all thresholds in [lo,hi):
+ *   J(t) = (mu_hi - mu_lo)^2 / (var_lo + var_hi) * (min(n_lo,n_hi)/N / 0.5)
+ * The balance term penalizes degenerate (mode-collapsed) splits. Returns best J; writes
+ * the argmax threshold to *best_t. Intensities normalized to [0,1] (u8/255). */
+double fy_haralick_shapiro(const long hist[256], int lo, int hi, int min_count, int *best_t) {
+    double n = 0, cx[256], cx2[256], c[256];
+    double acc = 0, accx = 0, accx2 = 0;
+    for (int i = 0; i < 256; i++) {
+        double xi = (double)i / 255.0;
+        acc += hist[i]; accx += hist[i] * xi; accx2 += hist[i] * xi * xi;
+        c[i] = acc; cx[i] = accx; cx2[i] = accx2;
+    }
+    n = c[255];
+    double totx = cx[255];
+    if (lo < 1) lo = 1; if (hi > 256) hi = 256;
+    double best = -1; int bt = lo;
+    for (int t = lo; t < hi; t++) {
+        double na = c[t-1], nb = n - na;
+        if (na < min_count || nb < min_count) continue;
+        double ma = cx[t-1] / na, mb = (totx - cx[t-1]) / nb;
+        double va = cx2[t-1] / na - ma * ma;
+        double vb = (cx2[255] - cx2[t-1]) / nb - mb * mb;
+        double bal = (na < nb ? na : nb) / n / 0.5;
+        double J = (mb - ma) * (mb - ma) / (va + vb + 1e-9) * bal;
+        if (J > best) { best = J; bt = t; }
+    }
+    if (best_t) *best_t = bt;
+    return best;
+}
+
+/* Bimodal valley depth from a histogram: smooth (box-5), exclude rails (0,254,255), find the
+ * two dominant modes and the valley between them. depth = 1 - h_valley/min(h_dark,h_light) in
+ * [0,1] (higher=deeper=better separated). Writes dark/light/valley bins if non-NULL. Returns
+ * -1 if not bimodal. */
+double fy_valley_depth(const long hist[256], int *dark_out, int *light_out, int *valley_out) {
+    double hf[256];
+    for (int i = 0; i < 256; i++) {
+        double s = 0; int cnt = 0;
+        for (int k = -2; k <= 2; k++) { int j = i + k; if (j >= 0 && j < 256) { s += hist[j]; cnt++; } }
+        hf[i] = s / cnt;
+    }
+    hf[0] = hf[254] = hf[255] = 0;
+    double mx = 0; for (int i = 0; i < 256; i++) if (hf[i] > mx) mx = hf[i];
+    if (mx <= 0) return -1;
+    /* collect peaks > 5% of max, merge those within 10 bins (keep the taller) */
+    int peaks[256], np = 0;
+    for (int u = 3; u < 253; u++)
+        if (hf[u] >= hf[u-1] && hf[u] >= hf[u+1] && hf[u] > 0.05 * mx) {
+            if (np && u - peaks[np-1] <= 10) { if (hf[u] > hf[peaks[np-1]]) peaks[np-1] = u; }
+            else peaks[np++] = u;
+        }
+    if (np < 2) return -1;
+    /* two tallest peaks */
+    int p1 = peaks[0], p2 = peaks[1];
+    for (int i = 0; i < np; i++) {
+        if (hf[peaks[i]] > hf[p1]) { p2 = p1; p1 = peaks[i]; }
+        else if (hf[peaks[i]] > hf[p2] && peaks[i] != p1) p2 = peaks[i];
+    }
+    int a = p1 < p2 ? p1 : p2, b = p1 < p2 ? p2 : p1;
+    int v = a; double vmin = hf[a];
+    for (int u = a; u <= b; u++) if (hf[u] < vmin) { vmin = hf[u]; v = u; }
+    if (dark_out) *dark_out = a; if (light_out) *light_out = b; if (valley_out) *valley_out = v;
+    double mn = hf[a] < hf[b] ? hf[a] : hf[b];
+    return 1.0 - vmin / (mn + 1e-12);
+}

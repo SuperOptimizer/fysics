@@ -88,6 +88,15 @@ void fy_glcae_global_finalize(const fy_hist_state *s, int *mapping_out /*[256]*/
 /* auto air/papyrus threshold (Otsu) from the volume's histogram -- per-volume,
  * not a hardcoded constant. Returns a [0,1] fraction for fy_recipe.air_thresh. */
 float fy_auto_air_thresh(const fy_hist_state *s);
+
+/* ---- segmentation-quality metrics from a 256-bin histogram (O(256), math in C) ----
+ * Haralick-Shapiro bias-guarded Fisher J over thresholds [lo,hi); returns best J, writes
+ * argmax threshold to *best_t. Higher J = cleaner 2-class separation (balance term guards
+ * against degenerate/mode-collapsed splits). min_count = min voxels per class. */
+double fy_haralick_shapiro(const long hist[256], int lo, int hi, int min_count, int *best_t);
+/* Bimodal valley depth (rails 0/254/255 excluded): 1 - h_valley/min(h_dark,h_light) in [0,1],
+ * higher=deeper. Writes dark/light/valley bins (non-NULL). -1 if not bimodal. */
+double fy_valley_depth(const long hist[256], int *dark_out, int *light_out, int *valley_out);
 void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
                               const int *mapping);
 
