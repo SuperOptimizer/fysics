@@ -223,3 +223,65 @@ double fy_valley_depth(const long hist[256], int *dark_out, int *light_out, int 
     double mn = hf[a] < hf[b] ? hf[a] : hf[b];
     return 1.0 - vmin / (mn + 1e-12);
 }
+
+
+/* ---- whole-pipeline quality metrics (math in C; Python glue) ----
+ * Computed in one pass over a float volume in [0,1]. */
+
+/* Edge/sheet sharpness: mean gradient magnitude (central differences). Higher = sharper
+ * boundaries (papyrus sheet edges). Skips a 1-voxel border. */
+double fy_edge_sharpness(const float *v, int nz, int ny, int nx) {
+    double s = 0; long cnt = 0;
+    for (int z = 1; z < nz-1; z++)
+        for (int y = 1; y < ny-1; y++)
+            for (int x = 1; x < nx-1; x++) {
+                size_t i = ((size_t)z*ny + y)*nx + x;
+                double gz = v[i+(size_t)ny*nx] - v[i-(size_t)ny*nx];
+                double gy = v[i+nx] - v[i-nx];
+                double gx = v[i+1] - v[i-1];
+                s += sqrt(gx*gx + gy*gy + gz*gz); cnt++;
+            }
+    return cnt ? s/cnt*0.5 : 0;
+}
+
+/* Dynamic-range usage: fraction of the [0,1] range actually occupied by the bulk (1-99
+ * percentile span) -- how well the volume uses its bit depth. From a histogram. */
+double fy_dynamic_range_usage(const long hist[256]) {
+    double n = 0; for (int i = 0; i < 256; i++) n += hist[i];
+    if (n <= 0) return 0;
+    double acc = 0; int lo = 0, hi = 255;
+    for (int i = 0; i < 256; i++) { acc += hist[i]; if (acc >= 0.01*n) { lo = i; break; } }
+    acc = 0; for (int i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= 0.01*n) { hi = i; break; } }
+    return (hi - lo) / 255.0;
+}
+
+/* Flat-region noise: median local std over flat (low-gradient) blocks -- the noise floor.
+ * blk=block size, samples nonoverlapping blocks, keeps flat ones (low mean-gradient), returns
+ * the median of their stds. Lower = less noise. */
+double fy_flat_noise(const float *v, int nz, int ny, int nx, int blk) {
+    if (blk < 4) blk = 8;
+    int nb = (nz/blk)*(ny/blk)*(nx/blk); if (nb <= 0) return 0;
+    double *stds = (double*)malloc(sizeof(double)*nb); int m = 0;
+    for (int z = 0; z+blk <= nz; z += blk)
+        for (int y = 0; y+blk <= ny; y += blk)
+            for (int x = 0; x+blk <= nx; x += blk) {
+                double s = 0, s2 = 0; int c = 0; double mn = 1e9, mx = -1e9;
+                for (int dz = 0; dz < blk; dz++)
+                    for (int dy = 0; dy < blk; dy++)
+                        for (int dx = 0; dx < blk; dx++) {
+                            float val = v[(((size_t)(z+dz)*ny+(y+dy))*nx)+(x+dx)];
+                            s += val; s2 += val*val; c++;
+                            if (val < mn) mn = val; if (val > mx) mx = val;
+                        }
+                double mean = s/c, var = s2/c - mean*mean;
+                (void)mx; (void)mn;
+                /* keep all bright (papyrus, not air) blocks; the noise floor is the LOW
+                 * percentile of their stds -- the least-textured papyrus blocks are ~pure
+                 * noise. (Requiring genuinely "flat" blocks fails: papyrus is textured.) */
+                if (mean > 0.1) stds[m++] = sqrt(var > 0 ? var : 0);
+            }
+    if (m == 0) { free(stds); return 0; }
+    /* sort; return the 10th percentile (the noise floor among bright blocks) */
+    for (int i = 0; i < m; i++) for (int j = i+1; j < m; j++) if (stds[j] < stds[i]) { double t = stds[i]; stds[i] = stds[j]; stds[j] = t; }
+    double nf = stds[m/10]; free(stds); return nf;
+}

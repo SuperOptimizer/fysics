@@ -97,6 +97,14 @@ double fy_haralick_shapiro(const long hist[256], int lo, int hi, int min_count, 
 /* Bimodal valley depth (rails 0/254/255 excluded): 1 - h_valley/min(h_dark,h_light) in [0,1],
  * higher=deeper. Writes dark/light/valley bins (non-NULL). -1 if not bimodal. */
 double fy_valley_depth(const long hist[256], int *dark_out, int *light_out, int *valley_out);
+
+/* ---- whole-pipeline quality metrics (math in C) ----
+ * Edge/sheet sharpness: mean gradient magnitude (higher=sharper boundaries). */
+double fy_edge_sharpness(const float *v, int nz, int ny, int nx);
+/* Dynamic-range usage: fraction of [0,1] occupied by the 1-99 percentile span (from histogram). */
+double fy_dynamic_range_usage(const long hist[256]);
+/* Flat-region noise: median local std over flat bright (papyrus) blocks -- the noise floor. */
+double fy_flat_noise(const float *v, int nz, int ny, int nx, int blk);
 void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
                               const int *mapping);
 
