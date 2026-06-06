@@ -287,6 +287,9 @@ int fy_papyrus_mask(const float *in, float *mask, int nz, int ny, int nx,
                     float var_lo, float var_hi, int radius);
 int fy_apply_mask(const float *processed, const float *original, const float *mask,
                   float *out, int nz, int ny, int nx, float air_fill);
+/* local standard deviation in a (2r+1)^3 box -- the "texture" feature (low=flat air,
+ * high=structured papyrus). Use for intensity x texture air/papyrus separation. */
+int fy_local_std(const float *in, float *out, int nz, int ny, int nx, int r);
 /* one-call sharpen-without-air-noise: deconv, keep only on papyrus */
 int fy_deconvolve_masked(const float *in, float *out, int nz, int ny, int nx,
                          const fy_physics *p, double reg,

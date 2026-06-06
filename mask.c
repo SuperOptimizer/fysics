@@ -45,6 +45,20 @@ static void local_stats(const float *restrict v, int nz, int ny, int nx, int r,
             }
 }
 
+/* Exported local standard deviation in a (2r+1)^3 box -- the "texture" feature: low in flat
+ * air/void, high in structured papyrus. Math in C (Python glue was using slow scipy). */
+int fy_local_std(const float *in, float *out, int nz, int ny, int nx, int r) {
+    if (r < 1) r = 1;
+    size_t n = (size_t)nz * ny * nx;
+    float *mean = malloc(sizeof(float) * n);
+    float *var = malloc(sizeof(float) * n);
+    if (!mean || !var) { free(mean); free(var); return 1; }
+    local_stats(in, nz, ny, nx, r, mean, var);
+    for (size_t i = 0; i < n; i++) out[i] = sqrtf(var[i] > 0 ? var[i] : 0);
+    free(mean); free(var);
+    return 0;
+}
+
 /* smoothstep for soft thresholding */
 static inline float smoothstep(float lo, float hi, float x) {
     if (hi <= lo) return x >= hi ? 1.0f : 0.0f;
