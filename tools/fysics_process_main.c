@@ -26,7 +26,8 @@ static void usage(const char *prog) {
         "  --profile P    export profile: 'conservative' (fidelity: keep faint material, full\n"
         "                 res, gentle denoise) or 'aggressive' (readability/size: cut faint\n"
         "                 material below the sheets, max safe downsample, stronger denoise)\n"
-        "  --downsample   enable auto safe downsample (anti-alias + decimate)\n"
+        "  --downsample   MANUAL downsample (anti-alias+decimate). NOT in any profile -- this volume\n"
+        "                 is barely oversampled; verify the result by eye. Off by default.\n"
         "  --aggr A       downsample aggressiveness 0..1 (p5->median, default 0.0)\n"
         "  --air-cut-aggr A  air-cut aggressiveness 0..1 (void-peak->valley, default 0.0)\n"
         "  --deconv       STORE matched-Wiener deconv (BM18 default: OFF, view-time only)\n"
@@ -72,10 +73,15 @@ int main(int argc, char **argv) {
     }
     /* PROFILES set every aggressiveness knob coherently (per-volume numbers still measured). */
     if (profile) {
+        /* NEITHER profile downsamples. Empirical finding: this volume is NOT meaningfully
+         * oversampled -- the auto-factor formula was unreliable (built on an INFLATED PSF sigma
+         * measurement; gave a nonsensical 3.68x) and the eye sees real detail loss even at small
+         * factors. Downsampling stays a MANUAL, opt-in tool (--downsample), eyes-on, never a
+         * profile/auto default -- the data is irreplaceable and the win isn't worth the risk. */
         if (!strcmp(profile, "conservative")) {        /* FIDELITY: keep faint material, full res */
             air_cut_aggr = 0.0; denoise_k = 3.0; do_downsample = 0; aggr = 0.0;
-        } else if (!strcmp(profile, "aggressive")) {   /* READABILITY/SIZE: cut faint, downsample */
-            air_cut_aggr = 1.0; denoise_k = 4.2; do_downsample = 1; aggr = 1.0;
+        } else if (!strcmp(profile, "aggressive")) {   /* READABILITY: cut faint material, full res */
+            air_cut_aggr = 1.0; denoise_k = 4.2; do_downsample = 0; aggr = 0.0;
         } else { fprintf(stderr, "unknown profile: %s (conservative|aggressive)\n", profile); return 2; }
     }
     if (!meta_path[0]) snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", in_zarr);

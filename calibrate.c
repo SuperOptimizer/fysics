@@ -178,12 +178,16 @@ double fy_cal_measure_psf_sigma(const unsigned char *tile, int nz, int ny, int n
 int fy_cal_downsample_factor(double p5, double med, double aggr) {
     if (aggr < 0.0) aggr = 0.0;
     if (aggr > 1.0) aggr = 1.0;
-    double sigma = p5 + aggr * (med - p5);   /* conservative(p5)..aggressive(med) */
+    /* MTF=0.2 floor (0.1 was too permissive -> over-downsampled), aggr blends only halfway
+     * p5->median, hard cap 2x (resolution ~2-3 vox FWHM => ~2x oversampling; 3x risks real loss). */
+    double sigma = p5 + 0.5 * aggr * (med - p5);
     if (sigma <= 0.0) return 1;
-    double f0 = sqrt(-log(0.1) / (2.0 * M_PI * M_PI * sigma * sigma)); /* cyc/vox */
-    double factor = 0.5 / f0;                 /* max factor keeping signal */
+    double f0 = sqrt(-log(0.2) / (2.0 * M_PI * M_PI * sigma * sigma)); /* cyc/vox */
+    double factor = 0.5 / f0;
     int f = (int)floor(factor);
-    return f < 1 ? 1 : f;
+    if (f < 1) f = 1;
+    if (f > 2) f = 2;
+    return f;
 }
 
 /* ===================================================================== *

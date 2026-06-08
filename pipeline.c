@@ -336,12 +336,20 @@ static double measure_tile_psf_sigma(const unsigned char *vol, int Z, int Y, int
 
 /* integer safe downsample factor from the PSF sigma map (port of _downsample_factor_from_psf). */
 static int downsample_factor_from_psf(double p5, double med, double aggr) {
-    double sigma = p5 + aggr * (med - p5);
+    /* Safe factor: the new Nyquist (0.5/factor) must stay >= f0, the freq where the system MTF
+     * drops to MTF_FLOOR. Use MTF_FLOOR=0.2 (NOT 0.1) -- there is still REAL faint signal between
+     * MTF 0.1 and 0.2, and 0.1 was too permissive (gave 3x on this blurry vol, which lost detail).
+     * Governed by the SHARPEST regions (p5) to protect detail; aggr only nudges toward median.
+     * HARD CAP at 2x: even fully aggressive, 2x is the defensible limit (resolution ~2-3 vox FWHM
+     * means ~2x oversampling; 3x sits at critical sampling with no margin -> risks real loss). */
+    double sigma = p5 + 0.5 * aggr * (med - p5);   /* aggr blends only HALFWAY p5->median */
     if (sigma <= 0) return 1;
-    double f0 = sqrt(-log(0.1) / (2.0 * M_PI * M_PI * sigma * sigma));
+    double f0 = sqrt(-log(0.2) / (2.0 * M_PI * M_PI * sigma * sigma));  /* MTF=0.2 floor */
     double factor = 0.5 / f0;
-    int fi = (int)factor;
-    return fi < 1 ? 1 : fi;
+    int fi = (int)(factor + 1e-9);
+    if (fi < 1) fi = 1;
+    if (fi > 2) fi = 2;                            /* hard cap: never more than 2x */
+    return fi;
 }
 
 /* iterated scratch denoise (guided eps=0.01, `passes` iterations); `buf` in/out, `tmp` scratch. */
