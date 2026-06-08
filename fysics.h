@@ -191,6 +191,15 @@ int fy_deconvolve_gureyev(const float *in, float *out,
                           int nz, int ny, int nx,
                           const fy_physics *p, double tikhonov);
 
+/* OPERATOR-MATCHED Wiener inverse of nabu's MEASURED effective operator: inverts ONLY
+ * G_psf(psf_sigma_vox) * unsharp(coeff,sigma) -- NOT the full Paganin (nabu's unsharp already
+ * removed most Paganin blur; measured effective blur ~1 vox, not the ~9.8 vox naive Paganin).
+ * The ONLY linear deconv shown to move BM18 data TOWARD ground truth (RMSE 0.0225) without the
+ * amplitude overshoot of the plain/gureyev inverses. tikhonov ~0.05. */
+int fy_deconvolve_matched(const float *in, float *out,
+                          int nz, int ny, int nx,
+                          const fy_physics *p, double tikhonov);
+
 
 /* ---- per-volume noise model estimation (drive the denoisers from DATA) ----
  * Measured across 145 cubes / 18 scrolls: the reconstructed-volume noise is
