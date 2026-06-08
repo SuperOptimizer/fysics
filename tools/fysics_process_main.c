@@ -5,7 +5,7 @@
  * (calibrate -> global stats -> parallel per-tile chain) zarr->zarr.
  *
  * Usage:
- *   fysics_process IN_ZARR OUT_ZARR [--tile N] [--downsample] [--aggr A]
+ *   fysics_process IN_ZARR OUT_ZARR [--tile N] [--profile P]
  *                  [--deconv] [--musica] [--no-air-zero] [--meta PATH]
  */
 #include "fysics.h"
@@ -24,11 +24,8 @@ static void usage(const char *prog) {
         "options:\n"
         "  --tile N       tile edge in voxels (default 128)\n"
         "  --profile P    export profile: 'conservative' (fidelity: keep faint material, full\n"
-        "                 res, gentle denoise) or 'aggressive' (readability/size: cut faint\n"
-        "                 material below the sheets, max safe downsample, stronger denoise)\n"
-        "  --downsample   MANUAL downsample (anti-alias+decimate). NOT in any profile -- this volume\n"
-        "                 is barely oversampled; verify the result by eye. Off by default.\n"
-        "  --aggr A       downsample aggressiveness 0..1 (p5->median, default 0.0)\n"
+        "                 res, gentle denoise) or 'aggressive' (readability: cut faint\n"
+        "                 material below the sheets, stronger denoise)\n"
         "  --air-cut-aggr A  air-cut aggressiveness 0..1 (void-peak->valley, default 0.0)\n"
         "  --deconv       STORE matched-Wiener deconv (BM18 default: OFF, view-time only)\n"
         "  --musica       apply MUSICA viewing enhancement (default OFF)\n"
@@ -54,15 +51,13 @@ static void apply_meta(fy_pipeline_cfg *c, const char *key, double v) {
 int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
     const char *in_zarr = argv[1], *out_zarr = argv[2];
-    int tile = 128, do_downsample = 0, do_deconv = 0, do_musica = 0, do_air_zero = 1;
-    double aggr = 0.0, air_cut_aggr = 0.0, denoise_k = 0.0;   /* 0 -> default 4.2 inside */
+    int tile = 128, do_deconv = 0, do_musica = 0, do_air_zero = 1;
+    double air_cut_aggr = 0.0, denoise_k = 0.0;   /* 0 -> default 4.2 inside */
     const char *profile = NULL;
     char meta_path[PATH_MAX]; meta_path[0] = 0;
 
     for (int i = 3; i < argc; i++) {
         if      (!strcmp(argv[i], "--tile") && i+1 < argc)  tile = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--downsample"))          do_downsample = 1;
-        else if (!strcmp(argv[i], "--aggr") && i+1 < argc)  aggr = atof(argv[++i]);
         else if (!strcmp(argv[i], "--air-cut-aggr") && i+1 < argc) air_cut_aggr = atof(argv[++i]);
         else if (!strcmp(argv[i], "--profile") && i+1 < argc) profile = argv[++i];
         else if (!strcmp(argv[i], "--deconv"))              do_deconv = 1;
@@ -73,15 +68,13 @@ int main(int argc, char **argv) {
     }
     /* PROFILES set every aggressiveness knob coherently (per-volume numbers still measured). */
     if (profile) {
-        /* NEITHER profile downsamples. Empirical finding: this volume is NOT meaningfully
-         * oversampled -- the auto-factor formula was unreliable (built on an INFLATED PSF sigma
-         * measurement; gave a nonsensical 3.68x) and the eye sees real detail loss even at small
-         * factors. Downsampling stays a MANUAL, opt-in tool (--downsample), eyes-on, never a
-         * profile/auto default -- the data is irreplaceable and the win isn't worth the risk. */
-        if (!strcmp(profile, "conservative")) {        /* FIDELITY: keep faint material, full res */
-            air_cut_aggr = 0.0; denoise_k = 3.0; do_downsample = 0; aggr = 0.0;
-        } else if (!strcmp(profile, "aggressive")) {   /* READABILITY: cut faint material, full res */
-            air_cut_aggr = 1.0; denoise_k = 4.2; do_downsample = 0; aggr = 0.0;
+        /* Profiles differ only in air-cut aggressiveness + denoise strength; both full-res.
+         * (Downsampling was removed entirely -- the volume is not meaningfully oversampled and the
+         * auto-factor rested on an unreliable PSF sigma.) */
+        if (!strcmp(profile, "conservative")) {        /* FIDELITY: keep faint material */
+            air_cut_aggr = 0.0; denoise_k = 3.0;
+        } else if (!strcmp(profile, "aggressive")) {   /* READABILITY: cut faint material */
+            air_cut_aggr = 1.0; denoise_k = 4.2;
         } else { fprintf(stderr, "unknown profile: %s (conservative|aggressive)\n", profile); return 2; }
     }
     if (!meta_path[0]) snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", in_zarr);
@@ -99,7 +92,6 @@ int main(int argc, char **argv) {
     cfg.scratch_passes = 5;
     cfg.do_normalize = 1; cfg.norm_lo = -1; cfg.norm_hi = -1;
     cfg.do_zdrift = 1; cfg.zdrift_factor = NULL;
-    cfg.do_downsample = do_downsample; cfg.downsample_factor = 1; cfg.downsample_aggr = aggr;
     cfg.do_musica = do_musica; cfg.musica_p = 0.6; cfg.musica_levels = 4; cfg.musica_core = 0.0;
 
     /* ---- locate read_meta.py: next to the binary, an installed ../share or the source
@@ -156,9 +148,8 @@ int main(int argc, char **argv) {
            cfg.delta_beta, cfg.energy_kev, cfg.distance_mm, cfg.pixel_um,
            cfg.unsharp_sigma, cfg.unsharp_coeff);
     printf("  window   : [%.4g, %.4g]\n", cfg.window_lo, cfg.window_hi);
-    printf("  stages   : deconv=%d(stored) air_zero=%d normalize=%d zdrift=%d musica=%d downsample=%d(aggr=%.2f)\n",
-           cfg.do_deconv, cfg.do_air_zero, cfg.do_normalize, cfg.do_zdrift, cfg.do_musica,
-           cfg.do_downsample, cfg.downsample_aggr);
+    printf("  stages   : deconv=%d(stored) air_zero=%d normalize=%d zdrift=%d musica=%d\n",
+           cfg.do_deconv, cfg.do_air_zero, cfg.do_normalize, cfg.do_zdrift, cfg.do_musica);
     printf("  tile     : %d\n", tile);
     fflush(stdout);
 
@@ -169,7 +160,6 @@ int main(int argc, char **argv) {
     printf("  guided_eps   : %.5f\n", cfg.guided_eps);
     printf("  air_cut_u8   : %d (band +/-%d)\n", cfg.air_cut_u8, cfg.air_cut_band);
     printf("  normalize    : %s (lo=%d hi=%d)\n", cfg.norm_lo >= 0 ? "applied" : "skipped", cfg.norm_lo, cfg.norm_hi);
-    printf("  downsample   : factor=%d\n", cfg.do_downsample ? cfg.downsample_factor : 1);
     printf("  halo         : %d\n", cfg.halo);
     printf("  out written  : %s\n", out_zarr);
     return 0;

@@ -17,7 +17,6 @@
  *     - norm lo/hi percentiles (GATE: only if span < 0.40)
  *     - z-drift per-z profile (fy_zdrift_accumulate -> finalize), GATED on
  *       coherence>=0.5 AND slope_frac>=0.05 AND metadata beam_drift>=0.05
- *     - downsample factor from the measured PSF sigma map (p5..median blend)
  *     - GLOBAL deconv-output rescale range (seam-safe), if cfg->do_deconv
  * PASS2 (parallel): per input tile, halo-padded:
  *     (a) norm_apply_u8 + zdrift_apply   (intensity corrections FIRST, gated)
@@ -25,10 +24,10 @@
  *     (c) guided_denoise(guided_eps)
  *     (d) air-zero (scratch guided-denoise -> local valley clamped to global+-band -> zero)
  *     (e) optional MUSICA (per-slice, clip-aware)
- *   then take the inner tile and either write it directly (tile==chunk grid) OR, when
- *   downsampling, anti-alias gaussian(0.5*factor) + decimate on the GLOBAL f-grid and
- *   scatter the decimated atom into a CHUNK ACCUMULATOR (decouples input tiles from
- *   output chunks; flush-when-full -> bounded RAM, seam-correct on the global grid).
+ *   then take the inner tile and write it directly (tile == output chunk grid).
+ * (Downsampling was removed: the volumes are not meaningfully oversampled and the auto-factor
+ *  rested on an unreliable PSF sigma; resolution-preserving decimation would need a sharp
+ *  anti-alias and a per-volume eyes-on check -- a manual tool, not an auto stage.)
  */
 #include "fysics.h"
 #include <stdio.h>
@@ -68,35 +67,6 @@ static double percentile_sorted(const double *v, int n, double pct) { /* v MUST 
     return v[i] * (1.0 - fr) + v[i + 1] * fr;
 }
 
-/* separable 3D gaussian blur (nearest-edge), matched to the anti-alias decimate cutoff. */
-static void gauss3d(const float *in, float *out, int nz, int ny, int nx, double sigma) {
-    if (sigma <= 0.0) { memcpy(out, in, sizeof(float) * (size_t)nz * ny * nx); return; }
-    int r = (int)(3.0 * sigma + 0.5); if (r < 1) r = 1;
-    int kn = 2 * r + 1;
-    float *k = (float *)malloc(sizeof(float) * kn);
-    double s = 0;
-    for (int i = -r; i <= r; i++) { k[i + r] = (float)exp(-(double)i * i / (2.0 * sigma * sigma)); s += k[i + r]; }
-    for (int i = 0; i < kn; i++) k[i] /= (float)s;
-    size_t N = (size_t)nz * ny * nx;
-    float *t1 = (float *)malloc(sizeof(float) * N);
-    float *t2 = (float *)malloc(sizeof(float) * N);
-    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
-        double a = 0; for (int i = -r; i <= r; i++) { int xx = x + i; if (xx < 0) xx = 0; if (xx >= nx) xx = nx - 1;
-            a += k[i + r] * in[((size_t)z * ny + y) * nx + xx]; }
-        t1[((size_t)z * ny + y) * nx + x] = (float)a;
-    }
-    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
-        double a = 0; for (int i = -r; i <= r; i++) { int yy = y + i; if (yy < 0) yy = 0; if (yy >= ny) yy = ny - 1;
-            a += k[i + r] * t1[((size_t)z * ny + yy) * nx + x]; }
-        t2[((size_t)z * ny + y) * nx + x] = (float)a;
-    }
-    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
-        double a = 0; for (int i = -r; i <= r; i++) { int zz = z + i; if (zz < 0) zz = 0; if (zz >= nz) zz = nz - 1;
-            a += k[i + r] * t2[((size_t)zz * ny + y) * nx + x]; }
-        out[((size_t)z * ny + y) * nx + x] = (float)a;
-    }
-    free(k); free(t1); free(t2);
-}
 
 /* physics from cfg; scaled variant applies the regime delta_beta partial-inversion. */
 static fy_physics phys_from_cfg(const fy_pipeline_cfg *c) {
@@ -112,136 +82,6 @@ static fy_physics scaled_phys_from_cfg(const fy_pipeline_cfg *c) {
     return p;
 }
 
-/* ============================================================================
- * CHUNK ACCUMULATOR -- decouples the INPUT tile grid from the OUTPUT chunk grid
- * for downsampling. Decimated atoms (in DOWNSAMPLED coords, on the GLOBAL f-grid)
- * are SCATTERED into output chunks of `C` voxels; a chunk is FLUSHED (written +
- * freed) as soon as every voxel it covers has been filled. Only partially-filled
- * boundary chunks live in RAM -> streaming, bounded memory.
- *
- * SEAM-CORRECTNESS: every tile's decimation samples lie on ONE shared global grid
- * (input coord % factor == 0), keyed by the tile's absolute origin, so adjacent
- * tiles contribute DISJOINT, non-overlapping atoms that tile the output exactly --
- * no double-count, no gap, no seam. A chunk's expected fill count is its true voxel
- * volume; it flushes only when that exact count is reached, so each chunk is written
- * ONCE, fully assembled (never a partial write a later atom must read-modify-write).
- *
- * BOUNDED RAM: a chunk is held only between its first touch and the moment it is
- * complete. With atoms arriving in raster tile order, at most O(one output-chunk
- * plane) of partial chunks are ever live -- never the whole volume.
- *
- * THREAD SAFETY: one omp lock guards the live-chunk hash map; the heavy I/O
- * (fy_zarr_write_chunk) runs OUTSIDE the lock.
- * ========================================================================== */
-typedef struct chunk_node {
-    long cz, cy, cx;          /* chunk index (output-chunk units) */
-    long ez, ey, ex;          /* this chunk's true extent (edge chunks are smaller) */
-    long filled;              /* voxels written so far */
-    unsigned char *buf;       /* ez*ey*ex u8 (calloc'd to fill_value 0 = air) */
-    struct chunk_node *next;  /* hash-bucket chain */
-} chunk_node;
-
-typedef struct {
-    long Sz, Sy, Sx;          /* output shape (downsampled voxels) */
-    long C;                   /* output chunk edge (cubic) */
-    long nbuckets;
-    chunk_node **buckets;
-    const fy_zarr *out;
-#ifdef _OPENMP
-    omp_lock_t lock;
-#endif
-} chunk_accum;
-
-static unsigned long acc_hash(long cz, long cy, long cx, long nb) {
-    unsigned long h = (unsigned long)(cz * 73856093L ^ cy * 19349663L ^ cx * 83492791L);
-    return h % (unsigned long)nb;
-}
-static void acc_init(chunk_accum *A, const fy_zarr *out, long Sz, long Sy, long Sx, long C) {
-    A->out = out; A->Sz = Sz; A->Sy = Sy; A->Sx = Sx; A->C = C;
-    A->nbuckets = 4096;
-    A->buckets = (chunk_node **)calloc(A->nbuckets, sizeof(chunk_node *));
-#ifdef _OPENMP
-    omp_init_lock(&A->lock);
-#endif
-}
-static void acc_extent(const chunk_accum *A, long cz, long cy, long cx, long *ez, long *ey, long *ex) {
-    *ez = lmin(A->C, A->Sz - cz * A->C);
-    *ey = lmin(A->C, A->Sy - cy * A->C);
-    *ex = lmin(A->C, A->Sx - cx * A->C);
-}
-
-/* place `atom` (az*ay*ax u8) at OUTPUT-space origin (oz,oy,ox); flush full chunks. */
-static void acc_add(chunk_accum *A, long oz, long oy, long ox,
-                    const unsigned char *atom, long az, long ay, long ax) {
-    if (az <= 0 || ay <= 0 || ax <= 0) return;
-    long C = A->C;
-    long cz0 = oz / C, cy0 = oy / C, cx0 = ox / C;
-    long cz1 = (oz + az - 1) / C, cy1 = (oy + ay - 1) / C, cx1 = (ox + ax - 1) / C;
-    for (long cz = cz0; cz <= cz1; cz++)
-    for (long cy = cy0; cy <= cy1; cy++)
-    for (long cx = cx0; cx <= cx1; cx++) {
-        long ez, ey, ex; acc_extent(A, cz, cy, cx, &ez, &ey, &ex);
-        long exp_vox = ez * ey * ex;
-        long bz0 = cz * C, by0 = cy * C, bx0 = cx * C;
-        long lz0 = lmax(oz, bz0), ly0 = lmax(oy, by0), lx0 = lmax(ox, bx0);
-        long lz1 = lmin(oz + az, bz0 + ez), ly1 = lmin(oy + ay, by0 + ey), lx1 = lmin(ox + ax, bx0 + ex);
-        if (lz1 <= lz0 || ly1 <= ly0 || lx1 <= lx0) continue;
-        unsigned char *flush_buf = NULL; long fcz = 0, fcy = 0, fcx = 0, fez = 0, fey = 0, fex = 0;
-#ifdef _OPENMP
-        omp_set_lock(&A->lock);
-#endif
-        unsigned long h = acc_hash(cz, cy, cx, A->nbuckets);
-        chunk_node *nd = A->buckets[h];
-        while (nd && !(nd->cz == cz && nd->cy == cy && nd->cx == cx)) nd = nd->next;
-        if (!nd) {
-            nd = (chunk_node *)malloc(sizeof(chunk_node));
-            nd->cz = cz; nd->cy = cy; nd->cx = cx; nd->ez = ez; nd->ey = ey; nd->ex = ex;
-            nd->filled = 0;
-            nd->buf = (unsigned char *)calloc((size_t)exp_vox, 1);
-            nd->next = A->buckets[h]; A->buckets[h] = nd;
-        }
-        for (long z = lz0; z < lz1; z++)
-        for (long y = ly0; y < ly1; y++) {
-            const unsigned char *src = atom + (((z - oz) * ay) + (y - oy)) * ax + (lx0 - ox);
-            unsigned char *dst = nd->buf + (((z - bz0) * nd->ey) + (y - by0)) * nd->ex + (lx0 - bx0);
-            memcpy(dst, src, (size_t)(lx1 - lx0));
-        }
-        nd->filled += (lz1 - lz0) * (ly1 - ly0) * (lx1 - lx0);
-        if (nd->filled >= exp_vox) {
-            chunk_node **pp = &A->buckets[h];
-            while (*pp != nd) pp = &(*pp)->next;
-            *pp = nd->next;
-            flush_buf = nd->buf; fcz = nd->cz; fcy = nd->cy; fcx = nd->cx;
-            fez = nd->ez; fey = nd->ey; fex = nd->ex;
-            free(nd);
-        }
-#ifdef _OPENMP
-        omp_unset_lock(&A->lock);
-#endif
-        if (flush_buf) {
-            fy_zarr_write_chunk(A->out, fcz, fcy, fcx, flush_buf, fez, fey, fex);
-            free(flush_buf);
-        }
-    }
-}
-
-/* flush remaining partial chunks (volume-edge chunks that never fully filled). */
-static void acc_finalize(chunk_accum *A) {
-    for (long h = 0; h < A->nbuckets; h++) {
-        chunk_node *nd = A->buckets[h];
-        while (nd) {
-            chunk_node *nx = nd->next;
-            fy_zarr_write_chunk(A->out, nd->cz, nd->cy, nd->cx, nd->buf, nd->ez, nd->ey, nd->ex);
-            free(nd->buf); free(nd);
-            nd = nx;
-        }
-        A->buckets[h] = NULL;
-    }
-    free(A->buckets);
-#ifdef _OPENMP
-    omp_destroy_lock(&A->lock);
-#endif
-}
 
 /* ---------------------------------------------------------------- PSF measurement
  * Effective system PSF sigma (voxels) from subpixel-aligned air<->papyrus edges in a
@@ -334,23 +174,6 @@ static double measure_tile_psf_sigma(const unsigned char *vol, int Z, int Y, int
     return sig;
 }
 
-/* integer safe downsample factor from the PSF sigma map (port of _downsample_factor_from_psf). */
-static int downsample_factor_from_psf(double p5, double med, double aggr) {
-    /* Safe factor: the new Nyquist (0.5/factor) must stay >= f0, the freq where the system MTF
-     * drops to MTF_FLOOR. Use MTF_FLOOR=0.2 (NOT 0.1) -- there is still REAL faint signal between
-     * MTF 0.1 and 0.2, and 0.1 was too permissive (gave 3x on this blurry vol, which lost detail).
-     * Governed by the SHARPEST regions (p5) to protect detail; aggr only nudges toward median.
-     * HARD CAP at 2x: even fully aggressive, 2x is the defensible limit (resolution ~2-3 vox FWHM
-     * means ~2x oversampling; 3x sits at critical sampling with no margin -> risks real loss). */
-    double sigma = p5 + 0.5 * aggr * (med - p5);   /* aggr blends only HALFWAY p5->median */
-    if (sigma <= 0) return 1;
-    double f0 = sqrt(-log(0.2) / (2.0 * M_PI * M_PI * sigma * sigma));  /* MTF=0.2 floor */
-    double factor = 0.5 / f0;
-    int fi = (int)(factor + 1e-9);
-    if (fi < 1) fi = 1;
-    if (fi > 2) fi = 2;                            /* hard cap: never more than 2x */
-    return fi;
-}
 
 /* iterated scratch denoise (guided eps=0.01, `passes` iterations); `buf` in/out, `tmp` scratch. */
 static void scratch_denoise(float *buf, int nz, int ny, int nx, int passes, float *tmp) {
@@ -543,8 +366,8 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                 int b = (int)(so[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; air_hist[b]++;
             }
         }
-        /* PSF sigma -- measured ALWAYS (drives BOTH the downsample factor AND the auto-deconv
-         * gate: deconv recovers real signal only when the system is sharp enough, sigma<=~1.1). */
+        /* PSF sigma -- measured for the auto-deconv
+         * gate (deconv recovers real signal only when sharp, sigma<=~1.1). */
         if (nsig < 64) {
             double sg = measure_tile_psf_sigma(sbuf, (int)dz, (int)dy, (int)dx);
             if (sg > 0) sigmas[nsig++] = sg;
@@ -610,18 +433,10 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         have_dec_range = 1;
     }
     free(dec_vals);
-    /* commit downsample factor from the PSF sigma map (p5..median blend); psf already in cfg. */
-    int fds = 1;
-    if (cfg->do_downsample && cfg->psf_med > 0) {
-        fds = downsample_factor_from_psf(cfg->psf_p5, cfg->psf_med, cfg->downsample_aggr);
-        cfg->downsample_factor = fds; cfg->do_downsample = fds > 1;
-    } else {
-        cfg->do_downsample = 0;
-    }
-    fds = cfg->do_downsample ? cfg->downsample_factor : 1;
-
-    if (verbose) fprintf(stderr, "[calib] samples=%d flat_nf_n=%d guided_eps=%.5f air_cut=%d band=%d psf_med=%.2f deconv=%d halo=%d fds=%d\n",
-                         nsamp, nfloor, cfg->guided_eps, cfg->air_cut_u8, cfg->air_cut_band, cfg->psf_med, cfg->do_deconv, halo, fds);
+    /* (downsample removed -- the volume is not meaningfully oversampled; the auto-factor rested on
+     * an unreliable PSF sigma. PSF is still measured above, but only for the auto-deconv gate.) */
+    if (verbose) fprintf(stderr, "[calib] samples=%d flat_nf_n=%d guided_eps=%.5f air_cut=%d band=%d psf_med=%.2f deconv=%d halo=%d\n",
+                         nsamp, nfloor, cfg->guided_eps, cfg->air_cut_u8, cfg->air_cut_band, cfg->psf_med, cfg->do_deconv, halo);
 
     /* ===================== PASS 1b: global norm + z-drift (streaming) ===================== */
     fy_hist_state nhist; fy_hist_init(&nhist);
@@ -705,24 +520,20 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                              have_norm, cfg->norm_lo, cfg->norm_hi, have_zdrift);
     }
 
-    /* ===================== OUTPUT zarr (shape = ceil(in/fds), chunk = tile) ===================== */
-    long oZ = ceil_div(Z, fds), oY = ceil_div(Y, fds), oX = ceil_div(X, fds);
-    long oshape[3] = { oZ, oY, oX };
+    /* ===================== OUTPUT zarr (same shape as input; chunk = tile) ===================== */
+    long oshape[3] = { Z, Y, X };
     long ochunk[3] = { tile, tile, tile };
     fy_zarr zout;
     if (fy_zarr_create(&zout, out_root, oshape, ochunk) != 0) {
         fprintf(stderr, "pipeline: cannot create %s\n", out_root);
         free(zsums); free(zcnts); free(zfactor); return 1;
     }
-    chunk_accum acc; int use_acc = (fds > 1);
-    if (use_acc) acc_init(&acc, &zout, oZ, oY, oX, tile);
 
     /* ===================== PASS 2: parallel per-tile ===================== */
     long ntz = ceil_div(Z, tile), nty = ceil_div(Y, tile), ntx = ceil_div(X, tile);
     long ntiles = ntz * nty * ntx;
     long out_done = 0;
-    if (verbose) fprintf(stderr, "[pass2] %ld tiles, halo=%d, downsample=%d(fds=%d)\n",
-                         ntiles, halo, cfg->do_downsample, fds);
+    if (verbose) fprintf(stderr, "[pass2] %ld tiles, halo=%d\n", ntiles, halo);
 
     #pragma omp parallel
     {
@@ -733,7 +544,6 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         float *orig = (float *)malloc(sizeof(float) * cap);
         float *b1 = (float *)malloc(sizeof(float) * cap);
         float *b2 = (float *)malloc(sizeof(float) * cap);
-        float *lp = use_acc ? (float *)malloc(sizeof(float) * cap) : NULL;
         unsigned char *ob = (unsigned char *)malloc(cap);
 
         #pragma omp for schedule(dynamic)
@@ -760,39 +570,15 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
 
             long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0;
 
-            if (use_acc) {
-                /* fused anti-alias + decimate on the haloed block (real neighbours), sampled on
-                 * the GLOBAL f-grid keyed by the tile's absolute origin -> seam-free. */
-                gauss3d(f, lp, (int)hz, (int)hy, (int)hx, 0.5 * fds);
-                long sz = ((-z0) % fds + fds) % fds, sy = ((-y0) % fds + fds) % fds, sx = ((-x0) % fds + fds) % fds;
-                long iz1 = iz0 + tz, iy1 = iy0 + ty, ix1 = ix0 + tx;
-                long az = 0; for (long zz = iz0 + sz; zz < iz1; zz += fds) az++;
-                long ay = 0; for (long yy = iy0 + sy; yy < iy1; yy += fds) ay++;
-                long ax = 0; for (long xx = ix0 + sx; xx < ix1; xx += fds) ax++;
-                if (az > 0 && ay > 0 && ax > 0) {
-                    unsigned char *atom = (unsigned char *)malloc((size_t)az * ay * ax);
-                    long ci = 0;
-                    for (long zz = iz0 + sz; zz < iz1; zz += fds)
-                    for (long yy = iy0 + sy; yy < iy1; yy += fds)
-                    for (long xx = ix0 + sx; xx < ix1; xx += fds) {
-                        float v = lp[((size_t)zz * hy + yy) * hx + xx] * 255.0f + 0.5f;
-                        atom[ci++] = v < 0 ? 0 : (v > 255 ? 255 : (unsigned char)v);
-                    }
-                    /* output origin = ceil(z0/fds) = first global-grid index covered by this tile. */
-                    acc_add(&acc, ceil_div(z0, fds), ceil_div(y0, fds), ceil_div(x0, fds), atom, az, ay, ax);
-                    free(atom);
-                }
-            } else {
-                /* tile == output chunk: convert the inner tile to u8 and write the chunk directly. */
-                long oi = 0;
-                for (long zz = iz0; zz < iz0 + tz; zz++)
-                for (long yy = iy0; yy < iy0 + ty; yy++)
-                for (long xx = ix0; xx < ix0 + tx; xx++) {
-                    float v = f[((size_t)zz * hy + yy) * hx + xx] * 255.0f + 0.5f;
-                    ob[oi++] = v < 0 ? 0 : (v > 255 ? 255 : (unsigned char)v);
-                }
-                fy_zarr_write_chunk(&zout, iz, iy, ix, ob, tz, ty, tx);
+            /* tile == output chunk: convert the inner tile to u8 and write the chunk directly. */
+            long oi = 0;
+            for (long zz = iz0; zz < iz0 + tz; zz++)
+            for (long yy = iy0; yy < iy0 + ty; yy++)
+            for (long xx = ix0; xx < ix0 + tx; xx++) {
+                float v = f[((size_t)zz * hy + yy) * hx + xx] * 255.0f + 0.5f;
+                ob[oi++] = v < 0 ? 0 : (v > 255 ? 255 : (unsigned char)v);
             }
+            fy_zarr_write_chunk(&zout, iz, iy, ix, ob, tz, ty, tx);
             #pragma omp atomic
             out_done++;
             if (verbose && (out_done % 64 == 0)) {
@@ -800,11 +586,10 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                 fprintf(stderr, "\r[pass2] %ld/%ld tiles", out_done, ntiles);
             }
         }
-        free(u8); free(f); free(orig); free(b1); free(b2); if (lp) free(lp); free(ob);
+        free(u8); free(f); free(orig); free(b1); free(b2); free(ob);
     }
 
-    if (use_acc) acc_finalize(&acc);
-    if (verbose) fprintf(stderr, "\n[done] %ld tiles, out shape %ldx%ldx%ld\n", out_done, oZ, oY, oX);
+    if (verbose) fprintf(stderr, "\n[done] %ld tiles, out shape %ldx%ldx%ld\n", out_done, Z, Y, X);
     free(zsums); free(zcnts); free(zfactor);
     return 0;
 }
