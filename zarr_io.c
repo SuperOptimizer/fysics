@@ -73,9 +73,12 @@ int fy_zarr_create(fy_zarr *z, const char *root, const long shape[3], const long
     return 0;
 }
 
-/* read one chunk (cz,cy,cx) into `out` (chunk-sized); fill if the file is absent. */
-static void read_chunk(const fy_zarr *z, long cz, long cy, long cx, unsigned char *out) {
-    long cn = z->chunk[0] * z->chunk[1] * z->chunk[2];
+/* read one chunk (cz,cy,cx) into `out`, laid out with the chunk's TRUE stored extent
+ * (ez,ey,ex) -- EDGE chunks are stored smaller than the nominal chunk size (matching how
+ * fy_zarr_write_chunk wrote them). Fills with z->fill if the file is absent or short. */
+static void read_chunk(const fy_zarr *z, long cz, long cy, long cx,
+                       long ez, long ey, long ex, unsigned char *out) {
+    long cn = ez * ey * ex;
     char path[2048];
     snprintf(path, sizeof(path), "%s/0/%ld/%ld/%ld", z->root, cz, cy, cx);
     FILE *f = fopen(path, "rb");
@@ -89,20 +92,26 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
                  unsigned char *out) {
     long C0 = z->chunk[0], C1 = z->chunk[1], C2 = z->chunk[2];
     long cn = C0 * C1 * C2;
-    unsigned char *cb = (unsigned char *)malloc(cn);
+    unsigned char *cb = (unsigned char *)malloc(cn);   /* max chunk size */
     if (!cb) return 1;
     for (long gz = z0; gz < z0 + dz; ) {
         long cz = gz / C0, lz = gz - cz * C0, hz = (lz + (z0 + dz - gz) < C0) ? lz + (z0 + dz - gz) : C0;
+        long ez = (z->shape[0] - cz * C0 < C0) ? (z->shape[0] - cz * C0) : C0;   /* TRUE z-extent */
         for (long gy = y0; gy < y0 + dy; ) {
             long cy = gy / C1, ly = gy - cy * C1, hy = (ly + (y0 + dy - gy) < C1) ? ly + (y0 + dy - gy) : C1;
+            long ey = (z->shape[1] - cy * C1 < C1) ? (z->shape[1] - cy * C1) : C1;
             for (long gx = x0; gx < x0 + dx; ) {
                 long cx = gx / C2, lx = gx - cx * C2, hx = (lx + (x0 + dx - gx) < C2) ? lx + (x0 + dx - gx) : C2;
-                read_chunk(z, cz, cy, cx, cb);
-                for (long zz = lz; zz < hz; zz++)
-                    for (long yy = ly; yy < hy; yy++) {
-                        unsigned char *src = cb + (zz * C1 + yy) * C2 + lx;
+                long ex = (z->shape[2] - cx * C2 < C2) ? (z->shape[2] - cx * C2) : C2;
+                read_chunk(z, cz, cy, cx, ez, ey, ex, cb);   /* laid out with TRUE strides ez,ey,ex */
+                /* clamp the copy span to the chunk's true extent (halo reads near the volume edge
+                 * must not read past the stored data). */
+                long hzc = hz < ez ? hz : ez, hyc = hy < ey ? hy : ey, hxc = hx < ex ? hx : ex;
+                for (long zz = lz; zz < hzc; zz++)
+                    for (long yy = ly; yy < hyc; yy++) {
+                        unsigned char *src = cb + (zz * ey + yy) * ex + lx;   /* TRUE strides */
                         unsigned char *dst = out + (((cz*C0+zz - z0) * dy) + (cy*C1+yy - y0)) * dx + (cx*C2+lx - x0);
-                        memcpy(dst, src, hx - lx);
+                        if (hxc > lx) memcpy(dst, src, hxc - lx);
                     }
                 gx = cx * C2 + hx;
             }

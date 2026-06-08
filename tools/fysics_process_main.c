@@ -130,6 +130,18 @@ int main(int argc, char **argv) {
     if (meta_lines == 0)
         fprintf(stderr, "[warn] no metadata read from %s -- using BM18 defaults\n", meta_path);
 
+    /* WINDOW -> physical air threshold. The u8 is a clipped linear window of physical attenuation
+     * mu: u8 = clip((mu - window_lo)/(window_hi - window_lo), 0, 1)*255 (nabu 32-bit conversion
+     * window, then the tif->u8 re-window). So the physical air/void level (mu ~ 0) maps to
+     * u8 ~= (0 - window_lo)/(window_hi - window_lo)*255. Use that as air_thresh (a [0,1] frac) so
+     * the air-cut has a PHYSICS-anchored floor (used when no clean histogram valley exists, and as
+     * the conservative end of the void-peak->valley interpolation). */
+    if (cfg.window_hi > cfg.window_lo) {
+        double air_frac = (0.0 - cfg.window_lo) / (cfg.window_hi - cfg.window_lo);
+        if (air_frac < 0) air_frac = 0; if (air_frac > 1) air_frac = 1;
+        cfg.air_thresh = air_frac;   /* e.g. window [-0.04,0.22] -> mu=0 at u8 ~39 -> 0.154 */
+    }
+
     printf("fysics_process\n");
     printf("  in       : %s\n", in_zarr);
     printf("  out      : %s\n", out_zarr);

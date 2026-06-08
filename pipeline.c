@@ -398,10 +398,11 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
         if (cfg->air_cut_u8 >= 0) {
             int gg = cfg->air_cut_u8, band = cfg->air_cut_band;
             if (d >= 0) {
-                /* local estimate uses the SAME void-peak->valley interpolation as the global cut,
-                 * then clamps to the global +-band so it tracks the profile but can't run away. */
+                /* local estimate: same PHYSICS-FLOOR -> valley interpolation as the global cut,
+                 * clamped to the global +-band so it tracks the profile but can't run away. */
+                int pf = (cfg->air_thresh > 0) ? (int)(cfg->air_thresh * 255 + 0.5) : 39;
                 double a = cfg->air_cut_aggr; if (a < 0) a = 0; if (a > 1) a = 1;
-                int local = (int)(dark + (0.2 + 0.8 * a) * (valley - dark) + 0.5);
+                int local = (valley > pf) ? (int)(pf + a * (valley - pf) + 0.5) : pf;
                 cut = local; if (cut < gg - band) cut = gg - band; if (cut > gg + band) cut = gg + band;
             } else cut = gg;
         } else if (d >= 0) {
@@ -547,27 +548,27 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         double k = cfg->denoise_k > 0 ? cfg->denoise_k : 4.2;
         cfg->guided_eps = (k * flat_nf) * (k * flat_nf);
     }
-    /* commit air cut: interpolate VOID-PEAK(dark) -> VALLEY by cfg->air_cut_aggr. The volume is
-     * NOT cleanly bimodal (void blends into low-density papyrus, no natural valley), so the cut is
-     * a USE-CASE choice, not a measured constant. Measured (papyrus-core erosion test on the real
-     * volume): cuts from just-above-the-void-peak up to the valley all lose ~0% of CONFIDENT
-     * papyrus; they differ only in how much faint low-density material (void / partial-volume edge
-     * / loose fiber) between the void peak and the dense sheets is removed.
-     *   aggr 0 (conservative/FIDELITY): cut = dark + 0.2*(valley-dark)  (just above the void peak)
-     *   aggr 1 (aggressive/READABILITY): cut = valley                   (~v7; removes faint stuff) */
+    /* commit air cut: PHYSICS-FLOOR (conservative) -> VALLEY (aggressive) by cfg->air_cut_aggr.
+     * The u8 is a clipped linear window of physical attenuation mu; the void/air level (mu~0) maps
+     * to u8 = air_thresh*255 (the metadata WINDOW floor -- this is the PHYSICALLY CORRECT air level,
+     * NOT a guess). The volume is not cleanly bimodal above that, so how much faint low-density
+     * material to additionally remove is a USE-CASE choice up to the histogram valley.
+     *   aggr 0 (conservative/FIDELITY): cut = physics window-floor (u8 ~39 here; zeros ~only true
+     *           air -- matches the python reference, which preferred the window floor).
+     *   aggr 1 (aggressive/READABILITY): cut = valley (~v7; also removes faint low-density material).
+     * Both keep ~0% confident papyrus. Anchoring conservative to the PHYSICS floor (not dark+0.2span)
+     * fixes the audit blocker where the C zeroed 36% the python kept. */
     if (cfg->do_air_zero && cfg->air_cut_u8 < 0) {
         long sum = 0; for (int i = 0; i < 256; i++) sum += air_hist[i];
         int dark = 0, light = 0, valley = 0;
         double d = (sum > 0) ? fy_valley_depth(air_hist, &dark, &light, &valley) : -1.0;
-        if (d >= 0 && valley > dark) {
+        int phys_floor = (cfg->air_thresh > 0) ? (int)(cfg->air_thresh * 255 + 0.5) : 39;
+        if (d >= 0 && valley > phys_floor) {
             double a = cfg->air_cut_aggr; if (a < 0) a = 0; if (a > 1) a = 1;
-            double frac = 0.2 + 0.8 * a;
-            cfg->air_cut_u8 = (int)(dark + frac * (valley - dark) + 0.5);
-            int band = (valley - dark) / 4; cfg->air_cut_band = band > 4 ? band : 4;
-        } else if (cfg->air_thresh > 0) {
-            cfg->air_cut_u8 = (int)(cfg->air_thresh * 255 + 0.5); cfg->air_cut_band = 4;
+            cfg->air_cut_u8 = (int)(phys_floor + a * (valley - phys_floor) + 0.5);
+            int band = (valley - phys_floor) / 4; cfg->air_cut_band = band > 4 ? band : 4;
         } else {
-            cfg->air_cut_u8 = (int)(0.05 * 255); cfg->air_cut_band = 8;
+            cfg->air_cut_u8 = phys_floor; cfg->air_cut_band = 4;
         }
     }
     /* commit deconv global range. */

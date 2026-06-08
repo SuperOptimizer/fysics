@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/forrest/fysics/build_asan/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
