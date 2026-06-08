@@ -398,7 +398,10 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
         if (cfg->air_cut_u8 >= 0) {
             int gg = cfg->air_cut_u8, band = cfg->air_cut_band;
             if (d >= 0) {
-                int local = (dark + valley) / 2;
+                /* local estimate uses the SAME void-peak->valley interpolation as the global cut,
+                 * then clamps to the global +-band so it tracks the profile but can't run away. */
+                double a = cfg->air_cut_aggr; if (a < 0) a = 0; if (a > 1) a = 1;
+                int local = (int)(dark + (0.2 + 0.8 * a) * (valley - dark) + 0.5);
                 cut = local; if (cut < gg - band) cut = gg - band; if (cut > gg + band) cut = gg + band;
             } else cut = gg;
         } else if (d >= 0) {
@@ -437,6 +440,44 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     long Z = zin.shape[0], Y = zin.shape[1], X = zin.shape[2];
     if (tile <= 0) tile = 128;
     if (verbose) fprintf(stderr, "pipeline: input %ldx%ldx%ld tile=%d\n", Z, Y, X, tile);
+
+    /* PRE-PASS: measure PSF sigma on a few sample tiles FIRST, so the AUTO-DECONV gate is decided
+     * BEFORE halo/sdec/rescale setup (deconv reach drives the halo; the gate must precede it). */
+    {
+        long st = tile; size_t cap = (size_t)st * st * st;
+        unsigned char *pb = (unsigned char *)malloc(cap);
+        double psig[27]; int nps = 0;
+        if (pb) {
+            for (int iz = 0; iz < 3 && nps < 27; iz++)
+              for (int iy = 0; iy < 3 && nps < 27; iy++)
+                for (int ix = 0; ix < 3 && nps < 27; ix++) {
+                    long z0 = lmin((long)iz * (Z / 3), Z - st);
+                    long y0 = lmin((long)iy * (Y / 3), Y - st);
+                    long x0 = lmin((long)ix * (X / 3), X - st);
+                    if (z0 < 0 || y0 < 0 || x0 < 0) continue;
+                    if (fy_zarr_read(&zin, z0, y0, x0, st, st, st, pb) != 0) continue;
+                    if (!any_nonzero(pb, cap)) continue;
+                    double sg = measure_tile_psf_sigma(pb, (int)st, (int)st, (int)st);
+                    if (sg > 0) psig[nps++] = sg;
+                }
+            free(pb);
+        }
+        if (nps >= 3) {
+            qsort(psig, nps, sizeof(double), cmp_double);
+            double med = percentile_sorted(psig, nps, 50.0);
+            cfg->psf_med = med; cfg->psf_p5 = percentile_sorted(psig, nps, 5.0);
+            /* AUTO-DECONV GATE: matched-Wiener deconv recovers REAL signal only when sharp
+             * (RMSE-to-truth: wins sigma<=1.0, loses >=1.3; boundary ~1.1). Above -> contrast-only
+             * (cosmetic, amplifies noise) -> do NOT store. Caller --deconv forces it regardless. */
+            if (!cfg->do_deconv && med <= 1.1) {
+                cfg->do_deconv = 1; cfg->use_matched_deconv = 1; cfg->psf_sigma_vox = med;
+                if (verbose) fprintf(stderr, "[calib] AUTO-DECONV ON: psf_med=%.2f<=1.1 (sharp->recovers signal)\n", med);
+            } else if (verbose && !cfg->do_deconv) {
+                fprintf(stderr, "[calib] auto-deconv OFF: psf_med=%.2f>1.1 (blurry->contrast-only, view-time)\n", med);
+            }
+            if (cfg->do_deconv && cfg->psf_sigma_vox <= 0) cfg->psf_sigma_vox = med;
+        }
+    }
 
     /* halo: kernel halo from physics (deconv reach); air-zero/denoise are local r=2. */
     fy_physics base_ph = phys_from_cfg(cfg);
@@ -478,8 +519,9 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                 int b = (int)(so[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; air_hist[b]++;
             }
         }
-        /* PSF sigma for downsample */
-        if (cfg->do_downsample && nsig < 64) {
+        /* PSF sigma -- measured ALWAYS (drives BOTH the downsample factor AND the auto-deconv
+         * gate: deconv recovers real signal only when the system is sharp enough, sigma<=~1.1). */
+        if (nsig < 64) {
             double sg = measure_tile_psf_sigma(sbuf, (int)dz, (int)dy, (int)dx);
             if (sg > 0) sigmas[nsig++] = sg;
         }
@@ -498,32 +540,34 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     }
     free(sbuf); free(sf); free(so); free(stmp); if (sdec) free(sdec);
 
-    /* commit guided_eps = (4.2 * median flat_nf)^2 ~0.004 (RETUNE consensus) unless pre-set. */
+    /* commit guided_eps = (k * median flat_nf)^2, k = cfg->denoise_k (profile: conservative 3.0
+     * ~0.002 preserves detail, aggressive 4.2 ~0.004). Default 4.2 if unset. Unless pre-set. */
     if (cfg->guided_eps <= 0) {
         double flat_nf = nfloor ? median_sorted(floors, nfloor) : 0.015;
-        cfg->guided_eps = (4.2 * flat_nf) * (4.2 * flat_nf);
+        double k = cfg->denoise_k > 0 ? cfg->denoise_k : 4.2;
+        cfg->guided_eps = (k * flat_nf) * (k * flat_nf);
     }
-    /* commit air cut: PREFER the PHYSICS WINDOW-FLOOR (cfg->air_thresh), NOT the scratch-valley.
-     * RETUNE finding: on non-bimodal volumes the scratch denoise manufactures a false dark mode
-     * and the valley lands INSIDE real low-density papyrus (u8 62 destroyed 0.42% of confident
-     * material, RMSE 90x worse than the floor u8 12). Physics floor == no-cut on RMSE. Valley =
-     * fallback only when there is no export window. */
+    /* commit air cut: interpolate VOID-PEAK(dark) -> VALLEY by cfg->air_cut_aggr. The volume is
+     * NOT cleanly bimodal (void blends into low-density papyrus, no natural valley), so the cut is
+     * a USE-CASE choice, not a measured constant. Measured (papyrus-core erosion test on the real
+     * volume): cuts from just-above-the-void-peak up to the valley all lose ~0% of CONFIDENT
+     * papyrus; they differ only in how much faint low-density material (void / partial-volume edge
+     * / loose fiber) between the void peak and the dense sheets is removed.
+     *   aggr 0 (conservative/FIDELITY): cut = dark + 0.2*(valley-dark)  (just above the void peak)
+     *   aggr 1 (aggressive/READABILITY): cut = valley                   (~v7; removes faint stuff) */
     if (cfg->do_air_zero && cfg->air_cut_u8 < 0) {
-        if (cfg->air_thresh > 0) {
+        long sum = 0; for (int i = 0; i < 256; i++) sum += air_hist[i];
+        int dark = 0, light = 0, valley = 0;
+        double d = (sum > 0) ? fy_valley_depth(air_hist, &dark, &light, &valley) : -1.0;
+        if (d >= 0 && valley > dark) {
+            double a = cfg->air_cut_aggr; if (a < 0) a = 0; if (a > 1) a = 1;
+            double frac = 0.2 + 0.8 * a;
+            cfg->air_cut_u8 = (int)(dark + frac * (valley - dark) + 0.5);
+            int band = (valley - dark) / 4; cfg->air_cut_band = band > 4 ? band : 4;
+        } else if (cfg->air_thresh > 0) {
             cfg->air_cut_u8 = (int)(cfg->air_thresh * 255 + 0.5); cfg->air_cut_band = 4;
         } else {
-        long sum = 0; for (int i = 0; i < 256; i++) sum += air_hist[i];
-        if (sum > 0) {
-            int dark = 0, light = 0, valley = 0;
-            double d = fy_valley_depth(air_hist, &dark, &light, &valley);
-            if (d >= 0) {
-                cfg->air_cut_u8 = valley;
-                int band = (valley - dark) / 4; cfg->air_cut_band = band > 4 ? band : 4;
-            } else {
-                cfg->air_cut_u8 = (int)((cfg->air_thresh > 0 ? cfg->air_thresh : 0.05) * 255);
-                cfg->air_cut_band = 8;
-            }
-        }
+            cfg->air_cut_u8 = (int)(0.05 * 255); cfg->air_cut_band = 8;
         }
     }
     /* commit deconv global range. */
@@ -536,22 +580,18 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         have_dec_range = 1;
     }
     free(dec_vals);
-    /* commit downsample factor from the PSF sigma map (p5..median blend). */
+    /* commit downsample factor from the PSF sigma map (p5..median blend); psf already in cfg. */
     int fds = 1;
-    if (cfg->do_downsample && nsig >= 3) {
-        qsort(sigmas, nsig, sizeof(double), cmp_double);
-        double p5 = percentile_sorted(sigmas, nsig, 5.0);
-        double med = percentile_sorted(sigmas, nsig, 50.0);
-        cfg->psf_p5 = p5; cfg->psf_med = med;
-        fds = downsample_factor_from_psf(p5, med, cfg->downsample_aggr);
-        cfg->downsample_factor = fds;
-        cfg->do_downsample = fds > 1;
+    if (cfg->do_downsample && cfg->psf_med > 0) {
+        fds = downsample_factor_from_psf(cfg->psf_p5, cfg->psf_med, cfg->downsample_aggr);
+        cfg->downsample_factor = fds; cfg->do_downsample = fds > 1;
     } else {
         cfg->do_downsample = 0;
     }
     fds = cfg->do_downsample ? cfg->downsample_factor : 1;
-    if (verbose) fprintf(stderr, "[calib] samples=%d flat_nf_n=%d guided_eps=%.5f air_cut=%d band=%d halo=%d fds=%d\n",
-                         nsamp, nfloor, cfg->guided_eps, cfg->air_cut_u8, cfg->air_cut_band, halo, fds);
+
+    if (verbose) fprintf(stderr, "[calib] samples=%d flat_nf_n=%d guided_eps=%.5f air_cut=%d band=%d psf_med=%.2f deconv=%d halo=%d fds=%d\n",
+                         nsamp, nfloor, cfg->guided_eps, cfg->air_cut_u8, cfg->air_cut_band, cfg->psf_med, cfg->do_deconv, halo, fds);
 
     /* ===================== PASS 1b: global norm + z-drift (streaming) ===================== */
     fy_hist_state nhist; fy_hist_init(&nhist);

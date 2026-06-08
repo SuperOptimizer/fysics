@@ -695,6 +695,8 @@ typedef struct {
     double psf_sigma_vox, deconv_tikhonov;
     double guided_eps;                    /* from (3*flat_nf)^2 */
     int    do_air_zero; int air_cut_u8, air_cut_band; double air_thresh;
+    double air_cut_aggr;   /* 0 conservative (void-peak) .. 1 aggressive (valley) */
+    double denoise_k;      /* eps = (denoise_k*flat_nf)^2; 0 -> default 4.2 */
     int    scratch_passes;
     int    do_normalize; int norm_lo, norm_hi;
     int    do_zdrift; float *zdrift_factor;  /* len = Z, or NULL */

@@ -23,8 +23,12 @@ static void usage(const char *prog) {
         "  OUT_ZARR       output zarr root (created)\n"
         "options:\n"
         "  --tile N       tile edge in voxels (default 128)\n"
+        "  --profile P    export profile: 'conservative' (fidelity: keep faint material, full\n"
+        "                 res, gentle denoise) or 'aggressive' (readability/size: cut faint\n"
+        "                 material below the sheets, max safe downsample, stronger denoise)\n"
         "  --downsample   enable auto safe downsample (anti-alias + decimate)\n"
         "  --aggr A       downsample aggressiveness 0..1 (p5->median, default 0.0)\n"
+        "  --air-cut-aggr A  air-cut aggressiveness 0..1 (void-peak->valley, default 0.0)\n"
         "  --deconv       STORE matched-Wiener deconv (BM18 default: OFF, view-time only)\n"
         "  --musica       apply MUSICA viewing enhancement (default OFF)\n"
         "  --no-air-zero  disable the air-zero masking stage (default ON)\n"
@@ -50,18 +54,29 @@ int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
     const char *in_zarr = argv[1], *out_zarr = argv[2];
     int tile = 128, do_downsample = 0, do_deconv = 0, do_musica = 0, do_air_zero = 1;
-    double aggr = 0.0;
+    double aggr = 0.0, air_cut_aggr = 0.0, denoise_k = 0.0;   /* 0 -> default 4.2 inside */
+    const char *profile = NULL;
     char meta_path[PATH_MAX]; meta_path[0] = 0;
 
     for (int i = 3; i < argc; i++) {
         if      (!strcmp(argv[i], "--tile") && i+1 < argc)  tile = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--downsample"))          do_downsample = 1;
         else if (!strcmp(argv[i], "--aggr") && i+1 < argc)  aggr = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--air-cut-aggr") && i+1 < argc) air_cut_aggr = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--profile") && i+1 < argc) profile = argv[++i];
         else if (!strcmp(argv[i], "--deconv"))              do_deconv = 1;
         else if (!strcmp(argv[i], "--musica"))              do_musica = 1;
         else if (!strcmp(argv[i], "--no-air-zero"))         do_air_zero = 0;
         else if (!strcmp(argv[i], "--meta") && i+1 < argc)  snprintf(meta_path, sizeof(meta_path), "%s", argv[++i]);
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 2; }
+    }
+    /* PROFILES set every aggressiveness knob coherently (per-volume numbers still measured). */
+    if (profile) {
+        if (!strcmp(profile, "conservative")) {        /* FIDELITY: keep faint material, full res */
+            air_cut_aggr = 0.0; denoise_k = 3.0; do_downsample = 0; aggr = 0.0;
+        } else if (!strcmp(profile, "aggressive")) {   /* READABILITY/SIZE: cut faint, downsample */
+            air_cut_aggr = 1.0; denoise_k = 4.2; do_downsample = 1; aggr = 1.0;
+        } else { fprintf(stderr, "unknown profile: %s (conservative|aggressive)\n", profile); return 2; }
     }
     if (!meta_path[0]) snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", in_zarr);
 
@@ -74,6 +89,7 @@ int main(int argc, char **argv) {
     cfg.use_matched_deconv = 1; cfg.psf_sigma_vox = 1.0; cfg.deconv_tikhonov = 0.05;
     cfg.guided_eps = 0.0;                      /* 0 -> calibrate from flat_nf inside */
     cfg.do_air_zero = do_air_zero; cfg.air_cut_u8 = -1; cfg.air_cut_band = 8; cfg.air_thresh = 0.05;
+    cfg.air_cut_aggr = air_cut_aggr; cfg.denoise_k = denoise_k;
     cfg.scratch_passes = 5;
     cfg.do_normalize = 1; cfg.norm_lo = -1; cfg.norm_hi = -1;
     cfg.do_zdrift = 1; cfg.zdrift_factor = NULL;
