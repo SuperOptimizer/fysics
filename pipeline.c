@@ -363,18 +363,33 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
                          float *b1, float *b2) {
     size_t N = (size_t)nz * ny * nx;
 
-    /* (b) DECONV (STORED off for BM18; matched Wiener when requested else plain auto-reg). */
+    /* (b) DECONV (STORED off for BM18; matched Wiener when requested else plain auto-reg).
+     * The physics inverse must run on PHYSICAL ATTENUATION mu, not u8/255 -- our u8 is a clipped
+     * linear window of mu (nabu conversion window window_lo/hi). So DE-WINDOW f (u8/255 -> mu)
+     * before the inverse, run it, then RE-WINDOW back to [0,1]. (When no window is known, mu==f.) */
     if (cfg->do_deconv) {
         fy_physics ph = scaled_phys_from_cfg(cfg);
+        int windowed = (cfg->window_hi > cfg->window_lo);
+        float wlo = (float)cfg->window_lo, wspan = (float)(cfg->window_hi - cfg->window_lo);
+        if (windowed) for (size_t i = 0; i < N; i++) f[i] = wlo + f[i] * wspan;   /* -> physical mu */
         int rc = (cfg->use_matched_deconv && cfg->psf_sigma_vox > 0)
             ? fy_deconvolve_matched(f, b1, nz, ny, nx, &ph, cfg->deconv_tikhonov)
             : fy_deconvolve(f, b1, nz, ny, nx, &ph, -1.0);
         if (rc == 0) {
+            if (windowed) {                                 /* mu -> [0,1] window */
+                float inv = 1.0f / wspan;
+                for (size_t i = 0; i < N; i++) b1[i] = (b1[i] - wlo) * inv;
+            }
             if (have_dec_range && dec_hi - dec_lo > 1e-6) {
                 float lo = (float)dec_lo, inv = 1.0f / (float)(dec_hi - dec_lo);
                 for (size_t i = 0; i < N; i++) b1[i] = (b1[i] - lo) * inv;
             }
-            memcpy(f, b1, sizeof(float) * N);
+            for (size_t i = 0; i < N; i++) {               /* clamp to [0,1] (rescale/window overshoot) */
+                float v = b1[i]; f[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            }
+        } else if (windowed) {                              /* deconv failed -> restore f to [0,1] */
+            float inv = 1.0f / wspan;
+            for (size_t i = 0; i < N; i++) f[i] = (f[i] - wlo) * inv;
         }
     }
 
@@ -526,15 +541,21 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             double sg = measure_tile_psf_sigma(sbuf, (int)dz, (int)dy, (int)dx);
             if (sg > 0) sigmas[nsig++] = sg;
         }
-        /* deconv output range (seam-safe global rescale) */
+        /* deconv output range (seam-safe global rescale) -- measured in the SAME windowed space
+         * as pass-2: de-window sf (u8/255 -> mu), deconv, re-window, collect [0,1] values. */
         if (cfg->do_deconv && sdec) {
             fy_physics ph = scaled_phys_from_cfg(cfg);
+            int windowed = (cfg->window_hi > cfg->window_lo);
+            float wlo = (float)cfg->window_lo, wspan = (float)(cfg->window_hi - cfg->window_lo);
+            if (windowed) for (size_t i = 0; i < n; i++) sf[i] = wlo + sf[i] * wspan;
             int rc = (cfg->use_matched_deconv && cfg->psf_sigma_vox > 0)
                 ? fy_deconvolve_matched(sf, sdec, (int)dz, (int)dy, (int)dx, &ph, cfg->deconv_tikhonov)
                 : fy_deconvolve(sf, sdec, (int)dz, (int)dy, (int)dx, &ph, -1.0);
+            if (windowed) for (size_t i = 0; i < n; i++) sf[i] = (sf[i] - wlo) / wspan;  /* restore sf */
             if (rc == 0) {
                 if (dec_n + n > dec_cap) { dec_cap = (dec_n + n) * 2; dec_vals = realloc(dec_vals, sizeof(double) * dec_cap); }
-                for (size_t i = 0; i < n; i++) dec_vals[dec_n++] = sdec[i];
+                for (size_t i = 0; i < n; i++)
+                    dec_vals[dec_n++] = windowed ? (sdec[i] - wlo) / wspan : sdec[i];
             }
         }
         nsamp++;
