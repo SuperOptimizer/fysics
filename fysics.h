@@ -668,6 +668,87 @@ int fy_downsample(const float *in, float *out, int nz, int ny, int nx,
 double fy_recommend_downsample(const float *in, int nz, int ny, int nx,
                                double err_budget);
 
+/* ===== LOCAL zarr v2 raw-u8 I/O (zarr_io.c) ============================= */
+typedef struct {
+    char root[1024];
+    long shape[3];      /* z,y,x voxels */
+    long chunk[3];      /* chunk dims */
+    unsigned char fill; /* fill_value */
+} fy_zarr;
+
+int  fy_zarr_open(fy_zarr *z, const char *root);                    /* read .zarray */
+int  fy_zarr_create(fy_zarr *z, const char *root, const long shape[3], const long chunk[3]);
+int  fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0,
+                  long dz, long dy, long dx, unsigned char *out);   /* assemble region */
+int  fy_zarr_write_chunk(const fy_zarr *z, long cz, long cy, long cx,
+                         const unsigned char *buf, long bz, long by, long bx);
+
+/* ===== pipeline orchestration (pipeline.c) ============================== */
+typedef struct {
+    /* physics (from metadata.json, parsed by the tiny python reader, passed on the CLI) */
+    double delta_beta, energy_kev, distance_mm, pixel_um, unsharp_sigma, unsharp_coeff;
+    double machine_current_start, machine_current_stop;
+    double window_lo, window_hi;          /* export window (f32), if known */
+    /* tuned/calibrated */
+    int    do_deconv;                     /* store deconv? (BM18: 0 -- view-time only) */
+    int    use_matched_deconv;
+    double psf_sigma_vox, deconv_tikhonov;
+    double guided_eps;                    /* from (3*flat_nf)^2 */
+    int    do_air_zero; int air_cut_u8, air_cut_band; double air_thresh;
+    int    scratch_passes;
+    int    do_normalize; int norm_lo, norm_hi;
+    int    do_zdrift; float *zdrift_factor;  /* len = Z, or NULL */
+    int    do_downsample, downsample_factor; double downsample_aggr;
+    double psf_p5, psf_med;
+    int    do_musica; double musica_p; int musica_levels; double musica_core;
+    int    halo;
+} fy_pipeline_cfg;
+
+/* run the whole 2-pass pipeline zarr->zarr; cfg physics pre-filled, rest calibrated inside. */
+int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *cfg,
+                    int tile, int verbose);
+
+/* ===== CALIBRATION math (calibrate.c) ==================================
+ * Reproduces the Python calibration (BM18-verified): per-volume eps from the clean
+ * noise floor, air-cut valley + band, normalize/zdrift gates, and the PSF->downsample
+ * factor. All pure C; the pipeline runs these once over sampled tiles in PASS1. */
+
+/* Effective system PSF sigma (voxels) from subpixel-aligned air<->papyrus edges in a
+ * tile (scans x & y edges; half=7, sup=8, min_contrast=40 u8; 50%-crossing align;
+ * LSF=clamped grad(ESF); sigma=2nd moment). Returns -1.0 if <30 clean edges (or the
+ * fitted sigma falls outside (0.3,5)). */
+double fy_cal_measure_psf_sigma(const unsigned char *tile, int nz, int ny, int nx);
+
+/* Integer safe downsample factor from the PSF-sigma map. sigma = p5 + aggr*(med-p5)
+ * (aggr in [0,1]: 0=protect sharpest, 1=max shrink), f0=sqrt(-ln(0.1)/(2 pi^2 sigma^2)),
+ * return max(1, floor(0.5/f0)). */
+int fy_cal_downsample_factor(double p5, double med, double aggr);
+
+/* Guided-filter eps from the clean noise floor: eps = (3*median(flat_nfs))^2.
+ * flat_nfs = per-tile fy_flat_noise(blk=8). Returns 0 if n<=0. */
+double fy_cal_eps_from_flatnoise(const double *flat_nfs, int n);
+
+/* Air cut from sample tiles: scratch-denoise each (guided eps=0.01 x scratch_passes),
+ * accumulate the u8 histogram, then fy_valley_depth. Writes air_cut_u8 = valley and
+ * air_cut_band = max(4, (valley-dark)/4). Returns 1 if a valley was found, 0 otherwise
+ * (caller then falls back to a physics/default cut). tiles = array of n tile pointers,
+ * each nz*ny*nx u8 (same dims). */
+int fy_cal_air_cut(const unsigned char *const *tiles, int n, int nz, int ny, int nx,
+                   int scratch_passes, int *air_cut_u8, int *air_cut_band);
+
+/* Air cut helper: valley + band directly from an already-accumulated scratch u8
+ * histogram. Returns 1 if bimodal (valley found), 0 otherwise. */
+int fy_cal_air_cut_from_hist(const long hist[256], int *air_cut_u8, int *air_cut_band);
+
+/* Normalize gate: apply global normalization iff (hi-lo)/255 < 0.40. lo,hi are u8
+ * percentile levels. Returns 1 to apply, 0 to skip (already well-windowed). */
+int fy_cal_norm_gate(int lo, int hi);
+
+/* z-drift gate: apply correction iff coherence>=0.5 AND slope_frac>=0.05 AND
+ * meta_drift>=0.05. Pass meta_drift<0 when metadata is unavailable (then the metadata
+ * condition is treated as satisfied -- measured signals decide). Returns 1/0. */
+int fy_cal_zdrift_gate(double coherence, double slope_frac, double meta_drift);
+
 #ifdef __cplusplus
 }
 #endif

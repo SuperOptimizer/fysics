@@ -29,18 +29,42 @@ if(FYSICS_VECREPORT)
   list(APPEND FYSICS_OPT_FLAGS -fopt-info-vec-optimized)
 endif()
 
+# OpenMP for the pipeline tile loop (the whole point of the C rewrite: no GIL).
+find_package(OpenMP)
+
 # ---- the library vc3d imports ----
-add_library(fysics STATIC fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c phasecorr.c compact.c fuse.c diffusion.c spectral.c texture.c)
+add_library(fysics STATIC fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c phasecorr.c compact.c fuse.c diffusion.c spectral.c texture.c zarr_io.c calibrate.c pipeline.c)
 target_include_directories(fysics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(fysics PRIVATE ${FYSICS_OPT_FLAGS})
 target_link_libraries(fysics PUBLIC m)
+if(OpenMP_C_FOUND)
+  target_link_libraries(fysics PUBLIC OpenMP::OpenMP_C)
+endif()
 
 # also build a shared lib (some importers prefer it)
-add_library(fysics_shared SHARED fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c phasecorr.c compact.c fuse.c diffusion.c spectral.c texture.c)
+add_library(fysics_shared SHARED fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c phasecorr.c compact.c fuse.c diffusion.c spectral.c texture.c zarr_io.c calibrate.c pipeline.c)
 set_target_properties(fysics_shared PROPERTIES OUTPUT_NAME fysics)
 target_include_directories(fysics_shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_options(fysics_shared PRIVATE ${FYSICS_OPT_FLAGS})
 target_link_libraries(fysics_shared PUBLIC m)
+if(OpenMP_C_FOUND)
+  target_link_libraries(fysics_shared PUBLIC OpenMP::OpenMP_C)
+endif()
+
+# ---- single CLI: the whole-volume preprocessing pipeline (zarr -> zarr) ----
+add_executable(fysics-process tools/fysics_process_main.c)
+target_link_libraries(fysics-process PRIVATE fysics m)
+target_compile_options(fysics-process PRIVATE ${FYSICS_OPT_FLAGS})
+if(OpenMP_C_FOUND)
+  target_link_libraries(fysics-process PRIVATE OpenMP::OpenMP_C)
+endif()
+install(TARGETS fysics-process RUNTIME DESTINATION bin)
+install(PROGRAMS tools/read_meta.py DESTINATION bin)
+# copy the python metadata stub next to the binary in the build tree too
+add_custom_command(TARGET fysics-process POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy
+          ${CMAKE_CURRENT_SOURCE_DIR}/tools/read_meta.py
+          $<TARGET_FILE_DIR:fysics-process>/read_meta.py)
 
 # ---- tests ----
 enable_testing()
