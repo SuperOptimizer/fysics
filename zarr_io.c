@@ -1,15 +1,58 @@
-/* zarr_io.c -- minimal LOCAL zarr v2 reader/writer for raw uint8 volumes.
+/* zarr_io.c -- minimal zarr v2 reader/writer for raw uint8 volumes (local + optional S3).
  *
  * Format produced by the export (and what we consume): level "0/" with a .zarray JSON header
  * and raw chunk files at "0/z/y/x" (dimension_separator '/'), dtype |u1, compressor null,
  * fill_value 0. A chunk file is exactly chunk_z*chunk_y*chunk_x bytes of raw u8 (C order).
- * Missing chunk file -> all fill_value (air padding). No compression, no S3 -- fopen/fread only. */
+ * Missing chunk -> all fill_value (air padding). No compression.
+ * S3: when compiled with FYSICS_S3 (links vendored libs3 + libcurl), a root starting with
+ * "s3://" is fetched per-chunk via libs3 instead of local fopen/mmap. The core library is
+ * dependency-free unless FYSICS_S3 is defined. */
 #include "fysics.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
+#ifdef FYSICS_S3
+#include "vendor/libs3/libs3.h"
+static s3_client *g_fy_s3 = NULL;
+static s3_status fy_s3_cred(void *ud, s3_credentials *out){ (void)ud; return s3_credentials_load(NULL,out); }
+static void fy_s3_ensure(void){
+    if(g_fy_s3) return;
+    s3_config cfg; memset(&cfg,0,sizeof cfg);
+    s3_credentials probe; memset(&probe,0,sizeof probe);
+    if(s3_credentials_load(NULL,&probe)==S3_OK){
+        cfg.cred_provider=fy_s3_cred;
+        if(probe.region&&probe.region[0]) cfg.region=strdup(probe.region);
+        s3_credentials_free(&probe);
+    }
+    g_fy_s3=s3_client_new(&cfg);
+}
+#endif
+/* fetch one S3 object into `out` (up to cn bytes; exact=1 requires >=cn, else accept short and
+ * zero-fill the tail). Returns 1 if handled (S3), 0 if not an S3 path (caller falls back local). */
+static int fy_s3_get(const char *path, unsigned char *out, long cn, unsigned char fill, int exact){
+#ifdef FYSICS_S3
+    if(strncmp(path,"s3://",5)!=0) return 0;
+    fy_s3_ensure();
+    if(!g_fy_s3){ memset(out,fill,cn); return 1; }
+    s3_response r; memset(&r,0,sizeof r);
+    s3_status st=s3_get(g_fy_s3,path,&r);
+    if(st==S3_OK && r.status==200 && r.body){
+        long have=(long)r.body_len;
+        if(exact && have<cn){ memset(out,fill,cn); }
+        else { long cp=have<cn?have:cn; memcpy(out,r.body,cp); if(cp<cn) memset(out+cp,0,cn-cp); }
+    } else memset(out,fill,cn);
+    s3_response_free(&r);
+    return 1;
+#else
+    (void)path;(void)out;(void)cn;(void)fill;(void)exact; return 0;
+#endif
+}
+/* chunk read: requires the full chunk (exact). */
+static int fy_s3_read_chunk(const char *path, unsigned char *out, long cn, unsigned char fill){
+    return fy_s3_get(path, out, cn, fill, 1);
+}
 
 /* tiny field grab from a flat .zarray json: finds "key": <int> (first occurrence). */
 static long json_int(const char *s, const char *key) {
@@ -36,9 +79,20 @@ int fy_zarr_open(fy_zarr *z, const char *root) {
     snprintf(z->root, sizeof(z->root), "%s", root);
     char path[2048];
     snprintf(path, sizeof(path), "%s/0/.zarray", root);
-    FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "zarr: no %s\n", path); return 1; }
-    char buf[4096]; size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f);
+    char buf[4096]; size_t n = 0;
+    if (strncmp(root, "s3://", 5) == 0) {
+        /* fetch .zarray over S3 (a tiny JSON object). read_chunk's S3 path needs a fixed length,
+         * so do a dedicated small GET here. */
+        unsigned char tmp[4096]; memset(tmp,0,sizeof tmp);
+        if (!fy_s3_get(path, tmp, sizeof(tmp)-1, 0, 0)) { fprintf(stderr,"zarr: S3 not compiled in (need FYSICS_S3) for %s\n", path); return 1; }
+        memcpy(buf, tmp, sizeof(buf)-1); buf[sizeof(buf)-1]=0; n = strlen(buf);
+        if (n == 0) { fprintf(stderr, "zarr: no %s (S3)\n", path); return 1; }
+    } else {
+        FILE *f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "zarr: no %s\n", path); return 1; }
+        n = fread(buf, 1, sizeof(buf) - 1, f); fclose(f);
+    }
+    buf[n] = 0;
     z->shape[0] = json_int_at(buf, "\"shape\"", 0);
     z->shape[1] = json_int_at(buf, "\"shape\"", 1);
     z->shape[2] = json_int_at(buf, "\"shape\"", 2);
@@ -81,6 +135,7 @@ static void read_chunk(const fy_zarr *z, long cz, long cy, long cx,
     long cn = ez * ey * ex;
     char path[2048];
     snprintf(path, sizeof(path), "%s/0/%ld/%ld/%ld", z->root, cz, cy, cx);
+    if (fy_s3_read_chunk(path, out, cn, z->fill)) return;   /* S3 path (if FYSICS_S3 & s3://) */
     FILE *f = fopen(path, "rb");
     if (!f) { memset(out, z->fill, cn); return; }
     size_t got = fread(out, 1, cn, f); fclose(f);

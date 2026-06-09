@@ -23,6 +23,12 @@
 // Returns 0 on success. Memory-lean: LOD0 is read via chunk-mmap (working-set resident).
 int v3_build_from_zarr(const char *zarr_root, const char *outpath, int dim, float quality);
 
+// FUSED export: build from a vsrc the caller fills with PREPROCESSED 128^3 chunks (no
+// intermediate zarr). alloc -> set_chunk per present chunk -> build (consumes/frees the vsrc).
+void *v3_vsrc_alloc(int dim);
+void  v3_vsrc_set_chunk(void *vsrc, int cz,int cy,int cx, uint8_t *buf128 /*owned by vsrc*/);
+int   v3_build_from_vsrc(void *vsrc, const char *outpath, int dim, float quality);
+
 // ---- random-access decode from a built/mmap'd archive ----
 // (decode a single 16^3 block, or a whole 256^3 chunk; the viewer path.)
 // arc = pointer to the mmap'd archive bytes. lod = 0..7. Returns 0 if absent (all zero).

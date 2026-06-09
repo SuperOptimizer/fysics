@@ -710,7 +710,22 @@ typedef struct {
     double psf_p5, psf_med;   /* measured PSF sigma map (drives the auto-deconv gate) */
     int    do_musica; double musica_p; int musica_levels; double musica_core;
     int    halo;
+    /* resolved calibration STATE (set by fy_calibrate; consumed by fy_process_chunk) */
+    int    have_norm, have_zdrift, have_dec_range;
+    double dec_lo, dec_hi;    /* global deconv-output rescale range */
+    long   vol_z;             /* full-volume Z (for zdrift_apply absolute-z indexing) */
 } fy_pipeline_cfg;
+
+/* ----- FUSED export support: calibrate once, then process arbitrary chunks on demand -----
+ * fy_calibrate: run the calibration (PSF/eps/air-cut/gates + norm/zdrift global stats) on the
+ * input zarr, filling cfg (incl. have_norm/have_zdrift/zdrift_factor/dec range). Call once.
+ * fy_process_chunk: process the inner `tile`^3 at (z0,y0,x0) using the calibrated cfg, reading a
+ * halo'd region from the open zarr; write the inner tile (tz*ty*tx u8) to out. Thread-safe given
+ * a per-thread scratch (pass NULL ws to malloc internally). Returns 0; sets *all_air if empty. */
+int fy_calibrate(const char *in_root, fy_pipeline_cfg *cfg, int tile, int verbose);
+int fy_process_chunk(const fy_zarr *zin, const fy_pipeline_cfg *cfg,
+                     long z0, long y0, long x0, int tile,
+                     unsigned char *out, int *out_tz, int *out_ty, int *out_tx, int *all_air);
 
 /* run the whole 2-pass pipeline zarr->zarr; cfg physics pre-filled, rest calibrated inside. */
 int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *cfg,

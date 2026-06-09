@@ -285,6 +285,58 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
 }
 
 /* ============================================================================
+ * fy_process_chunk -- process ONE inner tile at (z0,y0,x0) with a halo'd read,
+ * using the already-calibrated cfg. The pass-2 body, factored out so the FUSED
+ * v2/v3 export can pull preprocessed chunks on demand. Allocates its own scratch
+ * (self-contained / thread-safe). Writes the inner tile (tz*ty*tx u8) to `out`.
+ * ========================================================================== */
+int fy_process_chunk(const fy_zarr *zin, const fy_pipeline_cfg *cfg,
+                     long z0, long y0, long x0, int tile,
+                     unsigned char *out, int *out_tz, int *out_ty, int *out_tx, int *all_air) {
+    long Z = zin->shape[0], Y = zin->shape[1], X = zin->shape[2];
+    int halo = cfg->halo > 0 ? cfg->halo : 8;
+    long tz = lmin(tile, Z - z0), ty = lmin(tile, Y - y0), tx = lmin(tile, X - x0);
+    if (out_tz) *out_tz = (int)tz; if (out_ty) *out_ty = (int)ty; if (out_tx) *out_tx = (int)tx;
+    long rz0 = lmax(0, z0 - halo), ry0 = lmax(0, y0 - halo), rx0 = lmax(0, x0 - halo);
+    long rz1 = lmin(Z, z0 + tz + halo), ry1 = lmin(Y, y0 + ty + halo), rx1 = lmin(X, x0 + tx + halo);
+    long hz = rz1 - rz0, hy = ry1 - ry0, hx = rx1 - rx0;
+    size_t hn = (size_t)hz * hy * hx;
+    long bz_max = tile + 2 * halo; size_t cap = (size_t)bz_max * bz_max * bz_max;
+    unsigned char *u8 = malloc(cap); float *f = malloc(sizeof(float)*cap);
+    float *orig = malloc(sizeof(float)*cap), *b1 = malloc(sizeof(float)*cap);
+    float *b2 = malloc(sizeof(float)*cap), *ws = malloc(sizeof(float)*4*cap);
+    if (!u8||!f||!orig||!b1||!b2||!ws){ free(u8);free(f);free(orig);free(b1);free(b2);free(ws); return 1; }
+    int rc = 0; int air = 1;
+    if (fy_zarr_read(zin, rz0, ry0, rx0, hz, hy, hx, u8) != 0) { rc = 1; goto done; }
+    if (!any_nonzero(u8, hn)) { memset(out, 0, (size_t)tz*ty*tx); air = 1; goto done; }
+    air = 0;
+    if (cfg->have_norm) fy_norm_apply_u8(u8, f, hn, (unsigned char)cfg->norm_lo, (unsigned char)cfg->norm_hi);
+    else u8_to_f01(u8, f, hn);
+    if (cfg->have_zdrift && cfg->zdrift_factor) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, cfg->zdrift_factor);
+    memcpy(orig, f, sizeof(float) * hn);
+    process_tile(f, orig, u8, (int)hz, (int)hy, (int)hx, cfg,
+                 cfg->have_dec_range, cfg->dec_lo, cfg->dec_hi, b1, b2, ws);
+    { long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0, oi = 0;
+      for (long zz = iz0; zz < iz0 + tz; zz++)
+      for (long yy = iy0; yy < iy0 + ty; yy++)
+      for (long xx = ix0; xx < ix0 + tx; xx++) {
+          float v = f[((size_t)zz * hy + yy) * hx + xx] * 255.0f + 0.5f;
+          out[oi++] = v < 0 ? 0 : (v > 255 ? 255 : (unsigned char)v);
+      } }
+done:
+    if (all_air) *all_air = air;
+    free(u8); free(f); free(orig); free(b1); free(b2); free(ws);
+    return rc;
+}
+
+/* Calibrate the pipeline on `in_root` (PSF/eps/air-cut/gates + norm/zdrift global stats), filling
+ * cfg (incl. zdrift_factor, which the caller must free). Implemented as fy_run_pipeline with a NULL
+ * output (calibrate-only early return). For the fused export: call once, then fy_process_chunk. */
+int fy_calibrate(const char *in_root, fy_pipeline_cfg *cfg, int tile, int verbose) {
+    return fy_run_pipeline(in_root, NULL, cfg, tile, verbose);
+}
+
+/* ============================================================================
  * fy_run_pipeline -- the public 2-pass entry point.
  * ========================================================================== */
 int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *cfg,
@@ -545,6 +597,15 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         if (verbose) fprintf(stderr, "[pass1] norm=%d(lo=%d hi=%d) zdrift=%d\n",
                              have_norm, cfg->norm_lo, cfg->norm_hi, have_zdrift);
     }
+
+    /* publish resolved calibration STATE into cfg so fy_process_chunk (fused export) can use it. */
+    cfg->have_norm = have_norm; cfg->have_zdrift = have_zdrift;
+    cfg->have_dec_range = have_dec_range; cfg->dec_lo = dec_lo; cfg->dec_hi = dec_hi;
+    cfg->zdrift_factor = zfactor; cfg->vol_z = Z; cfg->halo = halo;
+
+    /* CALIBRATE-ONLY mode (out_root==NULL): used by fy_calibrate for the fused export. Keep zfactor
+     * alive in cfg (caller owns it); free the histogram accumulators. Do NOT free zfactor here. */
+    if (out_root == NULL) { free(zsums); free(zcnts); return 0; }
 
     /* ===================== OUTPUT zarr (same shape as input; chunk = tile) ===================== */
     long oshape[3] = { Z, Y, X };

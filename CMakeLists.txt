@@ -32,21 +32,31 @@ endif()
 # OpenMP for the pipeline tile loop (the whole point of the C rewrite: no GIL).
 find_package(OpenMP)
 
-# ---- the library vc3d imports ----
-add_library(fysics STATIC fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c phasecorr.c compact.c fuse.c diffusion.c spectral.c texture.c zarr_io.c pipeline.c)
-target_include_directories(fysics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+# S3 is ALWAYS on: the zarr reader speaks s3:// via the vendored libs3 (+ libcurl). Required.
+find_package(CURL REQUIRED)
+set(FYSICS_LIBS3 ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libs3/libs3.c)
+
+set(FYSICS_CORE_SRC fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c
+    guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c phasecorr.c compact.c fuse.c
+    diffusion.c spectral.c texture.c zarr_io.c pipeline.c ${FYSICS_LIBS3})
+
+# ---- the library vc3d imports (S3-enabled) ----
+add_library(fysics STATIC ${FYSICS_CORE_SRC})
+target_include_directories(fysics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libs3)
 target_compile_options(fysics PRIVATE ${FYSICS_OPT_FLAGS})
-target_link_libraries(fysics PUBLIC m)
+target_compile_definitions(fysics PRIVATE FYSICS_S3)
+target_link_libraries(fysics PUBLIC m CURL::libcurl)
 if(OpenMP_C_FOUND)
   target_link_libraries(fysics PUBLIC OpenMP::OpenMP_C)
 endif()
 
 # also build a shared lib (some importers prefer it)
-add_library(fysics_shared SHARED fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c phasecorr.c compact.c fuse.c diffusion.c spectral.c texture.c zarr_io.c pipeline.c)
+add_library(fysics_shared SHARED ${FYSICS_CORE_SRC})
 set_target_properties(fysics_shared PROPERTIES OUTPUT_NAME fysics)
-target_include_directories(fysics_shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(fysics_shared PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libs3)
 target_compile_options(fysics_shared PRIVATE ${FYSICS_OPT_FLAGS})
-target_link_libraries(fysics_shared PUBLIC m)
+target_compile_definitions(fysics_shared PRIVATE FYSICS_S3)
+target_link_libraries(fysics_shared PUBLIC m CURL::libcurl)
 if(OpenMP_C_FOUND)
   target_link_libraries(fysics_shared PUBLIC OpenMP::OpenMP_C)
 endif()
@@ -65,6 +75,26 @@ add_custom_command(TARGET fysics-process POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy
           ${CMAKE_CURRENT_SOURCE_DIR}/tools/read_meta.py
           $<TARGET_FILE_DIR:fysics-process>/read_meta.py)
+
+# ---- vca_export: FUSED single-pass preprocess -> v2/v3 VCA archive (.v3), reads local OR s3:// ----
+# Links the S3-enabled fysics lib + the vendored v2/v3 codec.
+add_executable(vca_export
+  tools/vca_export.c
+  vendor/vca/v3archive.c vendor/vca/v2codec.c)
+target_include_directories(vca_export PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libs3)
+target_compile_options(vca_export PRIVATE ${FYSICS_OPT_FLAGS})
+set_source_files_properties(vendor/vca/v3archive.c vendor/vca/v2codec.c
+  PROPERTIES COMPILE_FLAGS "-std=c23")
+target_link_libraries(vca_export PRIVATE fysics CURL::libcurl m)
+if(OpenMP_C_FOUND)
+  target_link_libraries(vca_export PRIVATE OpenMP::OpenMP_C)
+endif()
+add_custom_command(TARGET vca_export POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy
+          ${CMAKE_CURRENT_SOURCE_DIR}/tools/read_meta.py
+          $<TARGET_FILE_DIR:vca_export>/read_meta.py)
+install(TARGETS vca_export RUNTIME DESTINATION bin)
 
 # ---- tests ----
 enable_testing()
