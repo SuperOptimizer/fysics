@@ -350,7 +350,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     float *sf = (float *)malloc(sizeof(float) * scap);
     float *so = (float *)malloc(sizeof(float) * scap);
     float *stmp = (float *)malloc(sizeof(float) * scap);   /* scratch-denoise tmp */
-    float *sws  = (float *)malloc(sizeof(float) * 6 * scap); /* guided workspace */
+    float *sws  = (float *)malloc(sizeof(float) * 4 * scap); /* guided workspace */
     float *sdec = (cfg->do_deconv) ? (float *)malloc(sizeof(float) * scap) : NULL;
     double *dec_vals = NULL; size_t dec_n = 0, dec_cap = 0;
 
@@ -571,7 +571,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         float *b1 = (float *)malloc(sizeof(float) * cap);
         float *b2 = (float *)malloc(sizeof(float) * cap);
         unsigned char *ob = (unsigned char *)malloc(cap);
-        float *ws = (float *)malloc(sizeof(float) * 6 * cap);   /* guided-filter workspace, reused */
+        float *ws = (float *)malloc(sizeof(float) * 4 * cap);   /* guided-filter workspace, reused */
 
         #pragma omp for schedule(dynamic)
         for (long t = 0; t < ntiles; t++) {

@@ -108,33 +108,35 @@ int fy_guided_denoise_ws(const float *in, float *out, int nz, int ny, int nx,
                          int radius, double eps, float *ws) {
     if (radius < 1) radius = 2;
     size_t n = (size_t)nz * ny * nx;
-    float *mean = ws, *corr = ws + n, *isq = ws + 2*n, *a = ws + 3*n, *b = ws + 4*n, *tmp = ws + 5*n;
-    /* fuse the I^2 precompute with the I box-mean's first read is awkward; keep it but it's a
-     * cheap streaming pass. */
-    for (size_t i = 0; i < n; i++) isq[i] = in[i] * in[i];
+    /* Only 4 work buffers (was 6) by reusing dead lifetimes -> 33% smaller working set so more of
+     * the per-tile data stays L3-resident across the 12 box sweeps (the kernel is RAM-bandwidth
+     * bound; less footprint = fewer RAM round-trips). buf0..buf3 + tmp share `ws`. */
+    float *mean = ws, *corr = ws + n, *ab = ws + 2*n, *tmp = ws + 3*n;
+    /* mean = boxmean(I);  corr = boxmean(I^2)  (compute I^2 into corr in-place via tmp) */
     box_mean(in, mean, tmp, nz, ny, nx, radius);
-    box_mean(isq, corr, tmp, nz, ny, nx, radius);
+    for (size_t i = 0; i < n; i++) corr[i] = in[i] * in[i];   /* corr := I^2 */
+    box_mean(corr, ab, tmp, nz, ny, nx, radius);              /* ab := boxmean(I^2) */
+    /* a := var/(var+eps) into `corr`; b := mean*(1-a) into `ab` (overwrites mean(I^2)). */
     for (size_t i = 0; i < n; i++) {
-        float var = corr[i] - mean[i] * mean[i];
+        float var = ab[i] - mean[i] * mean[i];
         if (var < 0) var = 0;
         float ai = var / (var + (float)eps);
-        a[i] = ai;
-        b[i] = mean[i] * (1.0f - ai);
+        corr[i] = ai;                       /* corr := a */
+        ab[i]   = mean[i] * (1.0f - ai);    /* ab   := b */
     }
-    box_mean(a, corr, tmp, nz, ny, nx, radius);   /* corr = mean_a */
-    box_mean(b, isq,  tmp, nz, ny, nx, radius);    /* isq  = mean_b */
-    /* out = mean_a*I + mean_b -- vectorized fused multiply-add over the whole volume. */
-    for (size_t i = 0; i < n; i++) out[i] = corr[i] * in[i] + isq[i];
+    box_mean(corr, mean, tmp, nz, ny, nx, radius);   /* mean := mean_a */
+    box_mean(ab,   corr, tmp, nz, ny, nx, radius);   /* corr := mean_b */
+    for (size_t i = 0; i < n; i++) out[i] = mean[i] * in[i] + corr[i];
     return 0;
 }
 
 /* number of float scratch elements fy_guided_denoise_ws needs for an nz*ny*nx volume. */
-size_t fy_guided_ws_floats(int nz, int ny, int nx) { return (size_t)6 * nz * ny * nx; }
+size_t fy_guided_ws_floats(int nz, int ny, int nx) { return (size_t)4 * nz * ny * nx; }
 
 int fy_guided_denoise(const float *in, float *out, int nz, int ny, int nx,
                       int radius, double eps) {
     size_t n = (size_t)nz * ny * nx;
-    float *ws = malloc(sizeof(float) * 6 * n);
+    float *ws = malloc(sizeof(float) * 4 * n);
     if (!ws) return 1;
     int rc = fy_guided_denoise_ws(in, out, nz, ny, nx, radius, eps, ws);
     free(ws);
