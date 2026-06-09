@@ -51,7 +51,7 @@ static void apply_meta(fy_pipeline_cfg *c, const char *key, double v) {
 int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
     const char *in_zarr = argv[1], *out_zarr = argv[2];
-    int tile = 128, do_deconv = 0, do_musica = 0, do_air_zero = 1;
+    int tile = 128, do_deconv = 0, do_musica = 0, do_air_zero = 1, scratch_passes = 5;
     double air_cut_aggr = 0.0, denoise_k = 0.0;   /* 0 -> default 4.2 inside */
     const char *profile = NULL;
     char meta_path[PATH_MAX]; meta_path[0] = 0;
@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--deconv"))              do_deconv = 1;
         else if (!strcmp(argv[i], "--musica"))              do_musica = 1;
         else if (!strcmp(argv[i], "--no-air-zero"))         do_air_zero = 0;
+        else if (!strcmp(argv[i], "--scratch-passes") && i+1 < argc) scratch_passes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--meta") && i+1 < argc)  snprintf(meta_path, sizeof(meta_path), "%s", argv[++i]);
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 2; }
     }
@@ -89,7 +90,7 @@ int main(int argc, char **argv) {
     cfg.guided_eps = 0.0;                      /* 0 -> calibrate from flat_nf inside */
     cfg.do_air_zero = do_air_zero; cfg.air_cut_u8 = -1; cfg.air_cut_band = 8; cfg.air_thresh = 0.05;
     cfg.air_cut_aggr = air_cut_aggr; cfg.denoise_k = denoise_k;
-    cfg.scratch_passes = 5;
+    cfg.scratch_passes = scratch_passes;
     cfg.do_normalize = 1; cfg.norm_lo = -1; cfg.norm_hi = -1;
     cfg.do_zdrift = 1; cfg.zdrift_factor = NULL;
     cfg.do_musica = do_musica; cfg.musica_p = 0.6; cfg.musica_levels = 4; cfg.musica_core = 0.0;
