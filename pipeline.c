@@ -235,10 +235,12 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
             memcpy(f, b1, sizeof(float) * N);
     }
 
-    /* (d) AIR-ZERO: scratch denoise -> local valley clamped to global+-band -> zero. */
+    /* (d) AIR-ZERO: scratch smooth (box) -> local valley clamped to global+-band -> zero.
+     * Box-smooth ORIG directly into b2 (no pre-copy, no copy-back -- box_mean isn't in==out
+     * safe but orig!=b2). The smoothed scratch lives in b2, read only for the histogram. */
     if (cfg->do_air_zero) {
-        memcpy(b2, orig, sizeof(float) * N);
-        scratch_denoise(b2, nz, ny, nx, cfg->scratch_passes > 0 ? cfg->scratch_passes : 5, b1, ws);
+        int sr = cfg->scratch_passes > 0 ? cfg->scratch_passes : 5;
+        fy_box_smooth(orig, b2, b1, nz, ny, nx, sr);   /* b1 = tmp */
         long hist[256]; memset(hist, 0, sizeof(hist));
         for (size_t i = 0; i < N; i++) {
             int b = (int)(b2[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; hist[b]++;
@@ -465,6 +467,12 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             #pragma omp for schedule(dynamic)
             for (long t = 0; t < pntiles; t++) {
                 long iz = t / (pny * pnx), r = t % (pny * pnx), iy = r / pnx, ix = r % pnx;
+                /* SUBSAMPLE: read EVERY z-slab (the z-drift trend needs full z-coverage) but only
+                 * a strided subset of (y,x) tiles when the grid is large enough to keep stats
+                 * robust -- the norm histogram and per-z papyrus mean converge on a fraction of
+                 * the xy tiles. Cuts pass-1b I/O ~4x on big volumes (a full redundant read else). */
+                if (pny >= 4 && (iy & 1)) continue;
+                if (pnx >= 4 && (ix & 1)) continue;
                 long z0 = iz * ptile, y0 = iy * ptile, x0 = ix * ptile;
                 long dz = lmin(ptile, Z - z0), dy = lmin(ptile, Y - y0), dx = lmin(ptile, X - x0);
                 size_t n = (size_t)dz * dy * dx;
