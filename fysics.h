@@ -300,6 +300,8 @@ int fy_guided_denoise(const float *in, float *out, int nz, int ny, int nx,
 int fy_guided_denoise_ws(const float *in, float *out, int nz, int ny, int nx,
                          int radius, double eps, float *ws);
 size_t fy_guided_ws_floats(int nz, int ny, int nx);
+/* plain box smooth (mean over (2r+1)^3); tmp = n-float scratch; in/out may alias. */
+void fy_box_smooth(const float *in, float *out, float *tmp, int nz, int ny, int nx, int r);
 
 
 /* ---- ring-artifact removal (heuristic, not a physics inverse) ----

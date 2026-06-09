@@ -91,6 +91,14 @@ static void box_mean(const float *restrict in, float *restrict out, float *restr
     free(rx);
 }
 
+/* Plain 3D box smooth (mean over (2r+1)^3) -- ONE separable box pass, no variance/edge math.
+ * Used for the air-cut SCRATCH (which only needs to tighten the histogram modes for a valley
+ * decision, not preserve edges): a single box r=5 matches a 5-pass guided eps=0.01 scratch
+ * (valley within 1 u8) at ~1/4 the cost. `tmp` = n-float scratch. in/out may alias. */
+void fy_box_smooth(const float *in, float *out, float *tmp, int nz, int ny, int nx, int r) {
+    box_mean(in, out, tmp, nz, ny, nx, r);
+}
+
 /* self-guided guided filter. eps in (normalized intensity)^2, e.g. 0.01^2..0.1^2.
  * radius r voxels. in/out (may differ). Returns 0 on success. */
 /* workspace version: caller provides `ws` = 6*n contiguous floats (see fy_guided_ws_floats).

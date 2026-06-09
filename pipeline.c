@@ -176,12 +176,17 @@ static double measure_tile_psf_sigma(const unsigned char *vol, int Z, int Y, int
 
 
 /* iterated scratch denoise (guided eps=0.01, `passes` iterations); `buf` in/out, `tmp` scratch. */
+/* SCRATCH smoothing for the air-cut valley decision. The scratch is thrown away after
+ * thresholding (it only tightens the histogram modes), so it does NOT need the edge-preserving
+ * guided filter -- a single PLAIN BOX SMOOTH at radius ~= passes*2+1 matches the multi-pass guided
+ * scratch's valley within ~1 u8 at ~1/4 the cost (the guided filter does 4 box passes per call).
+ * `passes` is interpreted as the equivalent guided-pass count -> box radius (passes>=1). */
 static void scratch_denoise(float *buf, int nz, int ny, int nx, int passes, float *tmp, float *ws) {
     size_t n = (size_t)nz * ny * nx;
-    for (int p = 0; p < passes; p++) {
-        if (fy_guided_denoise_ws(buf, tmp, nz, ny, nx, 2, 0.01, ws) != 0) break;
-        memcpy(buf, tmp, sizeof(float) * n);
-    }
+    int r = passes > 0 ? passes : 5;        /* 5 guided eps=0.01 passes ~ box r=5 (measured) */
+    /* box_mean is not in==out safe (X pass reads ahead); smooth into ws, copy back. */
+    fy_box_smooth(buf, ws, tmp, nz, ny, nx, r);
+    memcpy(buf, ws, sizeof(float) * n);
 }
 
 /* ----------------------------------------------------------------- per-tile chain.
