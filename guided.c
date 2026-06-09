@@ -40,36 +40,38 @@ static void box_mean(const float *restrict in, float *restrict out, float *restr
     float *ry = rx + Lmax, *rz = ry + Lmax;
     box_recip(rx, nx, r); box_recip(ry, ny, r); box_recip(rz, nz, r);
 
-    /* X: unit-stride sliding sum along each row. */
-    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) {
-        const float *irow = in + ((size_t)z * ny + y) * nx;
-        float *orow = out + ((size_t)z * ny + y) * nx;
-        float s = 0;
-        for (int x = 0; x <= r && x < nx; x++) s += irow[x];
-        for (int x = 0; x < nx; x++) {
-            orow[x] = s * rx[x];
-            int xb = x + r + 1, xa = x - r;
-            if (xb < nx) s += irow[xb];
-            if (xa >= 0) s -= irow[xa];
-        }
-    }
-    /* Y: slide whole X-ROWS (unit-stride vector adds over x). out->tmp. */
+    /* X+Y FUSED per z-plane: smooth X into a plane-local L2-resident buffer (xp, ~81KB), then
+     * slide that buffer in Y into `tmp`. The X intermediate never round-trips to RAM (it was a
+     * full 11.9MB write+read of `out` before) -- big bandwidth saving on this RAM-bound kernel. */
+    static __thread float *xp = NULL, *accbuf = NULL; static __thread int xcap = 0;
+    int planesz = nx * ny;
+    if (xcap < planesz) { free(xp); free(accbuf); xp = malloc(sizeof(float)*planesz); accbuf = malloc(sizeof(float)*nx); xcap = planesz; }
     for (int z = 0; z < nz; z++) {
-        const float *plane = out + (size_t)z * ny * nx;
-        float *oplane = tmp + (size_t)z * ny * nx;
-        float *acc = oplane;                      /* reuse first row region as running sum? no -- need scratch */
-        /* running sum row in a small buffer */
-        static __thread float *accbuf = NULL; static __thread int acccap = 0;
-        if (acccap < nx) { free(accbuf); accbuf = malloc(sizeof(float) * nx); acccap = nx; }
-        acc = accbuf;
+        const float *iplane = in + (size_t)z * planesz;
+        /* X-smooth this plane into xp (cache-resident) */
+        for (int y = 0; y < ny; y++) {
+            const float *irow = iplane + (size_t)y * nx;
+            float *orow = xp + (size_t)y * nx;
+            float s = 0;
+            for (int x = 0; x <= r && x < nx; x++) s += irow[x];
+            for (int x = 0; x < nx; x++) {
+                orow[x] = s * rx[x];
+                int xb = x + r + 1, xa = x - r;
+                if (xb < nx) s += irow[xb];
+                if (xa >= 0) s -= irow[xa];
+            }
+        }
+        /* Y-smooth xp (in L2) -> tmp plane */
+        float *oplane = tmp + (size_t)z * planesz;
+        float *acc = accbuf;
         for (int x = 0; x < nx; x++) acc[x] = 0;
-        for (int y = 0; y <= r && y < ny; y++) { const float *row = plane + (size_t)y*nx; for (int x=0;x<nx;x++) acc[x]+=row[x]; }
+        for (int y = 0; y <= r && y < ny; y++) { const float *row = xp + (size_t)y*nx; for (int x=0;x<nx;x++) acc[x]+=row[x]; }
         for (int y = 0; y < ny; y++) {
             float *orow = oplane + (size_t)y * nx; float ryv = ry[y];
             for (int x = 0; x < nx; x++) orow[x] = acc[x] * ryv;
             int yb = y + r + 1, ya = y - r;
-            if (yb < ny) { const float *row = plane + (size_t)yb*nx; for (int x=0;x<nx;x++) acc[x]+=row[x]; }
-            if (ya >= 0) { const float *row = plane + (size_t)ya*nx; for (int x=0;x<nx;x++) acc[x]-=row[x]; }
+            if (yb < ny) { const float *row = xp + (size_t)yb*nx; for (int x=0;x<nx;x++) acc[x]+=row[x]; }
+            if (ya >= 0) { const float *row = xp + (size_t)ya*nx; for (int x=0;x<nx;x++) acc[x]-=row[x]; }
         }
     }
     /* Z: slide whole X-ROWS across planes. tmp->out. */
