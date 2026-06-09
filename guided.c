@@ -109,6 +109,8 @@ int fy_guided_denoise_ws(const float *in, float *out, int nz, int ny, int nx,
     if (radius < 1) radius = 2;
     size_t n = (size_t)nz * ny * nx;
     float *mean = ws, *corr = ws + n, *isq = ws + 2*n, *a = ws + 3*n, *b = ws + 4*n, *tmp = ws + 5*n;
+    /* fuse the I^2 precompute with the I box-mean's first read is awkward; keep it but it's a
+     * cheap streaming pass. */
     for (size_t i = 0; i < n; i++) isq[i] = in[i] * in[i];
     box_mean(in, mean, tmp, nz, ny, nx, radius);
     box_mean(isq, corr, tmp, nz, ny, nx, radius);
@@ -119,8 +121,9 @@ int fy_guided_denoise_ws(const float *in, float *out, int nz, int ny, int nx,
         a[i] = ai;
         b[i] = mean[i] * (1.0f - ai);
     }
-    box_mean(a, corr, tmp, nz, ny, nx, radius);
-    box_mean(b, isq,  tmp, nz, ny, nx, radius);
+    box_mean(a, corr, tmp, nz, ny, nx, radius);   /* corr = mean_a */
+    box_mean(b, isq,  tmp, nz, ny, nx, radius);    /* isq  = mean_b */
+    /* out = mean_a*I + mean_b -- vectorized fused multiply-add over the whole volume. */
     for (size_t i = 0; i < n; i++) out[i] = corr[i] * in[i] + isq[i];
     return 0;
 }
