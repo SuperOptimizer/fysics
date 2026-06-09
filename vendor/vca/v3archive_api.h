@@ -21,13 +21,24 @@
 // `dim` must be a multiple of 256 (chunk-aligned; padding is the export pipeline's job —
 // this errors out otherwise). `quality` is the v2 base_q dial. Writes `outpath`.
 // Returns 0 on success. Memory-lean: LOD0 is read via chunk-mmap (working-set resident).
-int v3_build_from_zarr(const char *zarr_root, const char *outpath, int dim, float quality);
+//
+// `metadata`/`meta_len`: optional caller-supplied free-form text (JSON/TOML/INI/...) stored
+// verbatim in the file's metadata region [256, 128KB). Pass (NULL,0) for none. Truncated +
+// a warning if it exceeds the capacity (V3_META_CAP). Read it back with v3_metadata().
+int v3_build_from_zarr(const char *zarr_root, const char *outpath, int dim, float quality,
+                       const char *metadata, size_t meta_len);
 
+// Read the metadata region from a built/mmap'd archive. Returns a pointer INTO `arc` (not
+// owned) + its byte length via *out_len. The region is zero-padded after the stored bytes.
+const char *v3_metadata(const uint8_t *arc, size_t *out_len);
 // FUSED export: build from a vsrc the caller fills with PREPROCESSED 128^3 chunks (no
 // intermediate zarr). alloc -> set_chunk per present chunk -> build (consumes/frees the vsrc).
+// metadata/meta_len: optional inline free-form text (same carve-out as v3_build_from_zarr).
 void *v3_vsrc_alloc(int dim);
 void  v3_vsrc_set_chunk(void *vsrc, int cz,int cy,int cx, uint8_t *buf128 /*owned by vsrc*/);
-int   v3_build_from_vsrc(void *vsrc, const char *outpath, int dim, float quality);
+int   v3_build_from_vsrc(void *vsrc, const char *outpath, int dim, float quality,
+                         const char *metadata, size_t meta_len);
+
 
 // ---- random-access decode from a built/mmap'd archive ----
 // (decode a single 16^3 block, or a whole 256^3 chunk; the viewer path.)

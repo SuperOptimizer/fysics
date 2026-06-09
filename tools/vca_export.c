@@ -115,7 +115,7 @@ int main(int argc, char **argv){
     free(cfg.zdrift_factor);
 
     /* ---- 3. encode all LODs to the .v3 archive ---- */
-    int rc = v3_build_from_vsrc(vs, out, dim, quality);   /* consumes vs */
+    int rc = v3_build_from_vsrc(vs, out, dim, quality, NULL, 0);   /* consumes vs */
     if (rc==0) fprintf(stderr,"vca_export: wrote %s\n", out);
     return rc;
 }
