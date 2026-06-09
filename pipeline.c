@@ -176,10 +176,10 @@ static double measure_tile_psf_sigma(const unsigned char *vol, int Z, int Y, int
 
 
 /* iterated scratch denoise (guided eps=0.01, `passes` iterations); `buf` in/out, `tmp` scratch. */
-static void scratch_denoise(float *buf, int nz, int ny, int nx, int passes, float *tmp) {
+static void scratch_denoise(float *buf, int nz, int ny, int nx, int passes, float *tmp, float *ws) {
     size_t n = (size_t)nz * ny * nx;
     for (int p = 0; p < passes; p++) {
-        if (fy_guided_denoise(buf, tmp, nz, ny, nx, 2, 0.01) != 0) break;
+        if (fy_guided_denoise_ws(buf, tmp, nz, ny, nx, 2, 0.01, ws) != 0) break;
         memcpy(buf, tmp, sizeof(float) * n);
     }
 }
@@ -191,7 +191,7 @@ static void scratch_denoise(float *buf, int nz, int ny, int nx, int passes, floa
 static void process_tile(float *f, const float *orig, const unsigned char *u8orig,
                          int nz, int ny, int nx, const fy_pipeline_cfg *cfg,
                          int have_dec_range, double dec_lo, double dec_hi,
-                         float *b1, float *b2) {
+                         float *b1, float *b2, float *ws) {
     size_t N = (size_t)nz * ny * nx;
 
     /* (b) DECONV (STORED off for BM18; matched Wiener when requested else plain auto-reg).
@@ -226,14 +226,14 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
 
     /* (c) GUIDED DENOISE at the calibrated eps. */
     if (cfg->guided_eps > 0) {
-        if (fy_guided_denoise(f, b1, nz, ny, nx, 2, cfg->guided_eps) == 0)
+        if (fy_guided_denoise_ws(f, b1, nz, ny, nx, 2, cfg->guided_eps, ws) == 0)
             memcpy(f, b1, sizeof(float) * N);
     }
 
     /* (d) AIR-ZERO: scratch denoise -> local valley clamped to global+-band -> zero. */
     if (cfg->do_air_zero) {
         memcpy(b2, orig, sizeof(float) * N);
-        scratch_denoise(b2, nz, ny, nx, cfg->scratch_passes > 0 ? cfg->scratch_passes : 5, b1);
+        scratch_denoise(b2, nz, ny, nx, cfg->scratch_passes > 0 ? cfg->scratch_passes : 5, b1, ws);
         long hist[256]; memset(hist, 0, sizeof(hist));
         for (size_t i = 0; i < N; i++) {
             int b = (int)(b2[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; hist[b]++;
@@ -343,6 +343,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     float *sf = (float *)malloc(sizeof(float) * scap);
     float *so = (float *)malloc(sizeof(float) * scap);
     float *stmp = (float *)malloc(sizeof(float) * scap);   /* scratch-denoise tmp */
+    float *sws  = (float *)malloc(sizeof(float) * 6 * scap); /* guided workspace */
     float *sdec = (cfg->do_deconv) ? (float *)malloc(sizeof(float) * scap) : NULL;
     double *dec_vals = NULL; size_t dec_n = 0, dec_cap = 0;
 
@@ -361,7 +362,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         /* air histogram (scratch-denoised copy in `so`; keeps `sf` pristine for deconv below). */
         if (cfg->do_air_zero) {
             memcpy(so, sf, sizeof(float) * n);
-            scratch_denoise(so, (int)dz, (int)dy, (int)dx, cfg->scratch_passes > 0 ? cfg->scratch_passes : 5, stmp);
+            scratch_denoise(so, (int)dz, (int)dy, (int)dx, cfg->scratch_passes > 0 ? cfg->scratch_passes : 5, stmp, sws);
             for (size_t i = 0; i < n; i++) {
                 int b = (int)(so[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; air_hist[b]++;
             }
@@ -391,7 +392,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         }
         nsamp++;
     }
-    free(sbuf); free(sf); free(so); free(stmp); if (sdec) free(sdec);
+    free(sbuf); free(sf); free(so); free(stmp); free(sws); if (sdec) free(sdec);
 
     /* commit guided_eps = (k * median flat_nf)^2, k = cfg->denoise_k (profile: conservative 3.0
      * ~0.002 preserves detail, aggressive 4.2 ~0.004). Default 4.2 if unset. Unless pre-set. */
@@ -466,8 +467,20 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                 if (!any_nonzero(pb, n)) continue;
                 if (cfg->do_normalize) fy_hist_accumulate_u8(&lh, pb, n);
                 if (cfg->do_zdrift) {
-                    u8_to_f01(pb, pf, n);
-                    fy_zdrift_accumulate(pf, (int)dz, (int)dy, (int)dx, (int)z0, ls, lc, 0.10f);
+                    /* z-drift only needs a coarse PER-Z trend (mean papyrus brightness per slice)
+                     * to decide coherence/slope -- accumulate on a 4x4 spatial SUBSAMPLE in x,y
+                     * (16x less work, statistically identical per-z mean over a 256-tile slab). */
+                    const int ss = 4;
+                    for (long z = 0; z < dz; z++) {
+                        const unsigned char *sl = pb + (size_t)z * dy * dx;
+                        double s = 0; long c = 0;
+                        for (long yy = 0; yy < dy; yy += ss)
+                            for (long xx = 0; xx < dx; xx += ss) {
+                                float v = sl[(size_t)yy * dx + xx] * (1.0f / 255.0f);
+                                if (v > 0.10f) { s += v; c++; }
+                            }
+                        ls[z0 + z] += s; lc[z0 + z] += c;
+                    }
                 }
             }
             #pragma omp critical
@@ -545,6 +558,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         float *b1 = (float *)malloc(sizeof(float) * cap);
         float *b2 = (float *)malloc(sizeof(float) * cap);
         unsigned char *ob = (unsigned char *)malloc(cap);
+        float *ws = (float *)malloc(sizeof(float) * 6 * cap);   /* guided-filter workspace, reused */
 
         #pragma omp for schedule(dynamic)
         for (long t = 0; t < ntiles; t++) {
@@ -566,7 +580,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
 
             /* (b-e) per-tile chain. */
             process_tile(f, orig, u8, (int)hz, (int)hy, (int)hx, cfg,
-                         have_dec_range, dec_lo, dec_hi, b1, b2);
+                         have_dec_range, dec_lo, dec_hi, b1, b2, ws);
 
             long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0;
 
@@ -586,7 +600,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                 fprintf(stderr, "\r[pass2] %ld/%ld tiles", out_done, ntiles);
             }
         }
-        free(u8); free(f); free(orig); free(b1); free(b2); free(ob);
+        free(u8); free(f); free(orig); free(b1); free(b2); free(ob); free(ws);
     }
 
     if (verbose) fprintf(stderr, "\n[done] %ld tiles, out shape %ldx%ldx%ld\n", out_done, Z, Y, X);

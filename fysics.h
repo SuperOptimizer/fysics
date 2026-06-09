@@ -295,6 +295,11 @@ int fy_bilateral_denoise(const float *in, float *out, int nz, int ny, int nx,
  * radius r. The recommended FAST default for streaming large volumes. */
 int fy_guided_denoise(const float *in, float *out, int nz, int ny, int nx,
                       int radius, double eps);
+/* workspace variant: caller supplies ws = fy_guided_ws_floats(nz,ny,nx) contiguous floats,
+ * reused across many calls to avoid per-call malloc churn (the per-tile pipeline hot path). */
+int fy_guided_denoise_ws(const float *in, float *out, int nz, int ny, int nx,
+                         int radius, double eps, float *ws);
+size_t fy_guided_ws_floats(int nz, int ny, int nx);
 
 
 /* ---- ring-artifact removal (heuristic, not a physics inverse) ----
