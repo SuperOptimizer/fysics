@@ -1,16 +1,17 @@
 /* vca_export.c -- FUSED single-pass export: uncompressed zarr (local or s3://) -> preprocess
- * (fysics BM18 pipeline: denoise + air-zero, gated norm/zdrift) -> v2/v3 VCA archive (.v3).
- * No intermediate zarr. The air-zero output feeds the v3 archive's mask-from-zeros directly.
+ * (fysics BM18 pipeline: denoise + air-zero, gated norm/zdrift) -> matter-compressor archive.
+ * No intermediate zarr. The air-zero output feeds the archive's mask-from-zeros (air=0) directly.
  *
- * Pipeline: fy_calibrate ONCE on the input -> for each 128^3 chunk (OpenMP), fy_process_chunk
- * with halo -> hand the processed 128^3 to the v3 vsrc -> v3_build_from_vsrc encodes all LODs.
+ * matter-compressor's mc_build pulls voxels through a CALLBACK (source-agnostic). We provide a
+ * callback that returns the PREPROCESSED voxel at (x,y,z): chunks are processed (with halo) on
+ * first touch and cached, then voxels served from the cache. Calibration runs ONCE up front.
  *
  * Usage: vca_export <in_zarr|s3url> <out.v3> [--profile conservative|aggressive] [--dim N]
  *        [--quality Q] [--meta PATH] [--tile 128]
  */
 #define _GNU_SOURCE
 #include "fysics.h"
-#include "../vendor/vca/v3archive_api.h"
+#include "../vendor/matter/mc_archive_api.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,23 @@ static void apply_meta(fy_pipeline_cfg *c, const char *key, double v) {
     else if (!strcmp(key,"machine_current_stop"))  c->machine_current_stop = v;
     else if (!strcmp(key,"window_lo"))             c->window_lo = v;
     else if (!strcmp(key,"window_hi"))             c->window_hi = v;
+}
+
+/* ---- preprocessed voxel source: process 128^3 chunks on first touch, cache, serve voxels.
+ * mc_build samples voxel-by-voxel in chunk-ish order, so a per-chunk cache (filled lazily) is
+ * cheap. We PRE-PROCESS all present chunks up front in parallel (one pass), then the callback is
+ * a pure lookup -- simplest + fastest given the whole volume fits in RAM as u8 (1GB for 1024^3). */
+typedef struct {
+    int dim, G;                 /* dim voxels; G = dim/128 chunks per axis */
+    unsigned char **chunk;      /* G^3 processed 128^3 chunks (NULL = all-air) */
+} prep_src;
+
+static mc_u8 prep_voxel(void *ud, int x, int y, int z){
+    prep_src *p = ud;
+    if((unsigned)x>=(unsigned)p->dim||(unsigned)y>=(unsigned)p->dim||(unsigned)z>=(unsigned)p->dim) return 0;
+    int G=p->G, ci=((z/128)*G + (y/128))*G + (x/128);
+    const unsigned char *c=p->chunk[ci]; if(!c) return 0;
+    return c[(((size_t)(z%128))*128 + (y%128))*128 + (x%128)];
 }
 
 int main(int argc, char **argv){
@@ -84,7 +102,6 @@ int main(int argc, char **argv){
     FILE *pp=popen(cmd,"r"); int meta_lines=0;
     if(pp){ char line[256]; while(fgets(line,sizeof line,pp)){ char*eq=strchr(line,'='); if(!eq)continue;
             *eq=0; apply_meta(&cfg,line,atof(eq+1)); meta_lines++; } pclose(pp); }
-    /* window -> physical air threshold (same as fysics_process) */
     if(cfg.window_hi>cfg.window_lo){ double af=(0.0-cfg.window_lo)/(cfg.window_hi-cfg.window_lo);
         if(af<0)af=0; if(af>1)af=1; cfg.air_thresh=af; }
 
@@ -94,13 +111,13 @@ int main(int argc, char **argv){
     /* ---- 1. CALIBRATE once on the input (local or s3://) ---- */
     if (fy_calibrate(in, &cfg, tile, 1) != 0) { fprintf(stderr,"calibrate failed\n"); return 1; }
 
-    /* ---- 2. open the input zarr, process every 128^3 chunk into the v3 vsrc ---- */
+    /* ---- 2. open the input zarr, PREPROCESS every 128^3 chunk into the cache (parallel) ---- */
     fy_zarr zin; if (fy_zarr_open(&zin, in) != 0) { fprintf(stderr,"open %s failed\n",in); return 1; }
     long V = zin.shape[0];
     if ((int)V != dim) { fprintf(stderr,"[note] zarr dim %ld != --dim %d; using zarr dim\n",V,dim); dim=(int)V; }
-    void *vs = v3_vsrc_alloc(dim);
-    if (!vs) return 1;
     int G = dim/128;
+    prep_src ps = { .dim=dim, .G=G, .chunk = calloc((size_t)G*G*G, sizeof(unsigned char*)) };
+    if (!ps.chunk) return 1;
     long nproc=0, nair=0;
     #pragma omp parallel for collapse(3) schedule(dynamic) reduction(+:nproc,nair)
     for (int cz=0; cz<G; cz++) for (int cy=0; cy<G; cy++) for (int cx=0; cx<G; cx++){
@@ -108,14 +125,18 @@ int main(int argc, char **argv){
         if (!buf) continue;
         int tz,ty,tx,air=0;
         fy_process_chunk(&zin, &cfg, (long)cz*128,(long)cy*128,(long)cx*128, 128, buf, &tz,&ty,&tx,&air);
-        if (air) { free(buf); nair++; }            /* absent chunk */
-        else { v3_vsrc_set_chunk(vs, cz,cy,cx, buf); nproc++; }   /* vsrc owns buf */
+        if (air) { free(buf); nair++; }
+        else { ps.chunk[((cz*G+cy)*G)+cx] = buf; nproc++; }
     }
-    fprintf(stderr,"vca_export: processed %ld chunks (%ld all-air) of %d^3\n", nproc, nair, G*G*G);
+    fprintf(stderr,"vca_export: preprocessed %ld chunks (%ld all-air) of %d^3\n", nproc, nair, G*G*G);
     free(cfg.zdrift_factor);
 
-    /* ---- 3. encode all LODs to the .v3 archive ---- */
-    int rc = v3_build_from_vsrc(vs, out, dim, quality, NULL, 0);   /* consumes vs */
+    /* ---- 3. encode all LODs via mc_build (callback pulls preprocessed voxels) ---- */
+    mc_codec_init();
+    mc_build_opts opt = { .dim=dim, .quality=quality, .metadata=NULL, .meta_len=0 };
+    int rc = mc_build_to_file(prep_voxel, &ps, &opt, out);
     if (rc==0) fprintf(stderr,"vca_export: wrote %s\n", out);
+    for (long i=0;i<(long)G*G*G;i++) free(ps.chunk[i]);
+    free(ps.chunk);
     return rc;
 }

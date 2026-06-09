@@ -76,15 +76,15 @@ add_custom_command(TARGET fysics-process POST_BUILD
           ${CMAKE_CURRENT_SOURCE_DIR}/tools/read_meta.py
           $<TARGET_FILE_DIR:fysics-process>/read_meta.py)
 
-# ---- vca_export: FUSED single-pass preprocess -> v2/v3 VCA archive (.v3), reads local OR s3:// ----
-# Links the S3-enabled fysics lib + the vendored v2/v3 codec.
+# ---- vca_export: FUSED single-pass preprocess -> matter-compressor archive, reads local OR s3:// ----
+# Links the S3-enabled fysics lib + the vendored matter-compressor codec (callback-driven build).
 add_executable(vca_export
   tools/vca_export.c
-  vendor/vca/v3archive.c vendor/vca/v2codec.c)
+  vendor/matter/mc_archive.c vendor/matter/mc_codec.c)
 target_include_directories(vca_export PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libs3)
+  ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/vendor/matter)
 target_compile_options(vca_export PRIVATE ${FYSICS_OPT_FLAGS})
-set_source_files_properties(vendor/vca/v3archive.c vendor/vca/v2codec.c
+set_source_files_properties(vendor/matter/mc_archive.c vendor/matter/mc_codec.c
   PROPERTIES COMPILE_FLAGS "-std=c23")
 target_link_libraries(vca_export PRIVATE fysics CURL::libcurl m)
 if(OpenMP_C_FOUND)
