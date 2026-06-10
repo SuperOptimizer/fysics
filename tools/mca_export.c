@@ -657,7 +657,10 @@ int main(int argc, char **argv){
     }
     const char *in=argv[1], *out=argv[2], *profile="conservative";
     float quality=8.0f;
-    long SB=1024, BAND=512;
+    long SB=512, BAND=512;   /* SB=512: small bands keep the pinned working set far
+                              * under the fetch budget (SB=1024 bands serialized the
+                              * downloaders through the progress token) and shrink
+                              * worker buffers so compute can run FULL-WIDTH */
     int nthreads=0, niothreads=0, qcap=0, process=1; double cache_gb=12.0, mem_gb=24.0;
     char meta_path[PATH_MAX]; meta_path[0]=0;
     for(int i=3;i<argc;i++){
@@ -743,14 +746,14 @@ int main(int argc, char **argv){
      *   slack (archive mmap, kernel, calib)                ~ 0.3N GB
      * Every term is overridable (--threads/--io-threads/--queue/--mem-gb/--cache-gb). */
     long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<1)ncpu=4;
-    /* MEASURED worker footprint at SB=1024 is ~2.3 GB (band buffers + fysics
-     * scratch + encoder TLS), not the naive buffer sum -- size compute at N/2 so
-     * N/2*2.3 + budgets fits the 2 GB/thread fleet rule with real slack. */
-    int nc_=nthreads>0?nthreads:(int)(ncpu/2<2?2:ncpu/2);
+    /* Threading philosophy (Forrest): pools may EXCEED hardware threads in total --
+     * blocked-on-network io threads cost only stack. Compute = ncpu (full width;
+     * measured ~1.3 GB/worker at SB=512 incl. encoder TLS), io = 2x ncpu. */
+    int nc_=nthreads>0?nthreads:(int)(ncpu<2?2:ncpu);
     int ni_=niothreads>0?niothreads:(is_s3(in)?(int)(ncpu*2):(nc_<4?nc_:4));
     int qc_=qcap>0?qcap:nc_/2+2;
-    if(mem_gb==24.0)  mem_gb=ncpu/4.0;   /* resident budget shares RAM with ~2.3GB/worker */     /* defaults only when not user-set */
-    if(cache_gb==12.0) cache_gb=ncpu/5.0;
+    if(mem_gb==24.0)  mem_gb=ncpu/4.0;   /* resident budget shares RAM with ~1.3GB/worker */     /* defaults only when not user-set */
+    if(cache_gb==12.0) cache_gb=ncpu/8.0;
     /* ONE resident-bytes budget covers in-flight bands AND cached reuse */
     cc_init((size_t)((mem_gb+cache_gb)*1e9));
     bq_init(&sc.q,qc_,ni_);
