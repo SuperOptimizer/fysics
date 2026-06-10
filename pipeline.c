@@ -519,53 +519,57 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (X - 1) / 2.0;
     int g = 3;                          /* 3x3x3 candidate quasi-grid */
     long stile = tile;
-    size_t scap = (size_t)stile * stile * stile;
-    unsigned char *sbuf = (unsigned char *)malloc(scap);
-    float *sf = (float *)malloc(sizeof(float) * scap);
-    float *so = (float *)malloc(sizeof(float) * scap);
-    float *stmp = (float *)malloc(sizeof(float) * scap);   /* scratch-denoise tmp */
-    float *sws  = (float *)malloc(sizeof(float) * 4 * scap); /* guided workspace */
-    float *sdec = (cfg->do_deconv) ? (float *)malloc(sizeof(float) * scap) : NULL;
+    size_t scap = (size_t)stile * stile * stile;   /* per-tile scratch, alloc'd in-loop */
     double *dec_vals = NULL; size_t dec_n = 0, dec_cap = 0;
 
+    /* PARALLEL over sample tiles: each tile's read (serial S3 GETs) and compute run
+     * concurrently; the shared accumulators are merged under one critical section.
+     * Per-tile scratch is allocated inside the loop (27 allocs total -- negligible). */
+    #pragma omp parallel for collapse(3) schedule(dynamic)
     for (int iz = 0; iz < g; iz++) for (int iy = 0; iy < g; iy++) for (int ix = 0; ix < g; ix++) {
+        unsigned char *sbuf = (unsigned char *)malloc(scap);
+        float *sf = (float *)malloc(sizeof(float) * scap);
+        float *so = (float *)malloc(sizeof(float) * scap);
+        float *stmp = (float *)malloc(sizeof(float) * scap);
+        float *sws  = (float *)malloc(sizeof(float) * 4 * scap);
+        float *sdec = (cfg->do_deconv) ? (float *)malloc(sizeof(float) * scap) : NULL;
+        long lhist[256]; memset(lhist, 0, sizeof(lhist));
+        if (!sbuf || !sf || !so || !stmp || !sws || (cfg->do_deconv && !sdec)) goto tile_done;
+        {
         long z0 = (long)(((iz + 0.5) / g) * (Z - stile)); if (z0 < 0) z0 = 0; if (z0 > Z - stile) z0 = Z > stile ? Z - stile : 0;
         long y0 = (long)(((iy + 0.5) / g) * (Y - stile)); if (y0 < 0) y0 = 0; if (y0 > Y - stile) y0 = Y > stile ? Y - stile : 0;
         long x0 = (long)(((ix + 0.5) / g) * (X - stile)); if (x0 < 0) x0 = 0; if (x0 > X - stile) x0 = X > stile ? X - stile : 0;
         long dz = lmin(stile, Z - z0), dy = lmin(stile, Y - y0), dx = lmin(stile, X - x0);
         size_t n = (size_t)dz * dy * dx;
-        if (fy_zarr_read(&zin, z0, y0, x0, dz, dy, dx, sbuf) != 0) continue;
-        size_t occ = 0; for (size_t i = 0; i < n; i++) if (sbuf[i] > 0) occ++;
-        if ((double)occ / n < 0.6) continue;
+        if (fy_zarr_read(&zin, z0, y0, x0, dz, dy, dx, sbuf) != 0) goto tile_done;
+        { size_t occ = 0; for (size_t i = 0; i < n; i++) if (sbuf[i] > 0) occ++;
+          if ((double)occ / n < 0.6) goto tile_done; }
         u8_to_f01(sbuf, sf, n);
         double fn = fy_flat_noise(sf, (int)dz, (int)dy, (int)dx, 8);
-        if (fn > 0 && nfloor < 64) {
-            double ry = y0 + dy / 2.0 - ecy, rx = x0 + dx / 2.0 - ecx;
-            rads[nfloor] = sqrt(ry * ry + rx * rx);
-            floors[nfloor++] = fn;
+        double aniso = -1, rz, rxy;
+        if (fy_noise_aniso(sf, (int)dz, (int)dy, (int)dx, &rz, &rxy) == 0 &&
+            rz > 0.05 && rz < 0.95 && rxy > 0.05 && rxy < 0.95) {
+            double ratio = sqrt(log(1.0 / rxy) / log(1.0 / rz));
+            if (ratio > 0.5 && ratio < 3.0) aniso = ratio;
         }
-        /* PSF anisotropy from noise autocorrelation (helical scans blur ~17% more in z) */
-        if (nani < 64) {
-            double rz, rxy;
-            if (fy_noise_aniso(sf, (int)dz, (int)dy, (int)dx, &rz, &rxy) == 0 &&
-                rz > 0.05 && rz < 0.95 && rxy > 0.05 && rxy < 0.95) {
-                double ratio = sqrt(log(1.0 / rxy) / log(1.0 / rz));
-                if (ratio > 0.5 && ratio < 3.0) anisos[nani++] = ratio;
-            }
-        }
-        /* air histogram (scratch-denoised copy in `so`; keeps `sf` pristine for deconv below). */
         if (cfg->do_air_zero) {
             memcpy(so, sf, sizeof(float) * n);
             scratch_denoise(so, (int)dz, (int)dy, (int)dx, cfg->scratch_passes > 0 ? cfg->scratch_passes : 5, stmp, sws);
             for (size_t i = 0; i < n; i++) {
-                int b = (int)(so[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; air_hist[b]++;
+                int b = (int)(so[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; lhist[b]++;
             }
         }
-        /* PSF sigma -- measured for the auto-deconv
-         * gate (deconv recovers real signal only when sharp, sigma<=~1.1). */
-        if (nsig < 64) {
-            double sg = measure_tile_psf_sigma(sbuf, (int)dz, (int)dy, (int)dx);
-            if (sg > 0) sigmas[nsig++] = sg;
+        double sg = measure_tile_psf_sigma(sbuf, (int)dz, (int)dy, (int)dx);
+        #pragma omp critical (calib_merge)
+        {
+            if (fn > 0 && nfloor < 64) {
+                double ry = y0 + dy / 2.0 - ecy, rx = x0 + dx / 2.0 - ecx;
+                rads[nfloor] = sqrt(ry * ry + rx * rx);
+                floors[nfloor++] = fn;
+            }
+            if (aniso > 0 && nani < 64) anisos[nani++] = aniso;
+            for (int b = 0; b < 256; b++) air_hist[b] += lhist[b];
+            if (sg > 0 && nsig < 64) sigmas[nsig++] = sg;
         }
         /* deconv output range (seam-safe global rescale) -- measured in the SAME windowed space
          * as pass-2: de-window sf (u8/255 -> mu), deconv, re-window, collect [0,1] values. */
@@ -579,14 +583,20 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                 : fy_deconvolve(sf, sdec, (int)dz, (int)dy, (int)dx, &ph, -1.0);
             if (windowed) for (size_t i = 0; i < n; i++) sf[i] = (sf[i] - wlo) / wspan;  /* restore sf */
             if (rc == 0) {
-                if (dec_n + n > dec_cap) { dec_cap = (dec_n + n) * 2; dec_vals = realloc(dec_vals, sizeof(double) * dec_cap); }
-                for (size_t i = 0; i < n; i++)
-                    dec_vals[dec_n++] = windowed ? (sdec[i] - wlo) / wspan : sdec[i];
+                #pragma omp critical (calib_merge)
+                {
+                    if (dec_n + n > dec_cap) { dec_cap = (dec_n + n) * 2; dec_vals = realloc(dec_vals, sizeof(double) * dec_cap); }
+                    for (size_t i = 0; i < n; i++)
+                        dec_vals[dec_n++] = windowed ? (sdec[i] - wlo) / wspan : sdec[i];
+                }
             }
         }
+        #pragma omp atomic
         nsamp++;
+        }
+tile_done:
+        free(sbuf); free(sf); free(so); free(stmp); free(sws); if (sdec) free(sdec);
     }
-    free(sbuf); free(sf); free(so); free(stmp); free(sws); if (sdec) free(sdec);
 
     /* commit guided_eps = (k * median flat_nf)^2, k = cfg->denoise_k (profile: conservative 3.0
      * ~0.002 preserves detail, aggressive 4.2 ~0.004). Default 4.2 if unset. Unless pre-set. */

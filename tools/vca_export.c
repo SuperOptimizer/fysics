@@ -106,6 +106,30 @@ static int parse_lvl(const char *zarr,int L,zlvl *lv){
 
 /* ---------------------------------------------------- occupancy (coarse level) */
 typedef struct { u8 *present; long ncz,ncy,ncx; } chunkmap;
+/* parallel coarse-level fetch state (startup was serial-GET bound) */
+static struct { const zlvl *cl; u8 *buf; long nclz,ncly,nclx; atomic_long next; } g_occ;
+static void *occ_fetch_worker(void *arg){
+    (void)arg;
+    const zlvl *cl=g_occ.cl;
+    long total=g_occ.nclz*g_occ.ncly*g_occ.nclx;
+    for(;;){
+        long i=atomic_fetch_add(&g_occ.next,1);
+        if(i>=total) break;
+        long qz=i/(g_occ.ncly*g_occ.nclx), r=i%(g_occ.ncly*g_occ.nclx), qy=r/g_occ.nclx, qx=r%g_occ.nclx;
+        char p[1500]; snprintf(p,sizeof p,"%s/%ld/%ld/%ld",cl->dir,qz,qy,qx);
+        size_t gn=0; u8 *got=src_get(p,&gn,NULL);
+        if(!got) continue;
+        long gz0=qz*cl->cz, gy0=qy*cl->cy, gx0=qx*cl->cx;
+        for(long z=0;z<cl->cz&&gz0+z<cl->sz;++z)for(long y=0;y<cl->cy&&gy0+y<cl->sy;++y){
+            long w=cl->cx; if(gx0+w>cl->sx)w=cl->sx-gx0;
+            size_t so=((size_t)z*cl->cy+y)*cl->cx;
+            if(so<gn) memcpy(g_occ.buf+((size_t)(gz0+z)*cl->sy+(gy0+y))*cl->sx+gx0, got+so,
+                             (size_t)w<gn-so?(size_t)w:gn-so);
+        }
+        free(got);
+    }
+    return NULL;
+}
 static int cm_from_coarse(chunkmap *cm,const char *zarr,const zlvl *z0){
     int bestL=-1; zlvl cl; long f=1;
     for(int L=5;L>=1;--L){
@@ -119,19 +143,14 @@ static int cm_from_coarse(chunkmap *cm,const char *zarr,const zlvl *z0){
     size_t voxn=(size_t)cl.sz*cl.sy*cl.sx;
     u8 *buf=calloc(voxn,1); if(!buf) return -1;
     long nclz=(cl.sz+cl.cz-1)/cl.cz, ncly=(cl.sy+cl.cy-1)/cl.cy, nclx=(cl.sx+cl.cx-1)/cl.cx;
-    size_t cb=(size_t)cl.cz*cl.cy*cl.cx;
-    for(long qz=0;qz<nclz;++qz)for(long qy=0;qy<ncly;++qy)for(long qx=0;qx<nclx;++qx){
-        char p[1500]; snprintf(p,sizeof p,"%s/%ld/%ld/%ld",cl.dir,qz,qy,qx);
-        size_t gn=0; u8 *got=src_get(p,&gn,NULL);
-        if(!got) continue;
-        long gz0=qz*cl.cz, gy0=qy*cl.cy, gx0=qx*cl.cx;
-        for(long z=0;z<cl.cz&&gz0+z<cl.sz;++z)for(long y=0;y<cl.cy&&gy0+y<cl.sy;++y){
-            long w=cl.cx; if(gx0+w>cl.sx)w=cl.sx-gx0;
-            size_t so=((size_t)z*cl.cy+y)*cl.cx;
-            if(so<gn) memcpy(buf+((size_t)(gz0+z)*cl.sy+(gy0+y))*cl.sx+gx0, got+so,
-                             (size_t)w<gn-so?(size_t)w:gn-so);
-        }
-        free(got); (void)cb;
+    /* PARALLEL fetch of the coarse level (16 downloaders; each chunk scatters to a
+     * disjoint region of buf, so no locking) -- this was a serial startup bottleneck. */
+    {
+        g_occ.cl=&cl; g_occ.buf=buf; g_occ.nclz=nclz; g_occ.ncly=ncly; g_occ.nclx=nclx;
+        atomic_store(&g_occ.next,0);
+        pthread_t th[16];
+        for(int i=0;i<16;i++) pthread_create(&th[i],NULL,occ_fetch_worker,NULL);
+        for(int i=0;i<16;i++) pthread_join(th[i],NULL);
     }
     for(long cz=0;cz<cm->ncz;++cz)for(long cy=0;cy<cm->ncy;++cy)for(long cx=0;cx<cm->ncx;++cx){
         long z0v=cz*vcz,y0v=cy*vcy,x0v=cx*vcx; int nz=0;
