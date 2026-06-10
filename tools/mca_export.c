@@ -358,6 +358,7 @@ typedef struct {
     long pz,py,px;              /* padded dims (multiples of 2*MCC for L1 alignment) */
     atomic_long next, fail, skipped, l0app, l1app;
     atomic_long dl_fetch, dl_gate, wk_busy, units_done;   /* live telemetry gauges */
+    unsigned char *done_bm; int prog_fd; atomic_long resumed;   /* resume journal */
     atomic_long io_open, io_miss, io_bytes;
     bandq q;
 } sched;
@@ -367,6 +368,9 @@ static void *download_worker(void *arg){
     for(;;){
         long ti=atomic_fetch_add(&sc->next,1);
         if(ti>=sc->nunits) break;
+        if(sc->done_bm && (sc->done_bm[ti>>3]>>(ti&7)&1)){
+            atomic_fetch_add(&sc->units_done,1); atomic_fetch_add(&sc->resumed,1); continue;
+        }
         int have_tok=0;
         long band_bytes=0;   /* gate per CHUNK below (per-band gating lets N
                               * downloaders overshoot the cap N-fold before any
@@ -537,7 +541,9 @@ static void *compute_worker(void *arg){
         long ti=bb.ti;
         long bz=ti%sc->nbz, txy=ti/sc->nbz, ty=txy/sc->ntx, tx=txy%sc->ntx;
         long vx0=tx*SB, vy0=ty*SB, vz0=bz*BAND;
-        if(bb.empty){ atomic_fetch_add(&sc->skipped,1); atomic_fetch_add(&sc->units_done,1); goto release; }
+        if(bb.empty){ atomic_fetch_add(&sc->skipped,1); atomic_fetch_add(&sc->units_done,1);
+            if(sc->prog_fd>=0){ long v=ti; if(write(sc->prog_fd,&v,8)!=8){} }
+            goto release; }
         atomic_fetch_add(&sc->wk_busy,1);
         {
         /* assemble the halo'd raw band (clamped to the volume) */
@@ -621,6 +627,10 @@ static void *compute_worker(void *arg){
         }
         atomic_fetch_sub(&sc->wk_busy,1);
         atomic_fetch_add(&sc->units_done,1);
+        /* journal AFTER all of this unit's chunks are appended (archive is
+         * crash-safe per append; the journal trails it, so a crash loses at
+         * most the un-journaled units -- they re-process, never skip wrongly) */
+        if(sc->prog_fd>=0){ long v=ti; if(write(sc->prog_fd,&v,8)!=8){} }
 release:
         for(int i=0;i<bb.nch;++i){
             if(bb.chunks[i].ce) cc_release(bb.chunks[i].ce);
@@ -766,6 +776,7 @@ int main(int argc, char **argv){
     mc_archive *arc=mc_archive_open_dims(out,(int)z0.sx,(int)z0.sy,(int)z0.sz,quality);
     if(!arc){fprintf(stderr,"cannot open %s\n",out);return 1;}
     sched sc; memset(&sc,0,sizeof sc);
+    sc.prog_fd=-1;
     sc.z0=&z0; sc.cm=&cm; sc.cfg=&cfg; sc.process=process; sc.arc=arc;
     sc.SB=SB; sc.BAND=BAND; sc.halo=cfg.halo>0?cfg.halo:8;
     sc.px=((z0.sx+2*MCC-1)/(2*MCC))*(2*MCC);
@@ -773,6 +784,30 @@ int main(int argc, char **argv){
     sc.pz=((z0.sz+2*MCC-1)/(2*MCC))*(2*MCC);
     sc.ntx=(sc.px+SB-1)/SB; sc.nty=(sc.py+SB-1)/SB; sc.nbz=(sc.pz+BAND-1)/BAND;
     sc.nunits=sc.ntx*sc.nty*sc.nbz;
+    /* ---- RESUME journal: <out>.progress holds 8-byte completed-unit ids after a
+     * geometry header; a matching journal + reopenable archive -> completed units
+     * are skipped without any I/O. Geometry mismatch -> start fresh. ---- */
+    {
+        char pp[2200]; snprintf(pp,sizeof pp,"%s.progress",out);
+        long hdr[6]={0x4d435052,SB,BAND,(long)z0.sz,(long)z0.sy,(long)z0.sx};
+        int fd=open(pp,O_RDWR,0644);
+        long nresume=0;
+        if(fd>=0){
+            long h[6]={0};
+            if(read(fd,h,48)==48 && memcmp(h,hdr,48)==0){
+                sc.done_bm=calloc((sc.nunits+7)/8,1);
+                long v;
+                while(read(fd,&v,8)==8) if(v>=0&&v<sc.nunits&&sc.done_bm){ if(!(sc.done_bm[v>>3]>>(v&7)&1)){sc.done_bm[v>>3]|=1<<(v&7); nresume++;} }
+                lseek(fd,0,SEEK_END);
+                sc.prog_fd=fd;
+            } else { close(fd); fd=-1; }   /* stale geometry -> rewrite below */
+        }
+        if(fd<0){
+            fd=open(pp,O_CREAT|O_RDWR|O_TRUNC,0644);
+            if(fd>=0){ if(write(fd,hdr,48)!=48){} sc.prog_fd=fd; }
+        }
+        fprintf(stderr,"resume: %ld of %ld units journaled complete\n",nresume,sc.nunits);
+    }
     /* AUTO-SIZING for the standard export fleet: compute instances provision
      * 2 GB RAM per hardware thread (N threads -> 2N GB). Budget split:
      *   compute = 3N/4 workers (~1.3 GB each at SB=1024)  ~ 1.0N GB
@@ -785,6 +820,11 @@ int main(int argc, char **argv){
      * blocked-on-network io threads cost only stack. Compute = ncpu (full width;
      * measured ~1.3 GB/worker at SB=512 incl. encoder TLS), io = 2x ncpu. */
     int nc_=nthreads>0?nthreads:(int)(ncpu<2?2:ncpu);
+    /* band_max must be the halo-rounded chunk FOOTPRINT, not core voxels: a
+     * SB=512 band fetches (4+2)^3 chunks for a 4^3 core (~3.4x) -- sizing on
+     * core bytes let 64 in-flight bands pin 27GB against a 12GB cap. Assume
+     * 128^3 input chunks (the fleet standard) for the estimate. */
+    long band_max=((SB/128)+2)*((SB/128)+2)*((BAND/128)+2)*2097152L;
     int ni_=niothreads>0?niothreads:(is_s3(in)?(int)(ncpu*2):(nc_<4?nc_:4));
     /* downloaders' worst-case in-flight band footprints must fit the budget
      * (gated otherwise -> token-serialized crawl): clamp the io pool to it */
@@ -796,11 +836,6 @@ int main(int argc, char **argv){
      * downloaders all gate and fetches serialize through the progress token
      * (observed: 58/64 downloaders cond-waiting, 6 fetching). Keep worst-case
      * pinned bytes <= half the budget so fetch headroom always exists. */
-    /* band_max must be the halo-rounded chunk FOOTPRINT, not core voxels: a
-     * SB=512 band fetches (4+2)^3 chunks for a 4^3 core (~3.4x) -- sizing on
-     * core bytes let 64 in-flight bands pin 27GB against a 12GB cap. Assume
-     * 128^3 input chunks (the fleet standard) for the estimate. */
-    long band_max=((SB/128)+2)*((SB/128)+2)*((BAND/128)+2)*2097152L;
     long cap_b=(long)((mem_gb==24.0?ncpu/4.0:mem_gb)*1e9)+(long)((cache_gb==12.0?ncpu/8.0:cache_gb)*1e9);
     int qc_=qcap>0?qcap:(int)(cap_b/2/band_max-nc_);
     if(qcap<=0){ if(qc_<4)qc_=4; if(qc_>nc_*2)qc_=nc_*2; }
