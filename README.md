@@ -156,8 +156,12 @@ detector follows the same two-pass pattern with a per-slab radial profile.)
 
 fysics owns the FULL pipeline: `vca_export <zarr|s3://...> <out.mc>` streams an
 uncompressed OME-zarr (local or S3) through calibration + the preprocessing
-chain into a matter-compressor archive with all 8 LODs, in one pass, bounded
-RAM, no intermediate zarr. Architecture ported from volume-compressor's
+chain into a matter-compressor archive with all 8 LODs, bounded RAM, no
+intermediate zarr. Two passes over the input by necessity (the global
+operators -- norm histogram, z-drift profile, ring detection -- must finalize
+before any tile can be processed): a ~0.25x subsampled calibration sweep,
+then ONE streaming read of LOD0 from which every pyramid level is produced
+(L1 in RAM, L2+ from the archive itself -- no per-LOD source re-reads). Architecture ported from volume-compressor's
 optimized vc_export_stream: occupancy from a coarse pyramid level (one tiny
 GET replaces thousands of HEADs; absent bands skipped), a downloader pool
 feeding a bounded queue so S3 latency never blocks the compute pool, chunk-
