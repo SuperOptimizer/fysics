@@ -18,7 +18,7 @@
  *
  * Calibration (fy_calibrate) runs once up front on the input zarr.
  *
- * Usage: vca_export <in_zarr|s3://...> <out.mc> [--profile conservative|aggressive]
+ * Usage: mca_export <in_zarr|s3://...> <out.mc> [--profile conservative|aggressive]
  *        [--quality Q] [--meta PATH] [--threads N] [--io-threads M] [--queue C]
  *        [--sb SB] [--band B] [--no-process]
  */

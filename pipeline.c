@@ -376,7 +376,7 @@ static double eps_for_tile(const fy_pipeline_cfg *cfg, double ecy, double ecx,
 /* ============================================================================
  * fy_process_buffer -- the I/O-FREE half of fy_process_chunk: process ONE inner
  * tile from an ALREADY-READ halo'd u8 buffer. For export pipelines that own
- * their I/O (e.g. the streaming vca_export downloader pool). `u8buf` is the
+ * their I/O (e.g. the streaming mca_export downloader pool). `u8buf` is the
  * hz*hy*hx region whose global origin is (rz0,ry0,rx0); the inner tile starts
  * at global (z0,y0,x0) and spans (tz,ty,tx) (caller clamps both). vol_y/vol_x
  * are the FULL volume Y/X (for the radial-eps / dering center). Thread-safe
@@ -509,7 +509,11 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             free(der); der = NULL;
         }
     }
-    #pragma omp parallel
+    /* S3 inputs: each sweep thread spends ~95% of its time blocked in a GET, so
+     * oversubscribe far past ncpu to saturate the NIC (S3 needs ~100+ concurrent
+     * streams for 10-15 Gbit; network-blocked threads cost only stack RAM). */
+    int sweep_threads = strncmp(in_root, "s3://", 5) == 0 ? 128 : omp_get_max_threads();
+    #pragma omp parallel num_threads(sweep_threads)
     {
         fy_hist_state lh; fy_hist_init(&lh);
         double *ls = (double *)calloc(Z, sizeof(double));

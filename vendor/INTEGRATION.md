@@ -10,7 +10,7 @@ build a .v3 archive from an uncompressed zarr (local OR s3://), with our preproc
     callback. Air mask derived from voxel==0 -> our air-zero output feeds it directly.
   (matter-compressor has NO S3/zarr -- that's the exporter's job. fysics zarr_io does S3 itself.)
 
-## The fused export (tools/vca_export.c, CMake target `vca_export`)
+## The fused export (tools/mca_export.c, CMake target `mca_export`)
 1. fy_calibrate ONCE on the input zarr (local/s3).
 2. fy_process_chunk every 128^3 chunk (OpenMP) -> cache (denoise + air-zero, air==0).
 3. mc_build_to_file(prep_voxel, ...) -- the callback serves preprocessed voxels; matter builds
