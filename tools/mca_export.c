@@ -180,44 +180,81 @@ static int cm_build(chunkmap *cm,const char *zarr,const zlvl *z0){
  * z-neighbor bands run consecutively and +x-neighbor columns run nbz units
  * later, so a modest cache turns the ~1.4x halo re-fetch into ~1.05x. */
 typedef struct centry { long key; u8 *bytes; size_t len; int refs; long lru;
+                        int ready;          /* 0 = fetch in flight (single-flight) */
                         struct centry *next; } centry;
 typedef struct {
     centry **bk; long nbk; size_t bytes, cap; long tick;
     long hits, misses;
     pthread_mutex_t m;
+    pthread_cond_t cv;                      /* broadcast on every cc_fill */
 } ccache;
 static ccache g_cc;
 static void cc_init(size_t cap){ memset(&g_cc,0,sizeof g_cc); g_cc.cap=cap;
-    g_cc.nbk=1<<16; g_cc.bk=calloc(g_cc.nbk,sizeof(centry*)); pthread_mutex_init(&g_cc.m,NULL); }
+    g_cc.nbk=1<<16; g_cc.bk=calloc(g_cc.nbk,sizeof(centry*));
+    pthread_mutex_init(&g_cc.m,NULL); pthread_cond_init(&g_cc.cv,NULL); }
 static long cc_key(long z,long y,long x){ return ((z*1000003L)+y)*1000003L+x; }
 static void cc_evict_locked(void){
     while(g_cc.bytes>g_cc.cap){
         centry *best=NULL,**bp=NULL;
+        /* never evict a referenced OR pending entry (a pending entry is the
+         * single-flight rendezvous point; freeing it would strand waiters) */
         for(long i=0;i<g_cc.nbk;i++) for(centry **p=&g_cc.bk[i];*p;p=&(*p)->next)
-            if((*p)->refs==0 && (!best||(*p)->lru<best->lru)){ best=*p; bp=p; }
+            if((*p)->refs==0 && (*p)->ready && (!best||(*p)->lru<best->lru)){ best=*p; bp=p; }
         if(!best) break;
         *bp=best->next; g_cc.bytes-=best->len; free(best->bytes); free(best);
     }
 }
-/* lookup: returns entry with a ref taken, or NULL */
+static centry *cc_find_locked(long k){
+    centry *e;
+    for(e=g_cc.bk[(unsigned long)k%g_cc.nbk];e;e=e->next) if(e->key==k) break;
+    return e;
+}
+/* lookup (phase 1): returns a READY entry with a ref taken, or NULL. Pending
+ * entries are NOT returned -- the caller queues the chunk as 'needed' and
+ * rendezvous happens in cc_reserve/cc_wait_ready. */
 static centry *cc_get(long z,long y,long x){
     long k=cc_key(z,y,x); centry *e;
     pthread_mutex_lock(&g_cc.m);
-    for(e=g_cc.bk[(unsigned long)k%g_cc.nbk];e;e=e->next) if(e->key==k) break;
-    if(e){ e->refs++; e->lru=++g_cc.tick; g_cc.hits++; } else g_cc.misses++;
+    e=cc_find_locked(k);
+    if(e&&e->ready){ e->refs++; e->lru=++g_cc.tick; g_cc.hits++; }
+    else e=NULL;                /* absent or pending: counted at cc_reserve */
     pthread_mutex_unlock(&g_cc.m);
     return e;
 }
-/* insert fetched bytes (takes ownership), returns entry with one ref */
-static centry *cc_put(long z,long y,long x,u8 *bytes,size_t len){
-    long k=cc_key(z,y,x);
-    centry *e=malloc(sizeof *e); e->key=k; e->bytes=bytes; e->len=len; e->refs=1;
+/* SINGLE-FLIGHT reserve: exactly one caller per key becomes the owner.
+ *   ready entry exists  -> ref'd entry, *owner=0 (use it directly)
+ *   pending entry exists-> ref'd entry, *owner=0 (caller cc_wait_ready's)
+ *   no entry            -> insert pending (refs=1, ready=0), *owner=1 (caller fetches+fills) */
+static centry *cc_reserve(long z,long y,long x,int *owner){
+    long k=cc_key(z,y,x); centry *e;
     pthread_mutex_lock(&g_cc.m);
-    e->lru=++g_cc.tick;
-    unsigned long b=(unsigned long)k%g_cc.nbk; e->next=g_cc.bk[b]; g_cc.bk[b]=e;
-    g_cc.bytes+=len; cc_evict_locked();
+    e=cc_find_locked(k);
+    if(e){
+        e->refs++; e->lru=++g_cc.tick; g_cc.hits++; *owner=0;
+    } else {
+        e=malloc(sizeof *e); e->key=k; e->bytes=NULL; e->len=0; e->refs=1; e->ready=0;
+        e->lru=++g_cc.tick;
+        unsigned long b=(unsigned long)k%g_cc.nbk; e->next=g_cc.bk[b]; g_cc.bk[b]=e;
+        g_cc.misses++; *owner=1;
+    }
     pthread_mutex_unlock(&g_cc.m);
     return e;
+}
+/* owner publishes the fetch result (takes ownership of bytes; bytes==NULL marks
+ * the chunk absent/failed) and wakes every waiter */
+static void cc_fill(centry *e,u8 *bytes,size_t len){
+    pthread_mutex_lock(&g_cc.m);
+    e->bytes=bytes; e->len=len; e->ready=1; e->lru=++g_cc.tick;
+    g_cc.bytes+=len; cc_evict_locked();
+    pthread_cond_broadcast(&g_cc.cv);
+    pthread_mutex_unlock(&g_cc.m);
+}
+/* non-owner: wait for the owner's cc_fill. After return, e->bytes==NULL means
+ * the owner's fetch failed/was absent (owner already did the accounting). */
+static void cc_wait_ready(centry *e){
+    pthread_mutex_lock(&g_cc.m);
+    while(!e->ready) pthread_cond_wait(&g_cc.cv,&g_cc.m);
+    pthread_mutex_unlock(&g_cc.m);
 }
 static void cc_release(centry *e){
     pthread_mutex_lock(&g_cc.m); e->refs--; pthread_mutex_unlock(&g_cc.m);
@@ -302,6 +339,7 @@ static void *download_worker(void *arg){
                             && qx>=vx0/z0->cx && qx*z0->cx<vx1);
                 centry *ce=cc_get(qz,qy,qx);
                 if(ce){
+                    if(!ce->bytes){ cc_release(ce); continue; }  /* negative-cached: chunk absent */
                     if(core) any=1;
                     if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
                     chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
@@ -312,7 +350,9 @@ static void *download_worker(void *arg){
             }
             /* phase 2: BATCHED fetch (s3_get_batch multiplexes transfers over pooled
              * connections -- a serial GET pays TLS+TTFB per object). Groups of 32,
-             * budget-gated between groups; local paths use the serial reader. */
+             * budget-gated between groups; local paths use the serial reader.
+             * SINGLE-FLIGHT: every needed chunk is cc_reserve'd first; exactly one
+             * worker (owner) fetches a given chunk, everyone else waits on its fill. */
             for(long g0=0; g0<nneed; g0+=32){
                 long gN=nneed-g0<32?nneed-g0:32;
                 pthread_mutex_lock(&sc->im);
@@ -320,43 +360,73 @@ static void *download_worker(void *arg){
                     pthread_cond_wait(&sc->icv,&sc->im);
                 pthread_mutex_unlock(&sc->im);
                 char paths[32][1500]; s3_range_req reqs[32]; s3_response rsp[32];
+                centry *ces[32]; int owner[32]; long ownidx[32]; long nown=0;
                 memset(rsp,0,sizeof rsp);
-                int use_batch = is_s3(z0->dir) && gN>1;
                 for(long i=0;i<gN;++i){
                     long qz=needq[(g0+i)*3],qy=needq[(g0+i)*3+1],qx=needq[(g0+i)*3+2];
-                    snprintf(paths[i],sizeof paths[i],"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
-                    reqs[i].url=paths[i]; reqs[i].offset=0; reqs[i].length=0;
+                    ces[i]=cc_reserve(qz,qy,qx,&owner[i]);
+                    if(owner[i]){
+                        snprintf(paths[i],sizeof paths[i],"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
+                        reqs[nown].url=paths[i]; reqs[nown].offset=0; reqs[nown].length=0;
+                        ownidx[nown++]=i;
+                    }
                 }
-                if(use_batch && s3_get_batch(g_s3,reqs,gN,16,rsp)!=S3_OK){
-                    for(long i=0;i<gN;++i) s3_response_free(&rsp[i]);
+                int use_batch = is_s3(z0->dir) && nown>1;
+                if(use_batch && s3_get_batch(g_s3,reqs,nown,16,rsp)!=S3_OK){
+                    for(long i=0;i<nown;++i) s3_response_free(&rsp[i]);
                     use_batch=0;                      /* transport failure -> serial (retries) */
                 }
-                for(long i=0;i<gN;++i){
+                /* pass 1: OWNERS fetch + cc_fill. All fills happen before any wait
+                 * below, so cross-thread waits can never form a cycle. */
+                for(long oi=0;oi<nown;++oi){
+                    long i=ownidx[oi];
                     long qz=needq[(g0+i)*3],qy=needq[(g0+i)*3+1],qx=needq[(g0+i)*3+2];
                     int core = (qz>=vz0/z0->cz && qz*z0->cz<vz1 && qy>=vy0/z0->cy && qy*z0->cy<vy1
                                 && qx>=vx0/z0->cx && qx*z0->cx<vx1);
                     u8 *got=NULL; size_t gn=0;
                     atomic_fetch_add(&sc->io_open,1);
                     if(use_batch){
-                        if(rsp[i].status==200 && rsp[i].body){
-                            got=(u8*)rsp[i].body; gn=rsp[i].body_len; rsp[i].body=NULL;
-                        } else if(rsp[i].status!=404 && rsp[i].status!=0){
+                        if(rsp[oi].status==200 && rsp[oi].body){
+                            got=(u8*)rsp[oi].body; gn=rsp[oi].body_len; rsp[oi].body=NULL;
+                        } else if(rsp[oi].status!=404 && rsp[oi].status!=0){
                             atomic_fetch_add(&sc->fail,1);
                         }
-                        s3_response_free(&rsp[i]);
+                        s3_response_free(&rsp[oi]);
                     } else {
                         int err=0; got=src_get(paths[i],&gn,&err);
                         if(err) atomic_fetch_add(&sc->fail,1);
                     }
-                    if(!got){ atomic_fetch_add(&sc->io_miss,1); continue; }
+                    if(!got){
+                        atomic_fetch_add(&sc->io_miss,1);
+                        cc_fill(ces[i],NULL,0);       /* publish 'absent' to waiters */
+                        cc_release(ces[i]);
+                        continue;
+                    }
                     if(core) any=1;
                     atomic_fetch_add(&sc->io_bytes,(long)gn);
                     atomic_fetch_add(&sc->inflight,(long)gn);
                     band_bytes+=(long)gn;
-                    centry *ce=cc_put(qz,qy,qx,got,gn);
+                    cc_fill(ces[i],got,gn);
                     if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
                     chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
-                    chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ce;chunks[nch].fetched=1;nch++;
+                    chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ces[i];chunks[nch].fetched=1;nch++;
+                }
+                /* pass 2: NON-OWNERS rendezvous with the concurrent fetch and share
+                 * its bytes (fetched=0: no inflight accounting -- the owner's band
+                 * carries those bytes). bytes==NULL = owner saw absent/failed; the
+                 * owner already counted it, so just drop the ref. */
+                for(long i=0;i<gN;++i){
+                    if(owner[i]) continue;
+                    cc_wait_ready(ces[i]);
+                    if(!ces[i]->bytes){ cc_release(ces[i]); continue; }
+                    long qz=needq[(g0+i)*3],qy=needq[(g0+i)*3+1],qx=needq[(g0+i)*3+2];
+                    int core = (qz>=vz0/z0->cz && qz*z0->cz<vz1 && qy>=vy0/z0->cy && qy*z0->cy<vy1
+                                && qx>=vx0/z0->cx && qx*z0->cx<vx1);
+                    if(core) any=1;
+                    if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
+                    chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
+                    chunks[nch].bytes=ces[i]->bytes;chunks[nch].len=ces[i]->len;
+                    chunks[nch].ce=ces[i];chunks[nch].fetched=0;nch++;
                 }
             }
             free(needq);
