@@ -155,8 +155,56 @@ static int cm_build(chunkmap *cm,const char *zarr,const zlvl *z0){
     return 0;
 }
 
+/* ------------------------------------------------------- shared chunk cache
+ * Refcounted LRU keyed by chunk coord. Units overlap at their halo boundaries:
+ * z-neighbor bands run consecutively and +x-neighbor columns run nbz units
+ * later, so a modest cache turns the ~1.4x halo re-fetch into ~1.05x. */
+typedef struct centry { long key; u8 *bytes; size_t len; int refs; long lru;
+                        struct centry *next; } centry;
+typedef struct {
+    centry **bk; long nbk; size_t bytes, cap; long tick;
+    long hits, misses;
+    pthread_mutex_t m;
+} ccache;
+static ccache g_cc;
+static void cc_init(size_t cap){ memset(&g_cc,0,sizeof g_cc); g_cc.cap=cap;
+    g_cc.nbk=1<<16; g_cc.bk=calloc(g_cc.nbk,sizeof(centry*)); pthread_mutex_init(&g_cc.m,NULL); }
+static long cc_key(long z,long y,long x){ return ((z*1000003L)+y)*1000003L+x; }
+static void cc_evict_locked(void){
+    while(g_cc.bytes>g_cc.cap){
+        centry *best=NULL,**bp=NULL;
+        for(long i=0;i<g_cc.nbk;i++) for(centry **p=&g_cc.bk[i];*p;p=&(*p)->next)
+            if((*p)->refs==0 && (!best||(*p)->lru<best->lru)){ best=*p; bp=p; }
+        if(!best) break;
+        *bp=best->next; g_cc.bytes-=best->len; free(best->bytes); free(best);
+    }
+}
+/* lookup: returns entry with a ref taken, or NULL */
+static centry *cc_get(long z,long y,long x){
+    long k=cc_key(z,y,x); centry *e;
+    pthread_mutex_lock(&g_cc.m);
+    for(e=g_cc.bk[(unsigned long)k%g_cc.nbk];e;e=e->next) if(e->key==k) break;
+    if(e){ e->refs++; e->lru=++g_cc.tick; g_cc.hits++; } else g_cc.misses++;
+    pthread_mutex_unlock(&g_cc.m);
+    return e;
+}
+/* insert fetched bytes (takes ownership), returns entry with one ref */
+static centry *cc_put(long z,long y,long x,u8 *bytes,size_t len){
+    long k=cc_key(z,y,x);
+    centry *e=malloc(sizeof *e); e->key=k; e->bytes=bytes; e->len=len; e->refs=1;
+    pthread_mutex_lock(&g_cc.m);
+    e->lru=++g_cc.tick;
+    unsigned long b=(unsigned long)k%g_cc.nbk; e->next=g_cc.bk[b]; g_cc.bk[b]=e;
+    g_cc.bytes+=len; cc_evict_locked();
+    pthread_mutex_unlock(&g_cc.m);
+    return e;
+}
+static void cc_release(centry *e){
+    pthread_mutex_lock(&g_cc.m); e->refs--; pthread_mutex_unlock(&g_cc.m);
+}
+
 /* ------------------------------------------------------------ band queue */
-typedef struct { long ccz,ccy,ccx; u8 *bytes; size_t len; } cchunk;
+typedef struct { long ccz,ccy,ccx; u8 *bytes; size_t len; centry *ce; } cchunk;
 typedef struct { long ti; cchunk *chunks; int nch; int empty; } bandbuf;
 typedef struct {
     bandbuf *slot; int cap,head,tail,count,closed,active_prod;
@@ -221,16 +269,22 @@ static void *download_worker(void *arg){
                 /* `any` tracks the CORE (the unit's own chunks), not halo chunks */
                 int core = (qz>=vz0/z0->cz && qz*z0->cz<vz1 && qy>=vy0/z0->cy && qy*z0->cy<vy1
                             && qx>=vx0/z0->cx && qx*z0->cx<vx1);
-                char p[1500]; snprintf(p,sizeof p,"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
-                atomic_fetch_add(&sc->io_open,1);
-                size_t gn=0; int err=0; u8 *got=src_get(p,&gn,&err);
-                if(err){ atomic_fetch_add(&sc->fail,1); }
-                if(!got){ atomic_fetch_add(&sc->io_miss,1); continue; }
-                if(core) any=1;
-                atomic_fetch_add(&sc->io_bytes,(long)gn);
+                centry *ce=cc_get(qz,qy,qx);
+                u8 *got; size_t gn;
+                if(ce){ got=ce->bytes; gn=ce->len; if(core) any=1; }
+                else {
+                    char p[1500]; snprintf(p,sizeof p,"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
+                    atomic_fetch_add(&sc->io_open,1);
+                    gn=0; int err=0; got=src_get(p,&gn,&err);
+                    if(err){ atomic_fetch_add(&sc->fail,1); }
+                    if(!got){ atomic_fetch_add(&sc->io_miss,1); continue; }
+                    if(core) any=1;
+                    atomic_fetch_add(&sc->io_bytes,(long)gn);
+                    ce=cc_put(qz,qy,qx,got,gn);
+                }
                 if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
                 chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
-                chunks[nch].bytes=got;chunks[nch].len=gn;nch++;
+                chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ce;nch++;
             }
         }
         bandbuf b={ti,chunks,nch,any?0:1};
@@ -350,7 +404,7 @@ static void *compute_worker(void *arg){
         }
         }
 release:
-        for(int i=0;i<bb.nch;++i) free(bb.chunks[i].bytes);
+        for(int i=0;i<bb.nch;++i) cc_release(bb.chunks[i].ce);
         free(bb.chunks);
     }
     free(raw);free(proc);free(l1);free(cbuf);free(tin);free(tout);
@@ -400,7 +454,7 @@ int main(int argc, char **argv){
     const char *in=argv[1], *out=argv[2], *profile="conservative";
     float quality=8.0f;
     long SB=1024, BAND=512;
-    int nthreads=0, niothreads=0, qcap=0, process=1;
+    int nthreads=0, niothreads=0, qcap=0, process=1; double cache_gb=12.0;
     char meta_path[PATH_MAX]; meta_path[0]=0;
     for(int i=3;i<argc;i++){
         if      (!strcmp(argv[i],"--profile")&&i+1<argc)   profile=argv[++i];
@@ -412,6 +466,7 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--sb")&&i+1<argc)        SB=atol(argv[++i]);
         else if (!strcmp(argv[i],"--band")&&i+1<argc)      BAND=atol(argv[++i]);
         else if (!strcmp(argv[i],"--no-process"))          process=0;
+        else if (!strcmp(argv[i],"--cache-gb")&&i+1<argc)  cache_gb=atof(argv[++i]);
         else { fprintf(stderr,"unknown arg: %s\n",argv[i]); return 2; }
     }
     if(SB%512||SB<512){fprintf(stderr,"--sb must be a multiple of 512\n");return 2;}
@@ -479,6 +534,7 @@ int main(int argc, char **argv){
     int nc_=nthreads>0?nthreads:(int)(ncpu<8?ncpu:8);
     int ni_=niothreads>0?niothreads:(is_s3(in)?nc_*2:(nc_<4?nc_:4));
     int qc_=qcap>0?qcap:nc_+2;
+    cc_init((size_t)(cache_gb*1e9));
     bq_init(&sc.q,qc_,ni_);
     fprintf(stderr,"units %ld (%ldx%ld tiles x %ld bands), SB=%ld BAND=%ld halo=%ld, "
                    "%d compute + %d io threads, queue %d\n",
@@ -490,6 +546,8 @@ int main(int argc, char **argv){
     for(int i=0;i<ni_;i++) pthread_join(iot[i],NULL);
     for(int i=0;i<nc_;i++) pthread_join(cot[i],NULL);
     free(iot);free(cot);
+    fprintf(stderr,"chunk cache: %ld hits / %ld misses (%.0f%% re-fetch avoided)\n",
+            g_cc.hits,g_cc.misses,g_cc.hits+g_cc.misses?100.0*g_cc.hits/(g_cc.hits+g_cc.misses):0.0);
     fprintf(stderr,"stream done: %ld L0 + %ld L1 chunks, %ld empty units skipped, "
                    "%ld GETs (%ld absent, %.1f GB)\n",
             atomic_load(&sc.l0app),atomic_load(&sc.l1app),atomic_load(&sc.skipped),
