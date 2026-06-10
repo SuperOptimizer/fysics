@@ -152,6 +152,20 @@ The global state is a 256-long histogram (a few KB) — **20TB never sits in RAM
 and a per-chunk operation never sees inconsistent global stats. (The ring
 detector follows the same two-pass pattern with a per-slab radial profile.)
 
+## Streaming process+export (vca_export)
+
+fysics owns the FULL pipeline: `vca_export <zarr|s3://...> <out.mc>` streams an
+uncompressed OME-zarr (local or S3) through calibration + the preprocessing
+chain into a matter-compressor archive with all 8 LODs, in one pass, bounded
+RAM, no intermediate zarr. Architecture ported from volume-compressor's
+optimized vc_export_stream: occupancy from a coarse pyramid level (one tiny
+GET replaces thousands of HEADs; absent bands skipped), a downloader pool
+feeding a bounded queue so S3 latency never blocks the compute pool, chunk-
+aligned independent (XY-tile x Z-band) units appending L0/L1 lock-free, and
+the coarse tail (L2+) built from the archive itself. Hard I/O errors fail
+loudly (never silent fill). `--no-process` exports raw; `--threads/--io-
+threads/--queue/--sb/--band` tune the pipeline.
+
 ## Build (CMake)
 
 ```bash

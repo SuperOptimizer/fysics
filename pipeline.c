@@ -374,6 +374,52 @@ static double eps_for_tile(const fy_pipeline_cfg *cfg, double ecy, double ecx,
 }
 
 /* ============================================================================
+ * fy_process_buffer -- the I/O-FREE half of fy_process_chunk: process ONE inner
+ * tile from an ALREADY-READ halo'd u8 buffer. For export pipelines that own
+ * their I/O (e.g. the streaming vca_export downloader pool). `u8buf` is the
+ * hz*hy*hx region whose global origin is (rz0,ry0,rx0); the inner tile starts
+ * at global (z0,y0,x0) and spans (tz,ty,tx) (caller clamps both). vol_y/vol_x
+ * are the FULL volume Y/X (for the radial-eps / dering center). Thread-safe
+ * (allocates its own scratch). Writes tz*ty*tx u8 to out; sets *all_air.
+ * ========================================================================== */
+int fy_process_buffer(const fy_pipeline_cfg *cfg, const unsigned char *u8buf,
+                      long rz0, long ry0, long rx0, long hz, long hy, long hx,
+                      long z0, long y0, long x0, long tz, long ty, long tx,
+                      long vol_y, long vol_x,
+                      unsigned char *out, int *all_air) {
+    size_t hn = (size_t)hz * hy * hx;
+    if (!any_nonzero(u8buf, hn)) {
+        memset(out, 0, (size_t)tz * ty * tx);
+        if (all_air) *all_air = 1;
+        return 0;
+    }
+    float *f = malloc(sizeof(float)*hn), *orig = malloc(sizeof(float)*hn);
+    float *b1 = malloc(sizeof(float)*hn), *b2 = malloc(sizeof(float)*hn);
+    float *ws = malloc(sizeof(float)*4*hn);
+    if (!f||!orig||!b1||!b2||!ws){ free(f);free(orig);free(b1);free(b2);free(ws); return 1; }
+    if (cfg->have_norm) fy_norm_apply_u8(u8buf, f, hn, (unsigned char)cfg->norm_lo, (unsigned char)cfg->norm_hi);
+    else u8_to_f01(u8buf, f, hn);
+    if (cfg->have_dering && cfg->dering) fy_dering_apply(cfg->dering, f, rz0, ry0, rx0, hz, hy, hx,
+        cfg->have_norm ? 1.0 / (cfg->norm_hi - cfg->norm_lo) : 1.0 / 255.0);
+    if (cfg->have_zdrift && cfg->zdrift_factor) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, cfg->zdrift_factor);
+    memcpy(orig, f, sizeof(float) * hn);
+    { double ecy = cfg->dering_cy > 0 ? cfg->dering_cy : (vol_y - 1) / 2.0;
+      double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (vol_x - 1) / 2.0;
+      process_tile(f, orig, u8buf, (int)hz, (int)hy, (int)hx, cfg,
+                   cfg->have_dec_range, cfg->dec_lo, cfg->dec_hi, b1, b2, ws,
+                   eps_for_tile(cfg, ecy, ecx, y0, x0, ty, tx)); }
+    { long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0, oi = 0;
+      for (long zz = iz0; zz < iz0 + tz; zz++)
+      for (long yy = iy0; yy < iy0 + ty; yy++)
+      for (long xx = ix0; xx < ix0 + tx; xx++)
+          out[oi++] = quant_u8(f[((size_t)zz * hy + yy) * hx + xx],
+                               rz0 + zz, ry0 + yy, rx0 + xx, cfg->no_dither); }
+    if (all_air) *all_air = 0;
+    free(f); free(orig); free(b1); free(b2); free(ws);
+    return 0;
+}
+
+/* ============================================================================
  * fy_process_chunk -- process ONE inner tile at (z0,y0,x0) with a halo'd read,
  * using the already-calibrated cfg. The pass-2 body, factored out so the FUSED
  * v2/v3 export can pull preprocessed chunks on demand. Allocates its own scratch
@@ -389,36 +435,15 @@ int fy_process_chunk(const fy_zarr *zin, const fy_pipeline_cfg *cfg,
     long rz0 = lmax(0, z0 - halo), ry0 = lmax(0, y0 - halo), rx0 = lmax(0, x0 - halo);
     long rz1 = lmin(Z, z0 + tz + halo), ry1 = lmin(Y, y0 + ty + halo), rx1 = lmin(X, x0 + tx + halo);
     long hz = rz1 - rz0, hy = ry1 - ry0, hx = rx1 - rx0;
-    size_t hn = (size_t)hz * hy * hx;
-    long bz_max = tile + 2 * halo; size_t cap = (size_t)bz_max * bz_max * bz_max;
-    unsigned char *u8 = malloc(cap); float *f = malloc(sizeof(float)*cap);
-    float *orig = malloc(sizeof(float)*cap), *b1 = malloc(sizeof(float)*cap);
-    float *b2 = malloc(sizeof(float)*cap), *ws = malloc(sizeof(float)*4*cap);
-    if (!u8||!f||!orig||!b1||!b2||!ws){ free(u8);free(f);free(orig);free(b1);free(b2);free(ws); return 1; }
+    unsigned char *u8 = malloc((size_t)hz * hy * hx);
+    if (!u8) return 1;
     int rc = 0; int air = 1;
     if (fy_zarr_read(zin, rz0, ry0, rx0, hz, hy, hx, u8) != 0) { rc = 1; goto done; }
-    if (!any_nonzero(u8, hn)) { memset(out, 0, (size_t)tz*ty*tx); air = 1; goto done; }
-    air = 0;
-    if (cfg->have_norm) fy_norm_apply_u8(u8, f, hn, (unsigned char)cfg->norm_lo, (unsigned char)cfg->norm_hi);
-    else u8_to_f01(u8, f, hn);
-    if (cfg->have_dering && cfg->dering) fy_dering_apply(cfg->dering, f, rz0, ry0, rx0, hz, hy, hx,
-        cfg->have_norm ? 1.0 / (cfg->norm_hi - cfg->norm_lo) : 1.0 / 255.0);
-    if (cfg->have_zdrift && cfg->zdrift_factor) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, cfg->zdrift_factor);
-    memcpy(orig, f, sizeof(float) * hn);
-    { double ecy = cfg->dering_cy > 0 ? cfg->dering_cy : (Y - 1) / 2.0;
-      double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (X - 1) / 2.0;
-      process_tile(f, orig, u8, (int)hz, (int)hy, (int)hx, cfg,
-                   cfg->have_dec_range, cfg->dec_lo, cfg->dec_hi, b1, b2, ws,
-                   eps_for_tile(cfg, ecy, ecx, y0, x0, ty, tx)); }
-    { long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0, oi = 0;
-      for (long zz = iz0; zz < iz0 + tz; zz++)
-      for (long yy = iy0; yy < iy0 + ty; yy++)
-      for (long xx = ix0; xx < ix0 + tx; xx++)
-          out[oi++] = quant_u8(f[((size_t)zz * hy + yy) * hx + xx],
-                               rz0 + zz, ry0 + yy, rx0 + xx, cfg->no_dither); }
+    rc = fy_process_buffer(cfg, u8, rz0, ry0, rx0, hz, hy, hx,
+                           z0, y0, x0, tz, ty, tx, Y, X, out, &air);
 done:
     if (all_air) *all_air = air;
-    free(u8); free(f); free(orig); free(b1); free(b2); free(ws);
+    free(u8);
     return rc;
 }
 

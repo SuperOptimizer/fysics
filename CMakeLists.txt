@@ -85,7 +85,8 @@ target_include_directories(vca_export PRIVATE
 target_compile_options(vca_export PRIVATE ${FYSICS_OPT_FLAGS})
 set_source_files_properties(vendor/matter/mc_archive.c vendor/matter/mc_codec.c
   PROPERTIES COMPILE_FLAGS "-std=c23")
-target_link_libraries(vca_export PRIVATE fysics CURL::libcurl m)
+find_package(Threads REQUIRED)
+target_link_libraries(vca_export PRIVATE fysics CURL::libcurl m Threads::Threads)
 if(OpenMP_C_FOUND)
   target_link_libraries(vca_export PRIVATE OpenMP::OpenMP_C)
 endif()

@@ -471,6 +471,15 @@ int fy_calibrate(const char *in_root, fy_pipeline_cfg *cfg, int tile, int verbos
 int fy_process_chunk(const fy_zarr *zin, const fy_pipeline_cfg *cfg,
                      long z0, long y0, long x0, int tile,
                      unsigned char *out, int *out_tz, int *out_ty, int *out_tx, int *all_air);
+/* the I/O-free half of fy_process_chunk: process one inner tile from an ALREADY-READ
+ * halo'd u8 buffer (hz*hy*hx at global origin rz0/ry0/rx0; inner tile at z0/y0/x0,
+ * span tz/ty/tx -- caller clamps both to the volume). vol_y/vol_x = full volume Y/X
+ * (rotation-axis center for radial eps + dering). Thread-safe. */
+int fy_process_buffer(const fy_pipeline_cfg *cfg, const unsigned char *u8buf,
+                      long rz0, long ry0, long rx0, long hz, long hy, long hx,
+                      long z0, long y0, long x0, long tz, long ty, long tx,
+                      long vol_y, long vol_x,
+                      unsigned char *out, int *all_air);
 
 /* run the whole 2-pass pipeline zarr->zarr; cfg physics pre-filled, rest calibrated inside. */
 int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *cfg,
