@@ -293,35 +293,73 @@ static void *download_worker(void *arg){
         if(fx0<fx1&&fy0<fy1&&fz0<fz1){
             long cxa=fx0/z0->cx,cxb=(fx1-1)/z0->cx, cya=fy0/z0->cy,cyb=(fy1-1)/z0->cy;
             long cza=fz0/z0->cz,czb=(fz1-1)/z0->cz;
+            /* phase 1: resolve cache hits + collect the chunks that need fetching */
+            long need_cap=(czb-cza+1)*(cyb-cya+1)*(cxb-cxa+1);
+            long *needq=malloc(need_cap*3*sizeof(long)); long nneed=0;
             for(long qz=cza;qz<=czb;++qz)for(long qy=cya;qy<=cyb;++qy)for(long qx=cxa;qx<=cxb;++qx){
                 if(!sc->cm->present[((size_t)qz*sc->cm->ncy+qy)*sc->cm->ncx+qx]) continue;
-                /* `any` tracks the CORE (the unit's own chunks), not halo chunks */
                 int core = (qz>=vz0/z0->cz && qz*z0->cz<vz1 && qy>=vy0/z0->cy && qy*z0->cy<vy1
                             && qx>=vx0/z0->cx && qx*z0->cx<vx1);
                 centry *ce=cc_get(qz,qy,qx);
-                u8 *got; size_t gn; int fetched=0;
-                if(ce){ got=ce->bytes; gn=ce->len; if(core) any=1; }
-                else {
-                    pthread_mutex_lock(&sc->im);
-                    while(band_bytes>0 && atomic_load(&sc->inflight)>sc->inflight_cap)
-                        pthread_cond_wait(&sc->icv,&sc->im);
-                    pthread_mutex_unlock(&sc->im);
-                    fetched=1;
-                    char p[1500]; snprintf(p,sizeof p,"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
+                if(ce){
+                    if(core) any=1;
+                    if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
+                    chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
+                    chunks[nch].bytes=ce->bytes;chunks[nch].len=ce->len;chunks[nch].ce=ce;chunks[nch].fetched=0;nch++;
+                } else {
+                    needq[nneed*3]=qz; needq[nneed*3+1]=qy; needq[nneed*3+2]=qx; nneed++;
+                }
+            }
+            /* phase 2: BATCHED fetch (s3_get_batch multiplexes transfers over pooled
+             * connections -- a serial GET pays TLS+TTFB per object). Groups of 32,
+             * budget-gated between groups; local paths use the serial reader. */
+            for(long g0=0; g0<nneed; g0+=32){
+                long gN=nneed-g0<32?nneed-g0:32;
+                pthread_mutex_lock(&sc->im);
+                while(band_bytes>0 && atomic_load(&sc->inflight)>sc->inflight_cap)
+                    pthread_cond_wait(&sc->icv,&sc->im);
+                pthread_mutex_unlock(&sc->im);
+                char paths[32][1500]; s3_range_req reqs[32]; s3_response rsp[32];
+                memset(rsp,0,sizeof rsp);
+                int use_batch = is_s3(z0->dir) && gN>1;
+                for(long i=0;i<gN;++i){
+                    long qz=needq[(g0+i)*3],qy=needq[(g0+i)*3+1],qx=needq[(g0+i)*3+2];
+                    snprintf(paths[i],sizeof paths[i],"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
+                    reqs[i].url=paths[i]; reqs[i].offset=0; reqs[i].length=0;
+                }
+                if(use_batch && s3_get_batch(g_s3,reqs,gN,16,rsp)!=S3_OK){
+                    for(long i=0;i<gN;++i) s3_response_free(&rsp[i]);
+                    use_batch=0;                      /* transport failure -> serial (retries) */
+                }
+                for(long i=0;i<gN;++i){
+                    long qz=needq[(g0+i)*3],qy=needq[(g0+i)*3+1],qx=needq[(g0+i)*3+2];
+                    int core = (qz>=vz0/z0->cz && qz*z0->cz<vz1 && qy>=vy0/z0->cy && qy*z0->cy<vy1
+                                && qx>=vx0/z0->cx && qx*z0->cx<vx1);
+                    u8 *got=NULL; size_t gn=0;
                     atomic_fetch_add(&sc->io_open,1);
-                    gn=0; int err=0; got=src_get(p,&gn,&err);
-                    if(err){ atomic_fetch_add(&sc->fail,1); }
+                    if(use_batch){
+                        if(rsp[i].status==200 && rsp[i].body){
+                            got=(u8*)rsp[i].body; gn=rsp[i].body_len; rsp[i].body=NULL;
+                        } else if(rsp[i].status!=404 && rsp[i].status!=0){
+                            atomic_fetch_add(&sc->fail,1);
+                        }
+                        s3_response_free(&rsp[i]);
+                    } else {
+                        int err=0; got=src_get(paths[i],&gn,&err);
+                        if(err) atomic_fetch_add(&sc->fail,1);
+                    }
                     if(!got){ atomic_fetch_add(&sc->io_miss,1); continue; }
                     if(core) any=1;
                     atomic_fetch_add(&sc->io_bytes,(long)gn);
                     atomic_fetch_add(&sc->inflight,(long)gn);
                     band_bytes+=(long)gn;
-                    ce=cc_put(qz,qy,qx,got,gn);
+                    centry *ce=cc_put(qz,qy,qx,got,gn);
+                    if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
+                    chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
+                    chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ce;chunks[nch].fetched=1;nch++;
                 }
-                if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
-                chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
-                chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ce;chunks[nch].fetched=fetched;nch++;
             }
+            free(needq);
         }
         bandbuf b={ti,chunks,nch,any?0:1};
         bq_push(&sc->q,b);

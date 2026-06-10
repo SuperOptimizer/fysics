@@ -234,6 +234,36 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
     long cn = C0 * C1 * C2;
     unsigned char *cb = (unsigned char *)malloc(cn);   /* max chunk size */
     if (!cb) return 1;
+#ifdef FYSICS_S3
+    /* S3: BATCH the region's chunk GETs over pooled connections (one serial GET per
+     * chunk pays TLS+TTFB each, ~13 MB/s per thread; the batch multiplexes them).
+     * Responses are indexed by chunk coordinate for the assembly loop below. */
+    s3_response *batch = NULL; char *bpaths = NULL;
+    long bcz0=0,bcy0=0,bcx0=0, bnz=0,bny=0,bnx=0;
+    if (strncmp(z->root, "s3://", 5) == 0) {
+        bcz0 = z0 / C0; bcy0 = y0 / C1; bcx0 = x0 / C2;
+        bnz = (z0+dz-1)/C0 - bcz0 + 1; bny = (y0+dy-1)/C1 - bcy0 + 1; bnx = (x0+dx-1)/C2 - bcx0 + 1;
+        long nb = bnz*bny*bnx;
+        if (nb >= 2 && nb <= 1024) {
+            fy_s3_ensure();
+            batch  = calloc(nb, sizeof(s3_response));
+            bpaths = malloc((size_t)nb * 2048);
+            s3_range_req *reqs = malloc(nb * sizeof(s3_range_req));
+            if (batch && bpaths && reqs && g_fy_s3) {
+                for (long i = 0; i < nb; i++) {
+                    long qz = bcz0 + i/(bny*bnx), r = i%(bny*bnx), qy = bcy0 + r/bnx, qx = bcx0 + r%bnx;
+                    snprintf(bpaths + i*2048, 2048, "%s/0/%ld/%ld/%ld", z->root, qz, qy, qx);
+                    reqs[i].url = bpaths + i*2048; reqs[i].offset = 0; reqs[i].length = 0;
+                }
+                if (s3_get_batch(g_fy_s3, reqs, nb, 16, batch) != S3_OK) {
+                    for (long i = 0; i < nb; i++) s3_response_free(&batch[i]);
+                    free(batch); batch = NULL;   /* transport failure -> serial fallback (retries) */
+                }
+            } else { free(batch); batch = NULL; }
+            free(reqs);
+        }
+    }
+#endif
     for (long gz = z0; gz < z0 + dz; ) {
         long cz = gz / C0, lz = gz - cz * C0, hz = (lz + (z0 + dz - gz) < C0) ? lz + (z0 + dz - gz) : C0;
         long ez = (z->shape[0] - cz * C0 < C0) ? (z->shape[0] - cz * C0) : C0;   /* TRUE z-extent */
@@ -243,9 +273,30 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
             for (long gx = x0; gx < x0 + dx; ) {
                 long cx = gx / C2, lx = gx - cx * C2, hx = (lx + (x0 + dx - gx) < C2) ? lx + (x0 + dx - gx) : C2;
                 long ex = (z->shape[2] - cx * C2 < C2) ? (z->shape[2] - cx * C2) : C2;
-                long cn = ez * ey * ex;
+                long cn2 = ez * ey * ex;
                 fy_chunk_view cv;
-                if (open_chunk(z, cz, cy, cx, cn, cb, &cv) != 0) { free(cb); return 1; }
+#ifdef FYSICS_S3
+                int from_batch = 0;
+                if (batch) {
+                    long bi = (cz-bcz0)*bny*bnx + (cy-bcy0)*bnx + (cx-bcx0);
+                    s3_response *r = &batch[bi];
+                    if (r->status == 200 && r->body) {
+                        cv.p = (const unsigned char*)r->body;
+                        cv.len = (size_t)r->body_len < (size_t)cn2 ? (size_t)r->body_len : (size_t)cn2;
+                        cv.map = NULL; cv.maplen = 0; cv.heap = NULL; from_batch = 1;
+                    } else if (r->status == 404 || r->status == 0) {
+                        cv.p = NULL; cv.len = 0; cv.map = NULL; cv.maplen = 0; cv.heap = NULL; from_batch = 1;
+                    }
+                    /* other statuses: fall through to the serial path (retries) */
+                }
+                if (!from_batch)
+#endif
+                if (open_chunk(z, cz, cy, cx, cn2, cb, &cv) != 0) {
+#ifdef FYSICS_S3
+                    if (batch) { long nb=bnz*bny*bnx; for (long i=0;i<nb;i++) s3_response_free(&batch[i]); free(batch); free(bpaths); }
+#endif
+                    free(cb); return 1;
+                }
                 /* clamp the copy span to the chunk's true extent (halo reads near the volume edge
                  * must not read past the stored data). */
                 long hzc = hz < ez ? hz : ez, hyc = hy < ey ? hy : ey, hxc = hx < ex ? hx : ex;
@@ -260,6 +311,9 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
                         memcpy(dst, cv.p + soff, c);
                         if (c < want) memset(dst + c, z->fill, want - c);     /* short file tail */
                     }
+#ifdef FYSICS_S3
+                if (!from_batch)
+#endif
                 close_chunk(&cv);
                 gx = cx * C2 + hx;
             }
@@ -267,6 +321,9 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
         }
         gz = cz * C0 + hz;
     }
+#ifdef FYSICS_S3
+    if (batch) { long nb=bnz*bny*bnx; for (long i=0;i<nb;i++) s3_response_free(&batch[i]); free(batch); free(bpaths); }
+#endif
     free(cb);
     return 0;
 }

@@ -509,11 +509,9 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             free(der); der = NULL;
         }
     }
-    /* S3 inputs: each sweep thread spends ~95% of its time blocked in a GET, so
-     * oversubscribe far past ncpu to saturate the NIC (S3 needs ~100+ concurrent
-     * streams for 10-15 Gbit; network-blocked threads cost only stack RAM). */
-    int sweep_threads = strncmp(in_root, "s3://", 5) == 0 ? 128 : omp_get_max_threads();
-    #pragma omp parallel num_threads(sweep_threads)
+    /* (no thread oversubscription: fy_zarr_read batches its S3 chunk GETs via
+     * s3_get_batch -- one thread drives many multiplexed transfers) */
+    #pragma omp parallel
     {
         fy_hist_state lh; fy_hist_init(&lh);
         double *ls = (double *)calloc(Z, sizeof(double));
