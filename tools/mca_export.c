@@ -1,4 +1,4 @@
-/* vca_export.c -- STREAMING single-pass export: uncompressed OME-zarr (local or s3://)
+/* mca_export.c -- STREAMING single-pass export: uncompressed OME-zarr (local or s3://)
  * -> fysics preprocess -> matter-compressor archive (.mc), all LODs, bounded RAM.
  *
  * Architecture ported from volume-compressor's vc_export_stream (the optimized tiled
@@ -543,7 +543,7 @@ int main(int argc, char **argv){
                *eq=0;apply_meta(&cfg,line,atof(eq+1));nmeta++;}pclose(pp);}
         if(cfg.window_hi>cfg.window_lo){double af=(0.0-cfg.window_lo)/(cfg.window_hi-cfg.window_lo);
             if(af<0)af=0;if(af>1)af=1;cfg.air_thresh=af;}
-        fprintf(stderr,"vca_export: %d meta keys from %s\n",nmeta,meta_path);
+        fprintf(stderr,"mca_export: %d meta keys from %s\n",nmeta,meta_path);
     }
 
     /* ---- parse level 0 + occupancy ---- */
@@ -626,6 +626,6 @@ int main(int argc, char **argv){
     free(cfg.zdrift_factor);
     if(cfg.dering){fy_dering_free(cfg.dering);free(cfg.dering);}
     cm.present?free(cm.present):(void)0;
-    fprintf(stderr,"vca_export: wrote %s\n",out);
+    fprintf(stderr,"mca_export: wrote %s\n",out);
     return 0;
 }

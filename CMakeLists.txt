@@ -75,26 +75,26 @@ add_custom_command(TARGET fysics-process POST_BUILD
           ${CMAKE_CURRENT_SOURCE_DIR}/tools/read_meta.py
           $<TARGET_FILE_DIR:fysics-process>/read_meta.py)
 
-# ---- vca_export: FUSED single-pass preprocess -> matter-compressor archive, reads local OR s3:// ----
+# ---- mca_export: FUSED single-pass preprocess -> matter-compressor archive, reads local OR s3:// ----
 # Links the S3-enabled fysics lib + the vendored matter-compressor codec (callback-driven build).
-add_executable(vca_export
-  tools/vca_export.c
+add_executable(mca_export
+  tools/mca_export.c
   vendor/matter/mc_archive.c vendor/matter/mc_codec.c)
-target_include_directories(vca_export PRIVATE
+target_include_directories(mca_export PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/vendor/matter)
-target_compile_options(vca_export PRIVATE ${FYSICS_OPT_FLAGS})
+target_compile_options(mca_export PRIVATE ${FYSICS_OPT_FLAGS})
 set_source_files_properties(vendor/matter/mc_archive.c vendor/matter/mc_codec.c
   PROPERTIES COMPILE_FLAGS "-std=c23")
 find_package(Threads REQUIRED)
-target_link_libraries(vca_export PRIVATE fysics CURL::libcurl m Threads::Threads)
+target_link_libraries(mca_export PRIVATE fysics CURL::libcurl m Threads::Threads)
 if(OpenMP_C_FOUND)
-  target_link_libraries(vca_export PRIVATE OpenMP::OpenMP_C)
+  target_link_libraries(mca_export PRIVATE OpenMP::OpenMP_C)
 endif()
-add_custom_command(TARGET vca_export POST_BUILD
+add_custom_command(TARGET mca_export POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy
           ${CMAKE_CURRENT_SOURCE_DIR}/tools/read_meta.py
-          $<TARGET_FILE_DIR:vca_export>/read_meta.py)
-install(TARGETS vca_export RUNTIME DESTINATION bin)
+          $<TARGET_FILE_DIR:mca_export>/read_meta.py)
+install(TARGETS mca_export RUNTIME DESTINATION bin)
 
 # ---- tests ----
 enable_testing()

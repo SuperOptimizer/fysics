@@ -152,9 +152,9 @@ The global state is a 256-long histogram (a few KB) — **20TB never sits in RAM
 and a per-chunk operation never sees inconsistent global stats. (The ring
 detector follows the same two-pass pattern with a per-slab radial profile.)
 
-## Streaming process+export (vca_export)
+## Streaming process+export (mca_export)
 
-fysics owns the FULL pipeline: `vca_export <zarr|s3://...> <out.mc>` streams an
+fysics owns the FULL pipeline: `mca_export <zarr|s3://...> <out.mc>` streams an
 uncompressed OME-zarr (local or S3) through calibration + the preprocessing
 chain into a matter-compressor archive with all 8 LODs, bounded RAM, no
 intermediate zarr. Two passes over the input by necessity (the global
