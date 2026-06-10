@@ -570,10 +570,19 @@ int main(int argc, char **argv){
     sc.pz=((z0.sz+2*MCC-1)/(2*MCC))*(2*MCC);
     sc.ntx=(sc.px+SB-1)/SB; sc.nty=(sc.py+SB-1)/SB; sc.nbz=(sc.pz+BAND-1)/BAND;
     sc.nunits=sc.ntx*sc.nty*sc.nbz;
+    /* AUTO-SIZING for the standard export fleet: compute instances provision
+     * 2 GB RAM per hardware thread (N threads -> 2N GB). Budget split:
+     *   compute = 3N/4 workers (~1.3 GB each at SB=1024)  ~ 1.0N GB
+     *   in-flight fetched chunks                           ~ 0.5N GB
+     *   chunk cache                                        ~ 0.2N GB
+     *   slack (archive mmap, kernel, calib)                ~ 0.3N GB
+     * Every term is overridable (--threads/--io-threads/--queue/--mem-gb/--cache-gb). */
     long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<1)ncpu=4;
-    int nc_=nthreads>0?nthreads:(int)(ncpu<8?ncpu:8);
-    int ni_=niothreads>0?niothreads:(is_s3(in)?nc_*2:(nc_<4?nc_:4));
-    int qc_=qcap>0?qcap:nc_+2;
+    int nc_=nthreads>0?nthreads:(int)(ncpu*3/4<2?2:ncpu*3/4);
+    int ni_=niothreads>0?niothreads:(is_s3(in)?(int)(ncpu*2):(nc_<4?nc_:4));
+    int qc_=qcap>0?qcap:nc_/2+2;
+    if(mem_gb==24.0)  mem_gb=ncpu/2.0;     /* defaults only when not user-set */
+    if(cache_gb==12.0) cache_gb=ncpu/5.0;
     cc_init((size_t)(cache_gb*1e9));
     sc.inflight_cap=(long)(mem_gb*1e9); atomic_store(&sc.inflight,0);
     pthread_mutex_init(&sc.im,NULL); pthread_cond_init(&sc.icv,NULL);
