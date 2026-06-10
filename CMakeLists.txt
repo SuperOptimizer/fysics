@@ -79,11 +79,11 @@ add_custom_command(TARGET fysics-process POST_BUILD
 # Links the S3-enabled fysics lib + the vendored matter-compressor codec (callback-driven build).
 add_executable(mca_export
   tools/mca_export.c
-  vendor/matter/mc_archive.c vendor/matter/mc_codec.c)
+  vendor/matter/matter_compressor.c)
 target_include_directories(mca_export PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/vendor/matter)
 target_compile_options(mca_export PRIVATE ${FYSICS_OPT_FLAGS})
-set_source_files_properties(vendor/matter/mc_archive.c vendor/matter/mc_codec.c
+set_source_files_properties(vendor/matter/matter_compressor.c
   PROPERTIES COMPILE_FLAGS "-std=c23")
 find_package(Threads REQUIRED)
 target_link_libraries(mca_export PRIVATE fysics CURL::libcurl m Threads::Threads)
