@@ -67,8 +67,9 @@ static u8 *src_get(const char *path, size_t *len, int *err){
         s3_status st=s3_get(g_s3,path,&r);
         u8 *out=NULL;
         if(st==S3_OK && r.status==200 && r.body){
-            out=malloc(r.body_len);
-            if(out){ memcpy(out,r.body,r.body_len); if(len)*len=r.body_len; }
+            /* steal the response body (libs3 frees it with plain free()) -- the
+             * stream fetches ~TBs through here; no copy. */
+            out=(u8*)r.body; if(len)*len=r.body_len; r.body=NULL;
         } else if(r.status!=404) { if(err)*err=1; }   /* 404 = absent chunk, not an error */
         s3_response_free(&r);
         return out;
