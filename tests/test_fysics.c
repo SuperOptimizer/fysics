@@ -179,6 +179,127 @@ static void test_dering(void) {
     fy_dering_free(&dt); fy_dering_free(&d); free(vol); free(f);
 }
 
+/* full-complex reference deconv (the pre-rfft implementation, via the public FFT):
+ * reflect-pad to fy_next_fft_size, fft3d, multiply by capped Wiener weight, ifft, crop. */
+static int ref_reflect(int i, int n) {
+    if (n == 1) return 0;
+    while (i < 0 || i >= n) { if (i < 0) i = -i - 1; if (i >= n) i = 2 * n - i - 1; }
+    return i;
+}
+static void ref_deconvolve(const float *in, float *out, int nz, int ny, int nx,
+                           const fy_physics *p, double reg) {
+    int pz = fy_next_fft_size(nz), py = fy_next_fft_size(ny), px = fy_next_fft_size(nx);
+    size_t np = (size_t)pz * py * px;
+    float *re = malloc(sizeof(float) * np), *im = calloc(np, sizeof(float));
+    for (int z = 0; z < pz; z++) for (int y = 0; y < py; y++) {
+        int sz = ref_reflect(z, nz), sy = ref_reflect(y, ny);
+        for (int x = 0; x < px; x++)
+            re[((size_t)z*py + y)*px + x] = in[((size_t)sz*ny + sy)*nx + ref_reflect(x, nx)];
+    }
+    fy_fft3d(re, im, pz, py, px, -1);
+    for (int z = 0; z < pz; z++) for (int y = 0; y < py; y++) for (int x = 0; x < px; x++) {
+        double fz = (z <= pz/2) ? (double)z/pz : (double)(z-pz)/pz;
+        double fy = (y <= py/2) ? (double)y/py : (double)(y-py)/py;
+        double fx = (x <= px/2) ? (double)x/px : (double)(x-px)/px;
+        double fr = sqrt(fz*fz + fy*fy + fx*fx);
+        double H = fy_recon_transfer(fr, p);
+        double w = H / (H*H + reg);
+        if (w > 8.0) w = 8.0;                       /* FY_MAX_DECONV_GAIN */
+        re[((size_t)z*py + y)*px + x] *= (float)w;
+        im[((size_t)z*py + y)*px + x] *= (float)w;
+    }
+    fy_fft3d(re, im, pz, py, px, +1);
+    fy_fft3d_normalize(re, im, pz, py, px);
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++)
+        out[((size_t)z*ny + y)*nx + x] = re[((size_t)z*py + y)*px + x];
+    free(re); free(im);
+}
+
+static void test_deconv_rfft_equivalence(void) {
+    /* the half-spectrum (R2C) deconv must match the full-complex reference,
+     * incl. odd crop dims (exercises the unpaired-row paths) */
+    int nz = 22, ny = 27, nx = 30;                  /* pads to 24 x 32 x 32 */
+    size_t n = (size_t)nz * ny * nx;
+    float *in = malloc(sizeof(float)*n), *a = malloc(sizeof(float)*n), *b = malloc(sizeof(float)*n);
+    unsigned int rng = 99;
+    for (size_t i = 0; i < n; i++) {
+        rng = rng*1664525u + 1013904223u;
+        in[i] = ((rng >> 8) & 0xFFFF) / 65535.0f;
+    }
+    fy_physics p = {1000.0, 78.0, 220.0, 2.4, 1.2, 4.0};
+    CHECK(fy_deconvolve(in, a, nz, ny, nx, &p, 0.015) == 0, "rfft deconv runs");
+    ref_deconvolve(in, b, nz, ny, nx, &p, 0.015);
+    double maxd = 0, scale = 0;
+    for (size_t i = 0; i < n; i++) {
+        double d = fabs(a[i] - b[i]); if (d > maxd) maxd = d;
+        double s = fabs(b[i]); if (s > scale) scale = s;
+    }
+    CHECK(maxd < 1e-3 * (scale > 1 ? scale : 1), "rfft deconv == full-complex reference (LUT-tolerance)");
+    free(in); free(a); free(b);
+}
+
+static void test_noise_aniso(void) {
+    /* white noise blurred 3-tap along z -> rho_z >> rho_xy; ratio detects it */
+    int nz = 64, ny = 64, nx = 64; size_t n = (size_t)nz*ny*nx;
+    float *v = malloc(sizeof(float)*n), *b = malloc(sizeof(float)*n);
+    unsigned int rng = 42;
+    for (size_t i = 0; i < n; i++) {
+        rng = rng*1664525u + 1013904223u;
+        v[i] = 0.5f + (((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f) * 0.1f;
+    }
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        size_t i = ((size_t)z*ny+y)*nx+x;
+        size_t zm = z > 0 ? i - (size_t)ny*nx : i, zp = z < nz-1 ? i + (size_t)ny*nx : i;
+        b[i] = 0.25f*v[zm] + 0.5f*v[i] + 0.25f*v[zp];
+    }
+    double rz, rxy;
+    CHECK(fy_noise_aniso(b, nz, ny, nx, &rz, &rxy) == 0, "noise aniso runs");
+    CHECK(rz > rxy + 0.1, "z-blurred noise: rho_z > rho_xy");
+    double rz2, rxy2;
+    CHECK(fy_noise_aniso(v, nz, ny, nx, &rz2, &rxy2) == 0 && fabs(rz2 - rxy2) < 0.08,
+          "isotropic noise: rho_z ~ rho_xy");
+    free(v); free(b);
+}
+
+static void blur3_axis(const float *in, float *out, int nz, int ny, int nx, int axis) {
+    size_t s = axis == 0 ? (size_t)ny*nx : (axis == 1 ? (size_t)nx : 1);
+    int len[3] = {nz, ny, nx};
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        size_t i = ((size_t)z*ny+y)*nx+x;
+        int pos = axis == 0 ? z : (axis == 1 ? y : x);
+        size_t m = pos > 0 ? i - s : i, p = pos < len[axis]-1 ? i + s : i;
+        out[i] = 0.25f*in[m] + 0.5f*in[i] + 0.25f*in[p];
+    }
+}
+
+static void test_matched_aniso(void) {
+    /* volume blurred MORE in z; the anisotropic matched inverse recovers z detail better */
+    int nz = 48, ny = 48, nx = 48; size_t n = (size_t)nz*ny*nx;
+    float *v = malloc(sizeof(float)*n), *bl = malloc(sizeof(float)*n), *tmp = malloc(sizeof(float)*n);
+    float *iso = malloc(sizeof(float)*n), *ani = malloc(sizeof(float)*n);
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++)
+        v[((size_t)z*ny+y)*nx+x] = 0.5f + 0.2f*sinf(z*1.1f) + 0.2f*sinf(x*1.1f);
+    blur3_axis(v, tmp, nz, ny, nx, 0);          /* z, twice (broader) */
+    blur3_axis(tmp, bl, nz, ny, nx, 0);
+    blur3_axis(bl, tmp, nz, ny, nx, 2);         /* x, once */
+    memcpy(bl, tmp, sizeof(float)*n);
+    fy_physics p = {1000, 78, 220, 2.4, 0, 0, 1.0, 0};   /* PSF only, no unsharp */
+    fy_deconvolve_matched(bl, iso, nz, ny, nx, &p, 0.05);
+    p.psf_sigma_z_vox = 1.4;
+    fy_deconvolve_matched(bl, ani, nz, ny, nx, &p, 0.05);
+    double dz_t = 0, dz_i = 0, dz_a = 0;
+    int fin = 1;
+    for (int z = 1; z < nz-1; z++) for (int y = 8; y < ny-8; y++) for (int x = 8; x < nx-8; x++) {
+        size_t i = ((size_t)z*ny+y)*nx+x, s = (size_t)ny*nx;
+        dz_t += fabs(v[i+s]-v[i-s]); dz_i += fabs(iso[i+s]-iso[i-s]); dz_a += fabs(ani[i+s]-ani[i-s]);
+        if (!isfinite(ani[i])) fin = 0;
+    }
+    CHECK(fin, "aniso matched deconv output finite");
+    CHECK(dz_a > dz_i * 1.02, "aniso inverse recovers more z detail than isotropic");
+    CHECK(dz_a < dz_t * 1.5, "aniso inverse does not overshoot wildly");
+    free(v); free(bl); free(tmp); free(iso); free(ani);
+}
+
 static void test_paganin_transfer(void) {
     fy_physics p = {1000.0, 78.0, 220.0, 2.4, 1.2, 4.0};
     /* nabu reference values (cycles/voxel grid, px=2.4): computed in python */
@@ -821,6 +942,9 @@ int main(void) {
     test_fft_radix3();
     test_guided_fast();
     test_dering();
+    test_noise_aniso();
+    test_matched_aniso();
+    test_deconv_rfft_equivalence();
     test_warp_identity();
     test_warp_translation();
     test_warp_roundtrip();

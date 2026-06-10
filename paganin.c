@@ -137,39 +137,89 @@ typedef double (*radial_weight_fn)(double fr, const fy_physics *p, double param)
 
 #define FY_DECONV_LUT_N 4096
 
+/* fz2_scale: anisotropic-PSF support. The z frequency axis is scaled by
+ * (sigma_z/sigma_xy)^2 before the radial weight lookup, which makes the Gaussian
+ * PSF factor exp(-2 pi^2 sigma_xy^2 u) EXACTLY the anisotropic PSF inverse (the
+ * unsharp factor is evaluated at the scaled radius too -- a small approximation,
+ * fine at the measured ~1.17x ratios). 1.0 = isotropic. */
+/* REAL-INPUT path: the volume is real and the weight is real and even, so the whole
+ * pipeline runs on the Hermitian HALF-spectrum (kx in [0, px/2]):
+ *   - X pass: two-for-one packed R2C (two real rows per complex FFT), with the
+ *     reflect-padding fused into the row gather (the full padded volume is never built);
+ *   - Y/Z passes: complex FFTs over hx = px/2+1 columns instead of px (~half the work);
+ *   - inverse X (C2R) only for the rows that survive the crop.
+ * ~2x less FFT work and ~2x less memory than the previous full-complex path. */
 static int deconv_radial(const float *in, float *out, int nz, int ny, int nx,
                          const fy_physics *p, double param, radial_weight_fn wfn,
-                         double cap) {
+                         double cap, double fz2_scale) {
     int pz = fy_next_fft_size(nz), py = fy_next_fft_size(ny), px = fy_next_fft_size(nx);
-    size_t np = (size_t)pz * py * px;
-    float *re = (float *)malloc(sizeof(float) * np);
-    float *im = (float *)calloc(np, sizeof(float));
-    if (!re || !im) { free(re); free(im); return 1; }
+    int hx = px / 2 + 1;
+    size_t nh = (size_t)pz * py * hx;
+    float *hre = (float *)malloc(sizeof(float) * nh);
+    float *him = (float *)malloc(sizeof(float) * nh);
+    int maxn = px > py ? (px > pz ? px : pz) : (py > pz ? py : pz);
+    float *lr = (float *)malloc(sizeof(float) * maxn);
+    float *li = (float *)malloc(sizeof(float) * maxn);
+    if (!hre || !him || !lr || !li) { free(hre); free(him); free(lr); free(li); return 1; }
 
+    /* ---- forward X (R2C, two rows per FFT, reflect-pad fused into the gather) ---- */
     for (int z = 0; z < pz; z++) {
         int sz = reflect(z, nz);
-        for (int y = 0; y < py; y++) {
-            int sy = reflect(y, ny);
-            size_t drow = ((size_t)z * py + y) * px;
-            size_t srow = ((size_t)sz * ny + sy) * nx;
-            for (int x = 0; x < px; x++)
-                re[drow + x] = in[srow + reflect(x, nx)];
+        for (int y = 0; y < py; y += 2) {
+            int sy0 = reflect(y, ny);
+            const float *rA = in + ((size_t)sz * ny + sy0) * nx;
+            int hasB = y + 1 < py;
+            const float *rB = hasB ? in + ((size_t)sz * ny + reflect(y + 1, ny)) * nx : NULL;
+            for (int x = 0; x < px; x++) {
+                int sx = reflect(x, nx);
+                lr[x] = rA[sx];
+                li[x] = hasB ? rB[sx] : 0.0f;
+            }
+            fy_fft1d(lr, li, px, -1);
+            /* untangle: A = (L(k)+conj(L(-k)))/2, B = (L(k)-conj(L(-k)))/(2i) */
+            float *ar = hre + ((size_t)z * py + y) * hx;
+            float *ai = him + ((size_t)z * py + y) * hx;
+            float *br = hasB ? hre + ((size_t)z * py + y + 1) * hx : NULL;
+            float *bi = hasB ? him + ((size_t)z * py + y + 1) * hx : NULL;
+            for (int k = 0; k < hx; k++) {
+                int mk = k == 0 ? 0 : px - k;     /* (px - k) mod px */
+                ar[k] = 0.5f * (lr[k] + lr[mk]);
+                ai[k] = 0.5f * (li[k] - li[mk]);
+                if (hasB) {
+                    br[k] = 0.5f * (li[k] + li[mk]);
+                    bi[k] = 0.5f * (lr[mk] - lr[k]);
+                }
+            }
         }
     }
 
-    fy_fft3d(re, im, pz, py, px, -1);
+    /* ---- forward Y then Z (complex, half-spectrum columns) ---- */
+    for (int z = 0; z < pz; z++)
+        for (int k = 0; k < hx; k++) {
+            size_t base = (size_t)z * py * hx + k;
+            for (int y = 0; y < py; y++) { lr[y] = hre[base + (size_t)y * hx]; li[y] = him[base + (size_t)y * hx]; }
+            fy_fft1d(lr, li, py, -1);
+            for (int y = 0; y < py; y++) { hre[base + (size_t)y * hx] = lr[y]; him[base + (size_t)y * hx] = li[y]; }
+        }
+    for (int y = 0; y < py; y++)
+        for (int k = 0; k < hx; k++) {
+            size_t base = (size_t)y * hx + k, zs = (size_t)py * hx;
+            for (int z = 0; z < pz; z++) { lr[z] = hre[base + (size_t)z * zs]; li[z] = him[base + (size_t)z * zs]; }
+            fy_fft1d(lr, li, pz, -1);
+            for (int z = 0; z < pz; z++) { hre[base + (size_t)z * zs] = lr[z]; him[base + (size_t)z * zs] = li[z]; }
+        }
 
-    /* per-axis squared frequencies (cycles/voxel) */
+    /* ---- weight multiply over the half-spectrum (radial LUT over f^2) ---- */
     double *fz2 = (double *)malloc(sizeof(double) * pz);
     double *fy2 = (double *)malloc(sizeof(double) * py);
-    double *fx2 = (double *)malloc(sizeof(double) * px);
-    if (!fz2 || !fy2 || !fx2) { free(re); free(im); free(fz2); free(fy2); free(fx2); return 1; }
+    double *fx2 = (double *)malloc(sizeof(double) * hx);
+    if (!fz2 || !fy2 || !fx2) { free(hre); free(him); free(lr); free(li); free(fz2); free(fy2); free(fx2); return 1; }
     double mz = 0, my = 0, mx = 0;
-    for (int i = 0; i < pz; i++) { double f = (i <= pz/2) ? (double)i/pz : (double)(i-pz)/pz; fz2[i] = f*f; if (fz2[i] > mz) mz = fz2[i]; }
+    if (fz2_scale <= 0) fz2_scale = 1.0;
+    for (int i = 0; i < pz; i++) { double f = (i <= pz/2) ? (double)i/pz : (double)(i-pz)/pz; fz2[i] = f*f*fz2_scale; if (fz2[i] > mz) mz = fz2[i]; }
     for (int i = 0; i < py; i++) { double f = (i <= py/2) ? (double)i/py : (double)(i-py)/py; fy2[i] = f*f; if (fy2[i] > my) my = fy2[i]; }
-    for (int i = 0; i < px; i++) { double f = (i <= px/2) ? (double)i/px : (double)(i-px)/px; fx2[i] = f*f; if (fx2[i] > mx) mx = fx2[i]; }
+    for (int i = 0; i < hx; i++) { double f = (double)i/px; fx2[i] = f*f; if (fx2[i] > mx) mx = fx2[i]; }
 
-    /* weight LUT over u = f^2 in [0, umax] */
     float lut[FY_DECONV_LUT_N + 1];
     double umax = mz + my + mx;
     double us = FY_DECONV_LUT_N / umax;
@@ -178,34 +228,67 @@ static int deconv_radial(const float *in, float *out, int nz, int ny, int nx,
         if (cap > 0 && w > cap) w = cap;
         lut[i] = (float)w;
     }
-
     for (int z = 0; z < pz; z++) {
         for (int y = 0; y < py; y++) {
-            size_t row = ((size_t)z * py + y) * px;
+            size_t row = ((size_t)z * py + y) * hx;
             double fzy = fz2[z] + fy2[y];
-            for (int x = 0; x < px; x++) {
-                double t = (fzy + fx2[x]) * us;
+            for (int k = 0; k < hx; k++) {
+                double t = (fzy + fx2[k]) * us;
                 int ti = (int)t;
                 if (ti >= FY_DECONV_LUT_N) ti = FY_DECONV_LUT_N - 1;
                 float w = lut[ti] + (lut[ti + 1] - lut[ti]) * (float)(t - ti);
-                re[row + x] *= w;
-                im[row + x] *= w;
+                hre[row + k] *= w;
+                him[row + k] *= w;
             }
         }
     }
 
-    fy_fft3d(re, im, pz, py, px, +1);
-    fy_fft3d_normalize(re, im, pz, py, px);
-
-    for (int z = 0; z < nz; z++)
-        for (int y = 0; y < ny; y++) {
-            size_t drow = ((size_t)z * ny + y) * nx;
-            size_t srow = ((size_t)z * py + y) * px;
-            for (int x = 0; x < nx; x++)
-                out[drow + x] = re[srow + x];
+    /* ---- inverse Z then Y (complex, half-spectrum columns) ---- */
+    for (int y = 0; y < py; y++)
+        for (int k = 0; k < hx; k++) {
+            size_t base = (size_t)y * hx + k, zs = (size_t)py * hx;
+            for (int z = 0; z < pz; z++) { lr[z] = hre[base + (size_t)z * zs]; li[z] = him[base + (size_t)z * zs]; }
+            fy_fft1d(lr, li, pz, +1);
+            for (int z = 0; z < pz; z++) { hre[base + (size_t)z * zs] = lr[z]; him[base + (size_t)z * zs] = li[z]; }
+        }
+    for (int z = 0; z < nz; z++)   /* only z rows that survive the crop */
+        for (int k = 0; k < hx; k++) {
+            size_t base = (size_t)z * py * hx + k;
+            for (int y = 0; y < py; y++) { lr[y] = hre[base + (size_t)y * hx]; li[y] = him[base + (size_t)y * hx]; }
+            fy_fft1d(lr, li, py, +1);
+            for (int y = 0; y < py; y++) { hre[base + (size_t)y * hx] = lr[y]; him[base + (size_t)y * hx] = li[y]; }
         }
 
-    free(re); free(im); free(fz2); free(fy2); free(fx2);
+    /* ---- inverse X (C2R, two rows per FFT), normalize, crop ---- */
+    float invN = 1.0f / ((float)pz * (float)py * (float)px);
+    for (int z = 0; z < nz; z++) {
+        for (int y = 0; y < ny; y += 2) {
+            int hasB = y + 1 < ny;
+            const float *ar = hre + ((size_t)z * py + y) * hx;
+            const float *ai = him + ((size_t)z * py + y) * hx;
+            const float *br = hasB ? hre + ((size_t)z * py + y + 1) * hx : NULL;
+            const float *bi = hasB ? him + ((size_t)z * py + y + 1) * hx : NULL;
+            /* repack L(k) = A(k) + i*B(k); Hermitian extension for k > px/2 */
+            for (int k = 0; k < hx; k++) {
+                lr[k] = ar[k] - (hasB ? bi[k] : 0.0f);
+                li[k] = ai[k] + (hasB ? br[k] : 0.0f);
+            }
+            for (int k = hx; k < px; k++) {
+                int m = px - k;
+                lr[k] = ar[m] + (hasB ? bi[m] : 0.0f);
+                li[k] = -ai[m] + (hasB ? br[m] : 0.0f);
+            }
+            fy_fft1d(lr, li, px, +1);
+            float *oA = out + ((size_t)z * ny + y) * nx;
+            float *oB = hasB ? out + ((size_t)z * ny + y + 1) * nx : NULL;
+            for (int x = 0; x < nx; x++) {
+                oA[x] = lr[x] * invN;
+                if (hasB) oB[x] = li[x] * invN;
+            }
+        }
+    }
+
+    free(hre); free(him); free(lr); free(li); free(fz2); free(fy2); free(fx2);
     return 0;
 }
 
@@ -221,7 +304,7 @@ int fy_deconvolve(const float *in, float *out,
     /* reg <= 0 -> derive a noise-safe value from the volume physics (recommended). */
     if (reg <= 0.0) reg = fy_auto_reg(p, 0.015);
     /* hard gain cap so a mis-set reg can never amplify the noise floor */
-    return deconv_radial(in, out, nz, ny, nx, p, reg, wiener_weight, FY_MAX_DECONV_GAIN);
+    return deconv_radial(in, out, nz, ny, nx, p, reg, wiener_weight, FY_MAX_DECONV_GAIN, 1.0);
 }
 
 /* OPERATOR-MATCHED Wiener inverse of nabu's MEASURED EFFECTIVE forward operator.
@@ -248,5 +331,12 @@ int fy_deconvolve_matched(const float *in, float *out,
                           int nz, int ny, int nx,
                           const fy_physics *p, double tikhonov) {
     if (tikhonov <= 0) tikhonov = 0.05;
-    return deconv_radial(in, out, nz, ny, nx, p, tikhonov, matched_transfer, 0.0);
+    /* anisotropic PSF: scale the z frequency axis by (sigma_z/sigma_xy)^2 */
+    double fzs = 1.0;
+    double sxy = p->psf_sigma_vox > 0 ? p->psf_sigma_vox : 1.0;
+    if (p->psf_sigma_z_vox > 0 && sxy > 0) {
+        double rr = p->psf_sigma_z_vox / sxy;
+        fzs = rr * rr;
+    }
+    return deconv_radial(in, out, nz, ny, nx, p, tikhonov, matched_transfer, 0.0, fzs);
 }

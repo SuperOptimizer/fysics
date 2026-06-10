@@ -1,6 +1,8 @@
 # ESRF / nabu reconstruction-pipeline audit
 
-**Status:** durable reference. Last revised 2026-06-05.
+**Status:** durable reference. Last revised 2026-06-10 (verified against the actual
+nabu 2026.1.0-alpha1 source, commit 9150912, gitlab.esrf.fr/tomotools/nabu — the code
+that reconstructed all 2025/2026 BM18 scans).
 **Scope:** the BM18 / nabu reconstruction pipeline as applied to Herculaneum scroll
 volumes (dense u8/u16, ~1.1–9.4 µm voxels, single-distance Paganin phase retrieval
 applied during reconstruction). For *every* operator in that pipeline, in order, this
@@ -410,8 +412,12 @@ the first three:
 2. **Is nabu's unsharp enabled per scan? Any ring removal baked in?** — *unsharp ANSWERED
    [empirical]:* **enabled on every scroll volume** (`coeff = 4.0`, `sigma` 2.5 or 1.2),
    22–37 % of signal — so fysics inverts it jointly and does **not** double-sharpen (§6).
-   Whether sinogram ring removal was applied: assume yes per standard pipeline; it is
-   *not-recoverable* regardless, and residual rings are handled heuristically (§4).
+   Whether sinogram ring removal was applied: **ANSWERED (2026-06, from nabu
+   2026.1.0-alpha1 source + metadata)** — **NO.** nabu's `sino_rings_correction`
+   defaults to empty/None (`nabu/pipeline/fullfield/nabu_config.py:179-183`) and the
+   scroll metadata contains no `sino_rings` field, so the delivered volumes carry
+   **unfiltered detector-stripe rings** — which is why `fy_dering_*` finds 2-4 u8
+   rings: it is the ONLY ring treatment anywhere in the chain (§4).
 
 3. **Optimal δ/β & reduced regularization for these dense u8 volumes** — *PARTIALLY
    ANSWERED [empirical].* Full inversion over-inverts ≤4.3 µm volumes; the measured optimum
@@ -429,14 +435,41 @@ the first three:
 
 ### Current gaps (operators we are NOT handling that we maybe should)
 
-- **Mosaic tile seams.** The fine volume is a 19-tile fused helical mosaic [empirical].
-  Seam discontinuities are a real artifact class with **no metadata transfer** and are
-  **not yet addressed**. Not a nabu reconstruction operator, but it lands in the delivered
-  volume; a seam-aware blending/destriping pass is a candidate complement.
+- **Mosaic tile seams.** The fine volume is a 19-tile fused helical mosaic. Seam
+  discontinuities are a real artifact class and are **not yet addressed**. UPDATE
+  (2026-06): the per-tile geometry IS now in metadata (`mosaic.tile_positions`,
+  per-tile windows/beam currents in `varying_fields`), so a metadata-seeded per-tile
+  gain/offset blend is feasible when prioritized.
 - **Residual-ring SOTA.** The Mäkinen 2022 correlated-noise BM4D framework jointly attacks
-  residual streaks + Poisson noise [research: claim 10,11] and outperforms our heuristic
-  ring removal in principle; it was ruled out on **cost** (~150× slower), not correctness.
-  Worth revisiting if a faster implementation appears.
+  residual streaks + Poisson noise [research: claim 10,11]; ruled out on **cost** (~150×
+  slower). The `fy_dering_*` sector-vote detect-then-subtract now covers the ring part.
+
+### Watch-item: half-acquisition transition band (not yet observed)
+
+nabu's `convert_halftomo` (`nabu/reconstruction/sinogram.py:245-267`) cross-fades the
+two 180° halves linearly over a transition band at a FIXED, computable radius; inside
+it one half's data is used, outside the other. Noise statistics shift across that
+annulus, and any gain mismatch between halves would print a circular seam there.
+Fixed-intensity noise-vs-radius scans on PHerc0139 showed no step, so nothing is
+corrected — but if a sharp circular artifact appears at one radius on some volume,
+this is the first suspect (and `fy_dering`'s sector vote would reject it as too wide;
+it would need a dedicated band correction).
+
+### Measured negatives (2026-06 diagnostics on PHerc0139 2.399 µm + PHercParis3 2.400 µm)
+
+Checked directly on the delivered volumes; recorded so they are not re-attempted:
+
+- **No radial cupping**: the air-gap mode shows no radial bowl (uniform ~5–10 u8
+  scatter offset above the window's physical zero only); outside-mask air sits exactly
+  at the predicted window level.
+- **No helical pitch banding**: no per-z spectral peak at the metadata pitch
+  (z_step / pixel ≈ 2131 slices/rev).
+- **Saturation is rare**: u8 0/255 clipping affects 0.01–0.13 % of in-mask voxels.
+- **Radial noise IS real on large scrolls**: flat-noise at fixed intensity rises ~3×
+  center→rim on PHercParis3 (half-acq coverage + path length) — now handled by the
+  pass-1 `fn(r)` fit driving a per-tile guided eps.
+- **PSF anisotropy IS real**: noise autocorrelation gives σz/σxy ≈ 1.17 — now
+  auto-measured (`fy_noise_aniso`) and inverted by the matched deconv.
 
 ---
 

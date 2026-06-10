@@ -200,3 +200,70 @@ double fy_guided_eps_for_noise(double noise_ref) {
     if (!(eps > 1e-8)) eps = 1e-8;
     return eps;
 }
+
+/* ---- noise-correlation anisotropy (PSF z/xy ratio) ----
+ * Lag-1 autocorrelation of the residual (voxel - block mean) per axis, measured in
+ * FLAT 8^3 blocks (block variance below the 20th percentile, so structure is mostly
+ * excluded and the residual is dominated by PSF-correlated noise). For a Gaussian
+ * PSF of width sigma, rho(1) = exp(-1/(4 sigma^2)) -- so the per-axis rho gives the
+ * relative PSF widths without needing edges. */
+int fy_noise_aniso(const float *v, int nz, int ny, int nx,
+                   double *rho_z, double *rho_xy) {
+    const int B = 8;
+    int bz = nz / B, by = ny / B, bx = nx / B;
+    long nb = (long)bz * by * bx;
+    if (nb < 64) return 1;
+    /* pass 1: block variances to find the flat-block threshold */
+    float *bvar = (float *)malloc(sizeof(float) * nb);
+    if (!bvar) return 1;
+    long nv = 0;
+    for (int z = 0; z < bz; z++) for (int y = 0; y < by; y++) for (int x = 0; x < bx; x++) {
+        double s = 0, s2 = 0; int nonzero = 1;
+        for (int dz = 0; dz < B; dz++) for (int dy = 0; dy < B; dy++) {
+            const float *row = v + ((size_t)(z*B+dz) * ny + (y*B+dy)) * nx + (size_t)x*B;
+            for (int dx = 0; dx < B; dx++) { float t = row[dx]; if (t <= 0) nonzero = 0; s += t; s2 += (double)t*t; }
+        }
+        if (!nonzero) continue;
+        double m = s / (B*B*B);
+        bvar[nv++] = (float)(s2 / (B*B*B) - m*m);
+    }
+    if (nv < 64) { free(bvar); return 1; }
+    /* 20th percentile threshold (nth_element-lite: sort the small array) */
+    for (long i = 1; i < nv; i++) { float k = bvar[i]; long j = i - 1;
+        while (j >= 0 && bvar[j] > k) { bvar[j+1] = bvar[j]; j--; } bvar[j+1] = k; }
+    float thresh = bvar[nv / 5];
+    /* pass 2: per-axis lag-1 products over residuals in flat blocks */
+    double num_z = 0, num_y = 0, num_x = 0, den = 0;
+    long used = 0;
+    float blk[8*8*8];
+    for (int z = 0; z < bz; z++) for (int y = 0; y < by; y++) for (int x = 0; x < bx; x++) {
+        double s = 0, s2 = 0; int nonzero = 1;
+        for (int dz = 0; dz < B; dz++) for (int dy = 0; dy < B; dy++) {
+            const float *row = v + ((size_t)(z*B+dz) * ny + (y*B+dy)) * nx + (size_t)x*B;
+            for (int dx = 0; dx < B; dx++) {
+                float t = row[dx]; if (t <= 0) nonzero = 0;
+                blk[(dz*B+dy)*B+dx] = t; s += t; s2 += (double)t*t;
+            }
+        }
+        if (!nonzero) continue;
+        double m = s / (B*B*B);
+        if (s2 / (B*B*B) - m*m > thresh) continue;
+        for (int i = 0; i < B*B*B; i++) blk[i] -= (float)m;
+        for (int dz = 0; dz < B; dz++) for (int dy = 0; dy < B; dy++) for (int dx = 0; dx < B; dx++) {
+            float c = blk[(dz*B+dy)*B+dx];
+            den += (double)c * c;
+            if (dz+1 < B) num_z += (double)c * blk[((dz+1)*B+dy)*B+dx];
+            if (dy+1 < B) num_y += (double)c * blk[(dz*B+dy+1)*B+dx];
+            if (dx+1 < B) num_x += (double)c * blk[(dz*B+dy)*B+dx+1];
+        }
+        used++;
+    }
+    free(bvar);
+    if (used < 32 || den <= 0) return 1;
+    /* lag-1 sums cover (B-1)/B of the pairs the denominator covers; the bias is the
+     * same on every axis so it cancels in the z/xy RATIO -- correct it anyway. */
+    double corr = (double)B / (B - 1);
+    *rho_z  = corr * num_z / den;
+    *rho_xy = corr * 0.5 * (num_y + num_x) / den;
+    return 0;
+}

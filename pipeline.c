@@ -91,6 +91,10 @@ static fy_physics phys_from_cfg(const fy_pipeline_cfg *c) {
     p.delta_beta = c->delta_beta; p.energy_kev = c->energy_kev; p.distance_mm = c->distance_mm;
     p.pixel_um = c->pixel_um; p.unsharp_sigma = c->unsharp_sigma; p.unsharp_coeff = c->unsharp_coeff;
     p.psf_sigma_vox = c->psf_sigma_vox;
+    /* measured PSF anisotropy (sigma_z/sigma_xy from noise autocorrelation): used
+     * by the matched deconv to invert the broader z blur of helical scans. */
+    p.psf_sigma_z_vox = (c->psf_z_ratio > 1.0 && c->psf_sigma_vox > 0)
+        ? c->psf_z_ratio * c->psf_sigma_vox : 0.0;
     return p;
 }
 static fy_physics scaled_phys_from_cfg(const fy_pipeline_cfg *c) {
@@ -210,10 +214,12 @@ static void scratch_denoise(float *buf, int nz, int ny, int nx, int passes, floa
  * `f` is the (corrected) haloed tile in [0,1]; returns the processed [0,1] in `f`.
  * `orig` = the corrected pre-deconv tile (air-blend baseline). `b1`,`b2` are caller-
  * owned per-thread scratch. u8orig = the haloed source (MUSICA rails). */
+/* guided_eps_tile <= 0 -> use cfg->guided_eps (the global calibration); a positive
+ * value overrides it (the radially-varying eps from the fn(r) fit). */
 static void process_tile(float *f, const float *orig, const unsigned char *u8orig,
                          int nz, int ny, int nx, const fy_pipeline_cfg *cfg,
                          int have_dec_range, double dec_lo, double dec_hi,
-                         float *b1, float *b2, float *ws) {
+                         float *b1, float *b2, float *ws, double guided_eps_tile) {
     size_t N = (size_t)nz * ny * nx;
 
     /* (b) DECONV (STORED off for BM18; matched Wiener when requested else plain auto-reg).
@@ -246,9 +252,12 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
         }
     }
 
-    /* (c) GUIDED DENOISE at the calibrated eps. */
-    if (cfg->guided_eps > 0) {
-        if (fy_guided_denoise_ws(f, b1, nz, ny, nx, 2, cfg->guided_eps, ws) == 0)
+    /* (c) GUIDED DENOISE (fast subsampled coefficients by default; eps is the global
+     * calibration or, when the radial fn(r) fit is active, the per-tile value). */
+    if (cfg->guided_eps > 0 || guided_eps_tile > 0) {
+        double eps = guided_eps_tile > 0 ? guided_eps_tile : cfg->guided_eps;
+        int gs = cfg->guided_subsample == 0 ? 2 : cfg->guided_subsample;
+        if (fy_guided_denoise_fast_ws(f, b1, nz, ny, nx, 2, eps, gs, ws) == 0)
             memcpy(f, b1, sizeof(float) * N);
     }
 
@@ -301,6 +310,19 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
     }
 }
 
+/* per-tile guided eps from the radial fn(r) fit (tile center vs rotation axis);
+ * 0 -> caller uses the global cfg->guided_eps. */
+static double eps_for_tile(const fy_pipeline_cfg *cfg, double ecy, double ecx,
+                           long y0, long x0, long ty, long tx) {
+    if (!cfg->have_eps_r || cfg->guided_eps <= 0 || cfg->eps_fn_med <= 0) return 0.0;
+    double ry = y0 + ty / 2.0 - ecy, rx = x0 + tx / 2.0 - ecx;
+    double fn = cfg->eps_fn_a + cfg->eps_fn_b * sqrt(ry * ry + rx * rx);
+    double s = fn / cfg->eps_fn_med, s2 = s * s;
+    if (s2 < 0.4) s2 = 0.4;
+    if (s2 > 8.0) s2 = 8.0;
+    return cfg->guided_eps * s2;
+}
+
 /* ============================================================================
  * fy_process_chunk -- process ONE inner tile at (z0,y0,x0) with a halo'd read,
  * using the already-calibrated cfg. The pass-2 body, factored out so the FUSED
@@ -333,8 +355,11 @@ int fy_process_chunk(const fy_zarr *zin, const fy_pipeline_cfg *cfg,
         cfg->have_norm ? 1.0 / (cfg->norm_hi - cfg->norm_lo) : 1.0 / 255.0);
     if (cfg->have_zdrift && cfg->zdrift_factor) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, cfg->zdrift_factor);
     memcpy(orig, f, sizeof(float) * hn);
-    process_tile(f, orig, u8, (int)hz, (int)hy, (int)hx, cfg,
-                 cfg->have_dec_range, cfg->dec_lo, cfg->dec_hi, b1, b2, ws);
+    { double ecy = cfg->dering_cy > 0 ? cfg->dering_cy : (Y - 1) / 2.0;
+      double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (X - 1) / 2.0;
+      process_tile(f, orig, u8, (int)hz, (int)hy, (int)hx, cfg,
+                   cfg->have_dec_range, cfg->dec_lo, cfg->dec_hi, b1, b2, ws,
+                   eps_for_tile(cfg, ecy, ecx, y0, x0, ty, tx)); }
     { long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0, oi = 0;
       for (long zz = iz0; zz < iz0 + tz; zz++)
       for (long yy = iy0; yy < iy0 + ty; yy++)
@@ -412,7 +437,11 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     /* ===================== PASS 1: CALIBRATION (sample tiles) ===================== */
     long air_hist[256]; memset(air_hist, 0, sizeof(air_hist));
     double floors[64]; int nfloor = 0, nsamp = 0;
+    double rads[64];                     /* tile-center radius paired with floors[] */
     double sigmas[64]; int nsig = 0;
+    double anisos[64]; int nani = 0;     /* measured sigma_z/sigma_xy per sample tile */
+    double ecy = cfg->dering_cy > 0 ? cfg->dering_cy : (Y - 1) / 2.0;   /* rotation axis */
+    double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (X - 1) / 2.0;
     int g = 3;                          /* 3x3x3 candidate quasi-grid */
     long stile = tile;
     size_t scap = (size_t)stile * stile * stile;
@@ -435,7 +464,20 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         if ((double)occ / n < 0.6) continue;
         u8_to_f01(sbuf, sf, n);
         double fn = fy_flat_noise(sf, (int)dz, (int)dy, (int)dx, 8);
-        if (fn > 0 && nfloor < 64) floors[nfloor++] = fn;
+        if (fn > 0 && nfloor < 64) {
+            double ry = y0 + dy / 2.0 - ecy, rx = x0 + dx / 2.0 - ecx;
+            rads[nfloor] = sqrt(ry * ry + rx * rx);
+            floors[nfloor++] = fn;
+        }
+        /* PSF anisotropy from noise autocorrelation (helical scans blur ~17% more in z) */
+        if (nani < 64) {
+            double rz, rxy;
+            if (fy_noise_aniso(sf, (int)dz, (int)dy, (int)dx, &rz, &rxy) == 0 &&
+                rz > 0.05 && rz < 0.95 && rxy > 0.05 && rxy < 0.95) {
+                double ratio = sqrt(log(1.0 / rxy) / log(1.0 / rz));
+                if (ratio > 0.5 && ratio < 3.0) anisos[nani++] = ratio;
+            }
+        }
         /* air histogram (scratch-denoised copy in `so`; keeps `sf` pristine for deconv below). */
         if (cfg->do_air_zero) {
             memcpy(so, sf, sizeof(float) * n);
@@ -473,10 +515,48 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
 
     /* commit guided_eps = (k * median flat_nf)^2, k = cfg->denoise_k (profile: conservative 3.0
      * ~0.002 preserves detail, aggressive 4.2 ~0.004). Default 4.2 if unset. Unless pre-set. */
+    /* RADIAL eps fit FIRST (median_sorted mutates floors[]): flat-noise rises toward the
+     * rim on large scrolls (measured 3x center->edge at fixed intensity on PHercParis3 --
+     * half-acquisition coverage + path length). Least-squares fn(r) = a + b*r over the
+     * sample tiles, gated on enough samples, positive slope, decent correlation, and a
+     * meaningful span; otherwise the single global eps stands. */
+    cfg->have_eps_r = 0;
+    if (nfloor >= 8) {
+        double sr = 0, sf2 = 0, srr = 0, srf = 0, sff = 0;
+        for (int i = 0; i < nfloor; i++) {
+            sr += rads[i]; sf2 += floors[i];
+            srr += rads[i] * rads[i]; srf += rads[i] * floors[i]; sff += floors[i] * floors[i];
+        }
+        double nn = nfloor;
+        double den = nn * srr - sr * sr;
+        if (den > 1e-9) {
+            double b = (nn * srf - sr * sf2) / den;
+            double a = (sf2 - b * sr) / nn;
+            double cden = sqrt((nn * srr - sr * sr) * (nn * sff - sf2 * sf2));
+            double corr = cden > 1e-12 ? (nn * srf - sr * sf2) / cden : 0;
+            double rmax = 0; for (int i = 0; i < nfloor; i++) if (rads[i] > rmax) rmax = rads[i];
+            double f0 = a, f1 = a + b * rmax;
+            if (b > 0 && corr >= 0.5 && f0 > 0 && f1 / f0 >= 1.3) {
+                cfg->eps_fn_a = a; cfg->eps_fn_b = b; cfg->have_eps_r = 1;
+                if (verbose) fprintf(stderr, "[calib] radial eps ON: fn %.4f -> %.4f (corr %.2f)\n", f0, f1, corr);
+            }
+        }
+    }
+    double flat_nf_med = nfloor ? median_sorted(floors, nfloor) : 0.015;
+    cfg->eps_fn_med = flat_nf_med;
     if (cfg->guided_eps <= 0) {
-        double flat_nf = nfloor ? median_sorted(floors, nfloor) : 0.015;
         double k = cfg->denoise_k > 0 ? cfg->denoise_k : 4.2;
-        cfg->guided_eps = (k * flat_nf) * (k * flat_nf);
+        cfg->guided_eps = (k * flat_nf_med) * (k * flat_nf_med);
+    }
+    /* commit measured PSF anisotropy (median over sample tiles, gated + clamped).
+     * NOTE: the pass-1 sample deconvs above ran isotropic; only pass 2 uses the ratio
+     * (a negligible inconsistency in the dec-range percentiles). */
+    if (nani >= 5) {
+        double ratio = median_sorted(anisos, nani);
+        if (ratio >= 1.05) {
+            cfg->psf_z_ratio = ratio < 1.6 ? ratio : 1.6;
+            if (verbose) fprintf(stderr, "[calib] PSF anisotropy: sigma_z/sigma_xy = %.2f\n", cfg->psf_z_ratio);
+        }
     }
     /* commit air cut: PHYSICS-FLOOR (conservative) -> VALLEY (aggressive) by cfg->air_cut_aggr.
      * The u8 is a clipped linear window of physical attenuation mu; the void/air level (mu~0) maps
@@ -665,6 +745,8 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     long ntz = ceil_div(Z, tile), nty = ceil_div(Y, tile), ntx = ceil_div(X, tile);
     long ntiles = ntz * nty * ntx;
     long out_done = 0, io_fail = 0;
+    double ecy2 = cfg->dering_cy > 0 ? cfg->dering_cy : (Y - 1) / 2.0;   /* radial-eps center */
+    double ecx2 = cfg->dering_cx > 0 ? cfg->dering_cx : (X - 1) / 2.0;
     if (verbose) fprintf(stderr, "[pass2] %ld tiles, halo=%d\n", ntiles, halo);
 
     #pragma omp parallel
@@ -706,7 +788,8 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
 
             /* (b-e) per-tile chain. */
             process_tile(f, orig, u8, (int)hz, (int)hy, (int)hx, cfg,
-                         have_dec_range, dec_lo, dec_hi, b1, b2, ws);
+                         have_dec_range, dec_lo, dec_hi, b1, b2, ws,
+                         eps_for_tile(cfg, ecy2, ecx2, y0, x0, ty, tx));
 
             long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0;
 

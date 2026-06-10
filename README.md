@@ -31,6 +31,8 @@ Be honest about what we can defensibly claim on ESRF/BM18 data:
 | **per-volume noise model** | ✅ measured | `fy_estimate_noise` fits `var=g·I+b` from the data; the level varies **1.5–3.3× scroll-to-scroll** so it must be estimated per-volume, not hardcoded. |
 | **partial delta_beta (fine vols)** | ✅ measured | full inversion over-inverts ≤4.3 µm volumes; `fy_auto_deltabeta_scale` backs off to ~0.35× (measured optimum). |
 | **guided denoise** | ✅ safe, generic | guided filter is the recommended denoiser; strength auto-set from the measured noise. Apply *after* deconv. |
+| **radially varying eps** | ✅ measured | flat-noise rises ~3× center→rim on large scrolls (PHercParis3, fixed-intensity; half-acq coverage + path length). Pass 1 fits `fn(r)` from the sample tiles (gated on slope/correlation/span); pass 2 scales the guided eps per tile. |
+| **anisotropic PSF (z)** | ✅ measured | helical scans blur ~1.17× broader in z (noise-autocorrelation, PHerc0139 2.4 µm). Pass 1 auto-measures `σz/σxy` (`fy_noise_aniso`, gated ≥1.05, clamped 1.6); the matched deconv inverts the anisotropic PSF. |
 | FBP ramp filter inversion | ❌ not clean | sinogram-domain, pre-backprojection — not invertible from the reconstructed volume. **Not implemented.** |
 | **residual ring removal** | ✅ detect-then-subtract | `fy_dering_*`: rings detected by an angular **sector sign-consistency vote** at the metadata rotation axis (a spiral wrap drifts in radius with angle and fails the vote; a true ring doesn't — verified on PHerc0139 2.4 µm: 267 ring radii, 93 % of ring energy removed in one pass). Only the detected component is subtracted; not a physics inverse, but measured, gated, and structure-safe. On by default in the pipeline (`--no-dering` to disable; `--dering-center y x` to override the axis). |
 
@@ -52,6 +54,16 @@ Measured across many volumes; each made results *worse* or wasn't worth it:
   worth it for streaming 20 TB. Guided is the pragmatic choice.
 - **Aggressive deconv (low reg) / full delta_beta on fine volumes** — over-amplifies
   noise for no resolution gain. `reg=0.015` + `fy_auto_deltabeta_scale` is the knee.
+- **Radial cupping correction** — measured ABSENT (PHerc0139 + PHercParis3, 2026-06):
+  the air-gap mode shows no radial bowl, only a uniform ~5–10 u8 scatter offset.
+  Don't add a radial flattening stage.
+- **Helical pitch-periodic z-banding correction** — measured ABSENT: no spectral peak
+  at the metadata pitch (2131 slices/rev at 2.4 µm); the per-z spectrum is wrap
+  structure. The existing slow z-drift correction is sufficient.
+- **Repeat-scan averaging** — scan-to-scan noise/artifacts are CORRELATED (bad SNR in
+  one scan predicts bad SNR in the other), so the naive sqrt(2) gain doesn't materialize.
+- **Saturation handling in deconv** — clipped voxels are only 0.01–0.13 % of the data;
+  measured too rare to justify an inpainting stage.
 
 ## What it does
 
@@ -157,16 +169,18 @@ shared (`libfysics.so`) library plus the public header.
 
 | region | time | throughput |
 |---|---|---|
-| 8×512×512 (viewer slab) | ~107 ms | ~20 Mvox/s |
-| 64×256×256 | ~355 ms | ~12 Mvox/s |
-| 256×256×256 (batch tile) | ~1.27 s | ~13 Mvox/s |
-| 176×176×176 (real halo'd 128-tile) | ~0.49 s | ~11 Mvox/s (was 1.69 s: 3.5×) |
+| 8×512×512 (viewer slab) | ~30 ms | ~71 Mvox/s |
+| 64×256×256 | ~73 ms | ~58 Mvox/s |
+| 256×256×256 (batch tile) | ~374 ms | ~45 Mvox/s |
+| 176×176×176 (real halo'd 128-tile) | ~112 ms | ~49 Mvox/s (was 1.69 s: **15×**) |
 
 Interactive for viewer-sized regions; the FFT is the cost (self-contained, sizes
 2^k and 3·2^k via a radix-3 split, precomputed twiddle tables so the butterflies
 vectorize). Sizes pad to `fy_next_fft_size()` — a 176³ halo'd tile costs a 192³
-FFT, not 256³. The Wiener weight is applied through a radial LUT (no per-voxel
-sqrt/exp). The guided denoise uses subsampled coefficients by default (He & Sun
+FFT, not 256³ — and the deconv runs on the Hermitian HALF-spectrum (real input):
+two-for-one packed X-pass with the reflect-padding fused in, Y/Z passes on half
+the columns, inverse transforms only for rows that survive the crop. The Wiener
+weight is applied through a radial LUT (no per-voxel sqrt/exp). The guided denoise uses subsampled coefficients by default (He & Sun
 fast guided filter, s=2): ~3× faster, visually identical; set
 `cfg.guided_subsample = 1` for the exact path. Output u8 quantization is
 dithered by default (hash of the global voxel coordinate: unbiased, seam-free,

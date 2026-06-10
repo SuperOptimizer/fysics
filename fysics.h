@@ -29,6 +29,9 @@ typedef struct {
     double unsharp_coeff;     /* unsharp coefficient; 0 disables */
     double psf_sigma_vox;     /* Gaussian SYSTEM PSF width (voxels) for the matched
                                * deconvolution; 0 -> estimate ~0.5 vox default. */
+    double psf_sigma_z_vox;   /* z-axis PSF width if ANISOTROPIC (helical scans measure
+                               * ~1.17x broader in z); 0 -> isotropic (= psf_sigma_vox).
+                               * Used by fy_deconvolve_matched only. */
 } fy_physics;
 
 /* ---- FFT (sizes 2^k and 3*2^k) ---- */
@@ -199,6 +202,16 @@ typedef struct {
 int fy_estimate_noise(const float *in, int nz, int ny, int nx,
                       int win, double flat_pct, double ref_intensity,
                       fy_noise_model *out);
+
+/* ---- noise-correlation anisotropy (PSF z/xy ratio) ----
+ * The system PSF shapes the noise correlation: lag-1 autocorrelation of the
+ * residual (voxel - local mean) in FLAT 8^3 blocks, per axis, gives the relative
+ * PSF width (rho = exp(-1/(4 sigma^2)) for a Gaussian PSF). Helical BM18 scans
+ * measure ~1.17x broader in z (PHerc0139 2.4um). Returns 0 and writes rho_z and
+ * rho_xy (mean of y,x); nonzero if too few flat blocks. Feed
+ * sigma_z/sigma_xy = sqrt(ln(1/rho_xy)/ln(1/rho_z)) to fy_physics.psf_sigma_z_vox. */
+int fy_noise_aniso(const float *v, int nz, int ny, int nx,
+                   double *rho_z, double *rho_xy);
 
 /* ---- z-drift / shading correction (whole-volume, the 13% beam-current drop) ----
  * Removes the slow brightness gradient along z from beam-current drift during the
@@ -439,6 +452,11 @@ typedef struct {
     /* resolved calibration STATE (set by fy_calibrate; consumed by fy_process_chunk) */
     int    have_norm, have_zdrift, have_dec_range;
     int    have_dering; fy_dering *dering;   /* detected rings (caller frees, like zdrift_factor) */
+    double psf_z_ratio;                      /* measured sigma_z/sigma_xy (0 or 1 = isotropic) */
+    /* radially varying guided eps: flat-noise rises toward the rim on large scrolls
+     * (measured 3x center->edge on PHercParis3). Linear fit fn(r) = a + b*r from the
+     * pass-1 sample tiles; per-tile eps = guided_eps * clamp((fn(r)/fn_med)^2, 0.4, 8). */
+    int    have_eps_r; double eps_fn_a, eps_fn_b, eps_fn_med;
     double dec_lo, dec_hi;    /* global deconv-output rescale range */
     long   vol_z;             /* full-volume Z (for zdrift_apply absolute-z indexing) */
 } fy_pipeline_cfg;
