@@ -1,2 +1,0 @@
-/usr/bin/ar qc libfysics.a CMakeFiles/fysics.dir/fft.c.o CMakeFiles/fysics.dir/paganin.c.o CMakeFiles/fysics.dir/dering.c.o CMakeFiles/fysics.dir/stream.c.o CMakeFiles/fysics.dir/guided.c.o CMakeFiles/fysics.dir/musica.c.o CMakeFiles/fysics.dir/zdrift.c.o CMakeFiles/fysics.dir/noise.c.o CMakeFiles/fysics.dir/register.c.o CMakeFiles/fysics.dir/phasecorr.c.o CMakeFiles/fysics.dir/zarr_io.c.o CMakeFiles/fysics.dir/pipeline.c.o CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o
-/usr/bin/ranlib libfysics.a
