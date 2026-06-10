@@ -511,13 +511,18 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
 
     /* ===================== PASS 1: CALIBRATION (sample tiles) ===================== */
     long air_hist[256]; memset(air_hist, 0, sizeof(air_hist));
-    double floors[64]; int nfloor = 0, nsamp = 0;
-    double rads[64];                     /* tile-center radius paired with floors[] */
-    double sigmas[64]; int nsig = 0;
-    double anisos[64]; int nani = 0;     /* measured sigma_z/sigma_xy per sample tile */
+    enum { CMAX = 256 };
+    double floors[CMAX]; int nfloor = 0, nsamp = 0;
+    double rads[CMAX];                   /* tile-center radius paired with floors[] */
+    double sigmas[CMAX]; int nsig = 0;
+    double anisos[CMAX]; int nani = 0;   /* measured sigma_z/sigma_xy per sample tile */
     double ecy = cfg->dering_cy > 0 ? cfg->dering_cy : (Y - 1) / 2.0;   /* rotation axis */
     double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (X - 1) / 2.0;
-    int g = 3;                          /* 3x3x3 candidate quasi-grid */
+    /* candidate quasi-grid scales with volume size (masked volumes discard the
+     * tiles that land on air, so big scrolls need many more candidates):
+     * <2 GB -> 3^3=27, <1 TB -> 4^3=64, <20 TB -> 5^3=125, else 6^3=216. */
+    double tvox = (double)Z * Y * X;
+    int g = tvox < 2e9 ? 3 : tvox < 1e12 ? 4 : tvox < 2e13 ? 5 : 6;
     long stile = tile;
     size_t scap = (size_t)stile * stile * stile;   /* per-tile scratch, alloc'd in-loop */
     double *dec_vals = NULL; size_t dec_n = 0, dec_cap = 0;
@@ -562,14 +567,14 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         double sg = measure_tile_psf_sigma(sbuf, (int)dz, (int)dy, (int)dx);
         #pragma omp critical (calib_merge)
         {
-            if (fn > 0 && nfloor < 64) {
+            if (fn > 0 && nfloor < CMAX) {
                 double ry = y0 + dy / 2.0 - ecy, rx = x0 + dx / 2.0 - ecx;
                 rads[nfloor] = sqrt(ry * ry + rx * rx);
                 floors[nfloor++] = fn;
             }
-            if (aniso > 0 && nani < 64) anisos[nani++] = aniso;
+            if (aniso > 0 && nani < CMAX) anisos[nani++] = aniso;
             for (int b = 0; b < 256; b++) air_hist[b] += lhist[b];
-            if (sg > 0 && nsig < 64) sigmas[nsig++] = sg;
+            if (sg > 0 && nsig < CMAX) sigmas[nsig++] = sg;
         }
         /* deconv output range (seam-safe global rescale) -- measured in the SAME windowed space
          * as pass-2: de-window sf (u8/255 -> mu), deconv, re-window, collect [0,1] values. */
