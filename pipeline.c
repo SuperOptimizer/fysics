@@ -393,10 +393,20 @@ int fy_process_buffer(const fy_pipeline_cfg *cfg, const unsigned char *u8buf,
         if (all_air) *all_air = 1;
         return 0;
     }
-    float *f = malloc(sizeof(float)*hn), *orig = malloc(sizeof(float)*hn);
-    float *b1 = malloc(sizeof(float)*hn), *b2 = malloc(sizeof(float)*hn);
-    float *ws = malloc(sizeof(float)*4*hn);
-    if (!f||!orig||!b1||!b2||!ws){ free(f);free(orig);free(b1);free(b2);free(ws); return 1; }
+    /* THREAD-LOCAL scratch, reused across calls: 8*hn floats per call through
+     * malloc/free was retained by glibc per-thread arenas anyway (~100MB/thread of
+     * phantom RSS, measured) -- so own it explicitly and stop the churn. */
+    static __thread float *tls_buf = NULL; static __thread size_t tls_cap = 0;
+    size_t need = 8 * hn;
+    if (tls_cap < need) {
+        free(tls_buf);
+        tls_buf = malloc(sizeof(float) * need);
+        if (!tls_buf) { tls_cap = 0; return 1; }
+        tls_cap = need;
+    }
+    float *f = tls_buf, *orig = tls_buf + hn;
+    float *b1 = tls_buf + 2*hn, *b2 = tls_buf + 3*hn;
+    float *ws = tls_buf + 4*hn;
     if (cfg->have_norm) fy_norm_apply_u8(u8buf, f, hn, (unsigned char)cfg->norm_lo, (unsigned char)cfg->norm_hi);
     else u8_to_f01(u8buf, f, hn);
     if (cfg->have_dering && cfg->dering) fy_dering_apply(cfg->dering, f, rz0, ry0, rx0, hz, hy, hx,
@@ -416,7 +426,6 @@ int fy_process_buffer(const fy_pipeline_cfg *cfg, const unsigned char *u8buf,
           out[oi++] = quant_u8(f[((size_t)zz * hy + yy) * hx + xx],
                                rz0 + zz, ry0 + yy, rx0 + xx, cfg->no_dither); }
     if (all_air) *all_air = 0;
-    free(f); free(orig); free(b1); free(b2); free(ws);
     return 0;
 }
 

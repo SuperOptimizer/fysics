@@ -32,6 +32,9 @@ void libs3_test_reset_imds_cache(void);
 bool libs3_test_fetch_imds(s3_credentials *out, time_t *expiry);
 bool libs3_test_cached_imds(s3_credentials *out);
 
+/* Clear the resolved-credential cache (the s3_credentials_load layer). */
+void libs3_test_reset_cred_cache(void);
+
 #endif /* LIBS3_TESTING */
 
 #endif /* LIBS3_INTERNAL_H */

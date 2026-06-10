@@ -51,6 +51,7 @@ typedef enum s3_status {
     S3_ERR_PARSE        = -6,  /* malformed JSON/XML response */
     S3_ERR_IO           = -7,  /* local file open/read failure */
     S3_ERR_ABORTED      = -8,  /* global abort flag was set */
+    S3_ERR_BUSY         = -9,  /* async request not yet complete */
 } s3_status;
 
 /* Human-readable string for a status code (static storage, never NULL). */
@@ -180,6 +181,14 @@ typedef struct s3_config {
     int   max_retries;                     /* default 3 (5xx/401/403/network) */
     bool  follow_redirects;                /* default true */
     const char *user_agent;                /* default "libs3/1.0" */
+
+    /*
+     * s3_get_batch range coalescing: requests on the same URL whose ranges
+     * are adjacent or separated by at most this many bytes are merged into
+     * one transfer (gap bytes are downloaded and discarded). 0 -> default
+     * (256 KiB); negative -> disabled. Merged spans are capped at 32 MiB.
+     */
+    int64_t coalesce_gap;
 } s3_config;
 
 /* Create a client. Returns NULL on allocation/curl-init failure. */
@@ -252,6 +261,20 @@ s3_status s3_get_to_file(s3_client *c, const char *url, FILE *sink, s3_response 
 s3_status s3_get_range(s3_client *c, const char *url,
                        uint64_t offset, uint64_t length, s3_response *resp);
 
+/*
+ * Parallel single-object download. Fetches [offset, offset+length) of `url`
+ * (length 0 = the whole object, sized via a HEAD) by splitting it into
+ * ~`part_size`-byte ranges fetched concurrently (<= `max_concurrency` at once)
+ * and assembling them in order into resp->body. One fat object, many sockets:
+ * saturates bandwidth that a single TCP stream cannot. part_size 0 -> 8 MiB,
+ * max_concurrency 0 -> 16. resp->status is 200/206 on success; any failed part
+ * yields S3_ERR_HTTP (resp still freed-by-caller via s3_response_free).
+ */
+s3_status s3_get_parallel(s3_client *c, const char *url,
+                          uint64_t offset, uint64_t length,
+                          uint64_t part_size, size_t max_concurrency,
+                          s3_response *resp);
+
 s3_status s3_head(s3_client *c, const char *url, s3_response *resp);
 
 s3_status s3_put(s3_client *c, const char *url,
@@ -309,17 +332,122 @@ s3_status s3_get_conditional(s3_client *c, const char *url,
  * function returns S3_OK if every transfer completed at the transport
  * level; inspect each out[i].status for per-object HTTP results. A length
  * of 0 fetches the whole object.
+ *
+ * Adjacent/near-adjacent ranges on the same URL are coalesced into one
+ * transfer (see s3_config.coalesce_gap) and split back transparently:
+ * every out[i] still gets its own status, body and body_len. Responses
+ * carved from a merged transfer share that transfer's content_type/etag/
+ * last_modified (duplicated; s3_response_free as usual).
  */
 typedef struct s3_range_req {
     const char *url;
     uint64_t    offset;
     uint64_t    length;   /* 0 -> whole object */
+    /*
+     * Optional caller-owned destination of `length` bytes (requires
+     * length > 0). When set, the body is written straight into `dst`
+     * (zero allocations, zero copies on the direct path); the response's
+     * body stays NULL and body_len reports bytes written. Bodies larger
+     * than `length` (e.g. a Range-ignoring server) are refused at the
+     * transport level rather than overrunning the buffer.
+     */
+    uint8_t    *dst;
 } s3_range_req;
 
 s3_status s3_get_batch(s3_client *c,
                        const s3_range_req *reqs, size_t n,
                        size_t max_concurrency,
                        s3_response *out);
+
+/*
+ * Zero-allocation single ranged GET: the body is written straight into
+ * `dst` (capacity = `length`). resp->body stays NULL; resp->body_len
+ * reports bytes written (0 unless the HTTP status was 200/206 -- error
+ * bodies are not delivered through `dst`). Same retry behaviour as
+ * s3_get_range.
+ */
+s3_status s3_get_range_into(s3_client *c, const char *url,
+                            uint64_t offset, uint64_t length,
+                            uint8_t *dst, s3_response *resp);
+
+/* ------------------------------------------------------------------ */
+/* Asynchronous batched GET (submit / poll / cancel)                    */
+/* ------------------------------------------------------------------ */
+/*
+ * Non-blocking variant of s3_get_batch for latency-sensitive callers
+ * (render loops, frame-budgeted I/O). Submit returns immediately; the
+ * transfers make progress only inside s3_batch_poll / s3_batch_wait,
+ * called from the SAME THREAD that submitted (the batch borrows the
+ * thread's persistent connection pool). Typical frame loop:
+ *
+ *   s3_batch *b;
+ *   s3_batch_submit(c, reqs, n, 16, &b);
+ *   ...per frame:
+ *   s3_batch_poll(b, 2);                       // <= 2 ms of I/O pumping
+ *   for (i ...) if (s3_batch_ready(b, i)) {
+ *       s3_response r; s3_batch_take(b, i, &r); ... s3_response_free(&r);
+ *   }
+ *   ...view changed:
+ *   s3_batch_cancel(b, i);                     // stale chunk: stop now
+ *   ...teardown:
+ *   s3_batch_free(b);                          // cancels whatever is left
+ *
+ * Requests are NOT range-coalesced (members of a merged transfer could
+ * not be cancelled independently). reqs[].url / reqs[].dst buffers are
+ * copied/borrowed at submit: urls are duplicated, dst buffers must stay
+ * alive until the request is taken, cancelled, or the batch is freed.
+ * A batch must be polled, taken from, cancelled, waited on and freed on
+ * its submitting thread.
+ */
+typedef struct s3_batch s3_batch;
+
+/* Start a batch: validates inputs, begins up to max_concurrency
+ * transfers (0 -> a sane default), returns without blocking. */
+s3_status s3_batch_submit(s3_client *c,
+                          const s3_range_req *reqs, size_t n,
+                          size_t max_concurrency,
+                          s3_batch **out);
+
+/*
+ * Pump the batch's transfers for at most `budget_ms` milliseconds
+ * (0 -> one non-blocking pump; negative -> until every request is
+ * terminal). Returns the total number of terminal (done or cancelled)
+ * requests, or -1 if `b` is NULL.
+ */
+int s3_batch_poll(s3_batch *b, long budget_ms);
+
+/* True once request i has completed (its response is takeable). */
+bool s3_batch_ready(const s3_batch *b, size_t i);
+
+/*
+ * Move request i's response out to the caller (caller frees with
+ * s3_response_free). Returns S3_ERR_BUSY while in flight, S3_ERR_ABORTED
+ * if it was cancelled, S3_ERR_INVALID_ARG if already taken / i out of
+ * range. Inspect out->status for the HTTP result as with s3_get_batch.
+ */
+s3_status s3_batch_take(s3_batch *b, size_t i, s3_response *out);
+
+/* Cancel request i: a pending request never starts; an in-flight one is
+ * torn down immediately (its connection is dropped). No-op once the
+ * request is terminal. */
+void s3_batch_cancel(s3_batch *b, size_t i);
+
+/* Block until every request is terminal. Returns S3_OK if every
+ * completed transfer succeeded at the transport level (per-request HTTP
+ * status still in each response), or the first error otherwise. */
+s3_status s3_batch_wait(s3_batch *b);
+
+/* Cancel anything still running, free untaken responses, release the
+ * batch. NULL-safe. */
+void s3_batch_free(s3_batch *b);
+
+/*
+ * Open `nconn` connections to `url`'s host from the calling thread's batch
+ * pool (tiny 1-byte ranged GETs), so the first real s3_get_batch on this
+ * thread doesn't pay TCP+TLS handshakes. Connections are per-thread; call
+ * it on the thread that will issue the batches.
+ */
+s3_status s3_prewarm(s3_client *c, const char *url, size_t nconn);
 
 /* ------------------------------------------------------------------ */
 /* Multipart upload                                                    */
