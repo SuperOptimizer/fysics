@@ -465,42 +465,208 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     if (tile <= 0) tile = 128;
     if (verbose) fprintf(stderr, "pipeline: input %ldx%ldx%ld tile=%d\n", Z, Y, X, tile);
 
-    /* PRE-PASS: measure PSF sigma on a few sample tiles FIRST, so the AUTO-DECONV gate is decided
-     * BEFORE halo/sdec/rescale setup (deconv reach drives the halo; the gate must precede it). */
+    /* ===================== PASS 1: UNIFIED CALIBRATION SWEEP =====================
+     * ONE parallel pass over budget-sampled 256^3 ptiles accumulates EVERYTHING:
+     *   - streaming (cheap, every sampled ptile): norm histogram, per-z z-drift
+     *     sums, dering ring profiles
+     *   - heavy stats (capped at HEAVY_MAX sub-blocks volume-wide): flat-noise +
+     *     radius pairs, PSF sigma + anisotropy, scratch-denoised air histogram --
+     *     measured on the CENTRAL 128^3 sub-block of qualifying (>=60% occupancy)
+     *     ptiles
+     *   - up to KEEP_MAX qualifying sub-block COPIES retained for the post-sweep
+     *     deconv-output-range measurement (the AUTO-DECONV gate is decided AFTER
+     *     the sweep from the accumulated PSF sigmas -- old pre-pass thresholds --
+     *     and must precede the halo/deconv setup).
+     */
+    enum { CMAX = 256, SUB = 128, KEEP_MAX = 32, HEAVY_MAX = 256 };
+    long air_hist[256]; memset(air_hist, 0, sizeof(air_hist));
+    double floors[CMAX]; int nfloor = 0, nsamp = 0;
+    double rads[CMAX];                   /* sub-block-center radius paired with floors[] */
+    double sigmas[CMAX]; int nsig = 0;
+    double anisos[CMAX]; int nani = 0;   /* measured sigma_z/sigma_xy per sample sub-block */
+    double ecy = cfg->dering_cy > 0 ? cfg->dering_cy : (Y - 1) / 2.0;   /* rotation axis */
+    double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (X - 1) / 2.0;
+    unsigned char *keep[KEEP_MAX]; int keep_d[KEEP_MAX][3]; int nkeep = 0;
+    int nheavy = 0;                      /* atomic cap on heavy-stat sub-blocks */
+
+    fy_hist_state nhist; fy_hist_init(&nhist);
+    double *zsums = (double *)calloc(Z, sizeof(double));
+    long *zcnts = (long *)calloc(Z, sizeof(long));
+    float *zfactor = NULL;
+    int have_norm = 0, have_zdrift = 0, have_dering = 0;
+    fy_dering *der = NULL;
+
+    long ptile = tile > 256 ? tile : 256;
+    long pnz = ceil_div(Z, ptile), pny = ceil_div(Y, ptile), pnx = ceil_div(X, ptile);
+    long pntiles = pnz * pny * pnx;
+    if (cfg->do_dering) {
+        der = (fy_dering *)malloc(sizeof(fy_dering));
+        /* slab = 2 sweep z-tiles, so each tile lands in exactly ONE slab (lock-free merge) */
+        if (!der || fy_dering_init(der, Z, Y, X, cfg->dering_cy > 0 ? cfg->dering_cy : -1,
+                                   cfg->dering_cx > 0 ? cfg->dering_cx : -1,
+                                   (int)(2 * ptile), 8) != 0) {
+            free(der); der = NULL;
+        }
+    }
+    #pragma omp parallel
     {
-        long st = tile; size_t cap = (size_t)st * st * st;
-        unsigned char *pb = (unsigned char *)malloc(cap);
-        double psig[27]; int nps = 0;
-        if (pb) {
-            for (int iz = 0; iz < 3 && nps < 27; iz++)
-              for (int iy = 0; iy < 3 && nps < 27; iy++)
-                for (int ix = 0; ix < 3 && nps < 27; ix++) {
-                    long z0 = lmin((long)iz * (Z / 3), Z - st);
-                    long y0 = lmin((long)iy * (Y / 3), Y - st);
-                    long x0 = lmin((long)ix * (X / 3), X - st);
-                    if (z0 < 0 || y0 < 0 || x0 < 0) continue;
-                    if (fy_zarr_read(&zin, z0, y0, x0, st, st, st, pb) != 0) continue;
-                    if (!any_nonzero(pb, cap)) continue;
-                    double sg = measure_tile_psf_sigma(pb, (int)st, (int)st, (int)st);
-                    if (sg > 0) psig[nps++] = sg;
+        fy_hist_state lh; fy_hist_init(&lh);
+        double *ls = (double *)calloc(Z, sizeof(double));
+        long *lc = (long *)calloc(Z, sizeof(long));
+        unsigned char *pb = (unsigned char *)malloc((size_t)ptile * ptile * ptile);
+        /* heavy-stat scratch (sub-block sized), allocated lazily on first use */
+        size_t scap = (size_t)SUB * SUB * SUB;
+        unsigned char *sub = NULL;
+        float *sf = NULL, *so = NULL, *stmp = NULL, *sws = NULL;
+        fy_dering dt; int have_dt = der && fy_dering_tile_init(&dt, der) == 0;
+        #pragma omp for schedule(dynamic)
+        for (long t = 0; t < pntiles; t++) {
+            long iz = t / (pny * pnx), r = t % (pny * pnx), iy = r / pnx, ix = r % pnx;
+            /* SAMPLE: read EVERY z-slab (the z-drift trend needs full z-coverage) but only
+             * a hash-selected fraction of (y,x) tiles, sized by a CALIBRATION I/O BUDGET
+             * (default 200 GB, cfg->calib_budget_gb) -- on a 27 TB volume the old strided
+             * 25% sweep was ~7 TB of reads before processing could start. The stats
+             * (norm histogram, per-z papyrus mean, ring profiles) converge on samples;
+             * a floor keeps >=~32 tiles expected per z-slab for the z-drift profile. */
+            if (pny >= 4 || pnx >= 4) {
+                double total_gb = (double)Z * Y * X / 1e9;
+                double budget = cfg->calib_budget_gb > 0 ? cfg->calib_budget_gb : 200.0;
+                double frac = total_gb > budget ? budget / total_gb : 1.0;
+                double floorf_ = 32.0 / ((double)pny * pnx);
+                if (frac < floorf_) frac = floorf_;
+                if (frac < 1.0) {
+                    unsigned int hsh = (unsigned int)(iz * 73856093L) ^ (unsigned int)(iy * 19349663L)
+                                     ^ (unsigned int)(ix * 83492791L);
+                    hsh ^= hsh >> 16; hsh *= 0x7feb352dU; hsh ^= hsh >> 15; hsh *= 0x846ca68bU; hsh ^= hsh >> 16;
+                    if (hsh > (unsigned int)(frac * 4294967295.0)) continue;
                 }
-            free(pb);
-        }
-        if (nps >= 3) {
-            qsort(psig, nps, sizeof(double), cmp_double);
-            double med = percentile_sorted(psig, nps, 50.0);
-            cfg->psf_med = med; cfg->psf_p5 = percentile_sorted(psig, nps, 5.0);
-            /* AUTO-DECONV GATE: matched-Wiener deconv recovers REAL signal only when sharp
-             * (RMSE-to-truth: wins sigma<=1.0, loses >=1.3; boundary ~1.1). Above -> contrast-only
-             * (cosmetic, amplifies noise) -> do NOT store. Caller --deconv forces it regardless. */
-            if (!cfg->do_deconv && med <= 1.1) {
-                cfg->do_deconv = 1; cfg->use_matched_deconv = 1; cfg->psf_sigma_vox = med;
-                if (verbose) fprintf(stderr, "[calib] AUTO-DECONV ON: psf_med=%.2f<=1.1 (sharp->recovers signal)\n", med);
-            } else if (verbose && !cfg->do_deconv) {
-                fprintf(stderr, "[calib] auto-deconv OFF: psf_med=%.2f>1.1 (blurry->contrast-only, view-time)\n", med);
             }
-            if (cfg->do_deconv && cfg->psf_sigma_vox <= 0) cfg->psf_sigma_vox = med;
+            long z0 = iz * ptile, y0 = iy * ptile, x0 = ix * ptile;
+            long dz = lmin(ptile, Z - z0), dy = lmin(ptile, Y - y0), dx = lmin(ptile, X - x0);
+            size_t n = (size_t)dz * dy * dx;
+            if (fy_zarr_read(&zin, z0, y0, x0, dz, dy, dx, pb) != 0) continue;
+            if (!any_nonzero(pb, n)) continue;
+            if (cfg->do_normalize) fy_hist_accumulate_u8(&lh, pb, n);
+            if (have_dt) {
+                fy_dering_tile_reset(&dt);
+                fy_dering_accumulate_u8(&dt, pb, y0, x0, dz, dy, dx, 2);
+                #pragma omp critical (dering_merge)
+                fy_dering_merge_tile(der, (int)(z0 / der->slab_z), &dt);
+            }
+            if (cfg->do_zdrift) {
+                /* z-drift only needs a coarse PER-Z trend (mean papyrus brightness per slice)
+                 * to decide coherence/slope -- accumulate on a 4x4 spatial SUBSAMPLE in x,y
+                 * (16x less work, statistically identical per-z mean over a 256-tile slab). */
+                const int ss = 4;
+                for (long z = 0; z < dz; z++) {
+                    const unsigned char *sl = pb + (size_t)z * dy * dx;
+                    double s = 0; long c = 0;
+                    for (long yy = 0; yy < dy; yy += ss)
+                        for (long xx = 0; xx < dx; xx += ss) {
+                            float v = sl[(size_t)yy * dx + xx] * (1.0f / 255.0f);
+                            if (v > 0.10f) { s += v; c++; }
+                        }
+                    ls[z0 + z] += s; lc[z0 + z] += c;
+                }
+            }
+            /* HEAVY calibration stats on the CENTRAL SUB^3 sub-block of this ptile,
+             * capped at HEAVY_MAX qualifying sub-blocks volume-wide (atomic claim). */
+            { int hv;
+              #pragma omp atomic read
+              hv = nheavy;
+              if (hv >= HEAVY_MAX) continue; }
+            if (!sub) {
+                sub  = (unsigned char *)malloc(scap);
+                sf   = (float *)malloc(sizeof(float) * scap);
+                so   = (float *)malloc(sizeof(float) * scap);
+                stmp = (float *)malloc(sizeof(float) * scap);
+                sws  = (float *)malloc(sizeof(float) * 4 * scap);
+                if (!sub || !sf || !so || !stmp || !sws) {
+                    free(sub); free(sf); free(so); free(stmp); free(sws);
+                    sub = NULL; sf = so = stmp = sws = NULL;
+                    continue;
+                }
+            }
+            long sdz = lmin(SUB, dz), sdy = lmin(SUB, dy), sdx = lmin(SUB, dx);
+            long oz = (dz - sdz) / 2, oy = (dy - sdy) / 2, ox = (dx - sdx) / 2;
+            size_t sn = (size_t)sdz * sdy * sdx;
+            for (long zz = 0; zz < sdz; zz++)
+                for (long yy = 0; yy < sdy; yy++)
+                    memcpy(sub + ((size_t)zz * sdy + yy) * sdx,
+                           pb + (((size_t)(oz + zz) * dy + (oy + yy)) * dx + ox), (size_t)sdx);
+            { size_t occ = 0; for (size_t i = 0; i < sn; i++) if (sub[i] > 0) occ++;
+              if ((double)occ / sn < 0.6) continue; }
+            { int my;
+              #pragma omp atomic capture
+              { my = nheavy; nheavy++; }
+              if (my >= HEAVY_MAX) continue; }
+            u8_to_f01(sub, sf, sn);
+            double fn = fy_flat_noise(sf, (int)sdz, (int)sdy, (int)sdx, 8);
+            double aniso = -1, arz, arxy;
+            if (fy_noise_aniso(sf, (int)sdz, (int)sdy, (int)sdx, &arz, &arxy) == 0 &&
+                arz > 0.05 && arz < 0.95 && arxy > 0.05 && arxy < 0.95) {
+                double ratio = sqrt(log(1.0 / arxy) / log(1.0 / arz));
+                if (ratio > 0.5 && ratio < 3.0) aniso = ratio;
+            }
+            long lhist[256]; memset(lhist, 0, sizeof(lhist));
+            if (cfg->do_air_zero) {
+                memcpy(so, sf, sizeof(float) * sn);
+                scratch_denoise(so, (int)sdz, (int)sdy, (int)sdx,
+                                cfg->scratch_passes > 0 ? cfg->scratch_passes : 5, stmp, sws);
+                for (size_t i = 0; i < sn; i++) {
+                    int b = (int)(so[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; lhist[b]++;
+                }
+            }
+            double sg = measure_tile_psf_sigma(sub, (int)sdz, (int)sdy, (int)sdx);
+            #pragma omp critical (calib_merge)
+            {
+                if (fn > 0 && nfloor < CMAX) {
+                    double ry = y0 + oy + sdy / 2.0 - ecy, rx = x0 + ox + sdx / 2.0 - ecx;
+                    rads[nfloor] = sqrt(ry * ry + rx * rx);
+                    floors[nfloor++] = fn;
+                }
+                if (aniso > 0 && nani < CMAX) anisos[nani++] = aniso;
+                for (int b = 0; b < 256; b++) air_hist[b] += lhist[b];
+                if (sg > 0 && nsig < CMAX) sigmas[nsig++] = sg;
+                if (nkeep < KEEP_MAX) {       /* retain a COPY for the deconv-range step */
+                    unsigned char *cp = (unsigned char *)malloc(sn);
+                    if (cp) {
+                        memcpy(cp, sub, sn);
+                        keep[nkeep] = cp;
+                        keep_d[nkeep][0] = (int)sdz; keep_d[nkeep][1] = (int)sdy; keep_d[nkeep][2] = (int)sdx;
+                        nkeep++;
+                    }
+                }
+            }
+            #pragma omp atomic
+            nsamp++;
         }
+        #pragma omp critical
+        {
+            if (cfg->do_normalize) fy_hist_merge(&nhist, &lh);
+            for (long z = 0; z < Z; z++) { zsums[z] += ls[z]; zcnts[z] += lc[z]; }
+        }
+        if (have_dt) fy_dering_free(&dt);
+        free(ls); free(lc); free(pb);
+        free(sub); free(sf); free(so); free(stmp); free(sws);
+    }
+
+    /* commit PSF median + AUTO-DECONV gate FIRST, so it is decided BEFORE the
+     * halo/sdec/rescale setup (deconv reach drives the halo; the gate must precede it). */
+    if (nsig >= 3) {
+        qsort(sigmas, nsig, sizeof(double), cmp_double);
+        double med = percentile_sorted(sigmas, nsig, 50.0);
+        cfg->psf_med = med; cfg->psf_p5 = percentile_sorted(sigmas, nsig, 5.0);
+        /* AUTO-DECONV GATE: matched-Wiener deconv recovers REAL signal only when sharp
+         * (RMSE-to-truth: wins sigma<=1.0, loses >=1.3; boundary ~1.1). Above -> contrast-only
+         * (cosmetic, amplifies noise) -> do NOT store. Caller --deconv forces it regardless. */
+        if (!cfg->do_deconv && med <= 1.1) {
+            cfg->do_deconv = 1; cfg->use_matched_deconv = 1; cfg->psf_sigma_vox = med;
+            if (verbose) fprintf(stderr, "[calib] AUTO-DECONV ON: psf_med=%.2f<=1.1 (sharp->recovers signal)\n", med);
+        } else if (verbose && !cfg->do_deconv) {
+            fprintf(stderr, "[calib] auto-deconv OFF: psf_med=%.2f>1.1 (blurry->contrast-only, view-time)\n", med);
+        }
+        if (cfg->do_deconv && cfg->psf_sigma_vox <= 0) cfg->psf_sigma_vox = med;
     }
 
     /* halo: kernel halo from physics (deconv reach); air-zero/denoise are local r=2. */
@@ -509,99 +675,46 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     if (halo < 8) halo = 8;
     cfg->halo = halo;
 
-    /* ===================== PASS 1: CALIBRATION (sample tiles) ===================== */
-    long air_hist[256]; memset(air_hist, 0, sizeof(air_hist));
-    enum { CMAX = 256 };
-    double floors[CMAX]; int nfloor = 0, nsamp = 0;
-    double rads[CMAX];                   /* tile-center radius paired with floors[] */
-    double sigmas[CMAX]; int nsig = 0;
-    double anisos[CMAX]; int nani = 0;   /* measured sigma_z/sigma_xy per sample tile */
-    double ecy = cfg->dering_cy > 0 ? cfg->dering_cy : (Y - 1) / 2.0;   /* rotation axis */
-    double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (X - 1) / 2.0;
-    /* candidate quasi-grid scales with volume size (masked volumes discard the
-     * tiles that land on air, so big scrolls need many more candidates):
-     * <2 GB -> 3^3=27, <1 TB -> 4^3=64, <20 TB -> 5^3=125, else 6^3=216. */
-    double tvox = (double)Z * Y * X;
-    int g = tvox < 2e9 ? 3 : tvox < 1e12 ? 4 : tvox < 2e13 ? 5 : 6;
-    long stile = tile;
-    size_t scap = (size_t)stile * stile * stile;   /* per-tile scratch, alloc'd in-loop */
-    double *dec_vals = NULL; size_t dec_n = 0, dec_cap = 0;
-
-    /* PARALLEL over sample tiles: each tile's read (serial S3 GETs) and compute run
-     * concurrently; the shared accumulators are merged under one critical section.
-     * Per-tile scratch is allocated inside the loop (27 allocs total -- negligible). */
-    #pragma omp parallel for collapse(3) schedule(dynamic)
-    for (int iz = 0; iz < g; iz++) for (int iy = 0; iy < g; iy++) for (int ix = 0; ix < g; ix++) {
-        unsigned char *sbuf = (unsigned char *)malloc(scap);
-        float *sf = (float *)malloc(sizeof(float) * scap);
-        float *so = (float *)malloc(sizeof(float) * scap);
-        float *stmp = (float *)malloc(sizeof(float) * scap);
-        float *sws  = (float *)malloc(sizeof(float) * 4 * scap);
-        float *sdec = (cfg->do_deconv) ? (float *)malloc(sizeof(float) * scap) : NULL;
-        long lhist[256]; memset(lhist, 0, sizeof(lhist));
-        if (!sbuf || !sf || !so || !stmp || !sws || (cfg->do_deconv && !sdec)) goto tile_done;
-        {
-        long z0 = (long)(((iz + 0.5) / g) * (Z - stile)); if (z0 < 0) z0 = 0; if (z0 > Z - stile) z0 = Z > stile ? Z - stile : 0;
-        long y0 = (long)(((iy + 0.5) / g) * (Y - stile)); if (y0 < 0) y0 = 0; if (y0 > Y - stile) y0 = Y > stile ? Y - stile : 0;
-        long x0 = (long)(((ix + 0.5) / g) * (X - stile)); if (x0 < 0) x0 = 0; if (x0 > X - stile) x0 = X > stile ? X - stile : 0;
-        long dz = lmin(stile, Z - z0), dy = lmin(stile, Y - y0), dx = lmin(stile, X - x0);
-        size_t n = (size_t)dz * dy * dx;
-        if (fy_zarr_read(&zin, z0, y0, x0, dz, dy, dx, sbuf) != 0) goto tile_done;
-        { size_t occ = 0; for (size_t i = 0; i < n; i++) if (sbuf[i] > 0) occ++;
-          if ((double)occ / n < 0.6) goto tile_done; }
-        u8_to_f01(sbuf, sf, n);
-        double fn = fy_flat_noise(sf, (int)dz, (int)dy, (int)dx, 8);
-        double aniso = -1, rz, rxy;
-        if (fy_noise_aniso(sf, (int)dz, (int)dy, (int)dx, &rz, &rxy) == 0 &&
-            rz > 0.05 && rz < 0.95 && rxy > 0.05 && rxy < 0.95) {
-            double ratio = sqrt(log(1.0 / rxy) / log(1.0 / rz));
-            if (ratio > 0.5 && ratio < 3.0) aniso = ratio;
-        }
-        if (cfg->do_air_zero) {
-            memcpy(so, sf, sizeof(float) * n);
-            scratch_denoise(so, (int)dz, (int)dy, (int)dx, cfg->scratch_passes > 0 ? cfg->scratch_passes : 5, stmp, sws);
-            for (size_t i = 0; i < n; i++) {
-                int b = (int)(so[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; lhist[b]++;
-            }
-        }
-        double sg = measure_tile_psf_sigma(sbuf, (int)dz, (int)dy, (int)dx);
-        #pragma omp critical (calib_merge)
-        {
-            if (fn > 0 && nfloor < CMAX) {
-                double ry = y0 + dy / 2.0 - ecy, rx = x0 + dx / 2.0 - ecx;
-                rads[nfloor] = sqrt(ry * ry + rx * rx);
-                floors[nfloor++] = fn;
-            }
-            if (aniso > 0 && nani < CMAX) anisos[nani++] = aniso;
-            for (int b = 0; b < 256; b++) air_hist[b] += lhist[b];
-            if (sg > 0 && nsig < CMAX) sigmas[nsig++] = sg;
-        }
-        /* deconv output range (seam-safe global rescale) -- measured in the SAME windowed space
-         * as pass-2: de-window sf (u8/255 -> mu), deconv, re-window, collect [0,1] values. */
-        if (cfg->do_deconv && sdec) {
+    /* commit deconv global range (seam-safe rescale) over the RETAINED sub-blocks --
+     * measured in the SAME windowed space as pass-2: de-window (u8/255 -> mu), deconv,
+     * re-window, collect [0,1] values. Runs BEFORE the psf_z_ratio commit below, so these
+     * sample deconvs are isotropic -- same as the old pass-1 sampling (only pass 2 uses
+     * the ratio; a negligible inconsistency in the dec-range percentiles). */
+    int have_dec_range = 0; double dec_lo = 0.0, dec_hi = 1.0;
+    if (cfg->do_deconv && nkeep > 0) {
+        size_t scap = (size_t)SUB * SUB * SUB;
+        double *dec_vals = NULL; size_t dec_n = 0, dec_cap = 0;
+        float *df = (float *)malloc(sizeof(float) * scap);
+        float *ddec = (float *)malloc(sizeof(float) * scap);
+        if (df && ddec) {
             fy_physics ph = scaled_phys_from_cfg(cfg);
             int windowed = (cfg->window_hi > cfg->window_lo);
             float wlo = (float)cfg->window_lo, wspan = (float)(cfg->window_hi - cfg->window_lo);
-            if (windowed) for (size_t i = 0; i < n; i++) sf[i] = wlo + sf[i] * wspan;
-            int rc = (cfg->use_matched_deconv && cfg->psf_sigma_vox > 0)
-                ? fy_deconvolve_matched(sf, sdec, (int)dz, (int)dy, (int)dx, &ph, cfg->deconv_tikhonov)
-                : fy_deconvolve(sf, sdec, (int)dz, (int)dy, (int)dx, &ph, -1.0);
-            if (windowed) for (size_t i = 0; i < n; i++) sf[i] = (sf[i] - wlo) / wspan;  /* restore sf */
-            if (rc == 0) {
-                #pragma omp critical (calib_merge)
-                {
-                    if (dec_n + n > dec_cap) { dec_cap = (dec_n + n) * 2; dec_vals = realloc(dec_vals, sizeof(double) * dec_cap); }
-                    for (size_t i = 0; i < n; i++)
-                        dec_vals[dec_n++] = windowed ? (sdec[i] - wlo) / wspan : sdec[i];
-                }
+            for (int k = 0; k < nkeep; k++) {
+                int kz = keep_d[k][0], ky = keep_d[k][1], kx = keep_d[k][2];
+                size_t n = (size_t)kz * ky * kx;
+                u8_to_f01(keep[k], df, n);
+                if (windowed) for (size_t i = 0; i < n; i++) df[i] = wlo + df[i] * wspan;
+                int rc = (cfg->use_matched_deconv && cfg->psf_sigma_vox > 0)
+                    ? fy_deconvolve_matched(df, ddec, kz, ky, kx, &ph, cfg->deconv_tikhonov)
+                    : fy_deconvolve(df, ddec, kz, ky, kx, &ph, -1.0);
+                if (rc != 0) continue;
+                if (dec_n + n > dec_cap) { dec_cap = (dec_n + n) * 2; dec_vals = realloc(dec_vals, sizeof(double) * dec_cap); }
+                for (size_t i = 0; i < n; i++)
+                    dec_vals[dec_n++] = windowed ? (ddec[i] - wlo) / wspan : ddec[i];
             }
         }
-        #pragma omp atomic
-        nsamp++;
+        free(df); free(ddec);
+        if (dec_n > 0) {
+            qsort(dec_vals, dec_n, sizeof(double), cmp_double);
+            dec_lo = percentile_sorted(dec_vals, dec_n, 0.1);
+            dec_hi = percentile_sorted(dec_vals, dec_n, 99.9);
+            if (dec_hi - dec_lo < 1e-6) { dec_lo = 0.0; dec_hi = 1.0; }
+            have_dec_range = 1;
         }
-tile_done:
-        free(sbuf); free(sf); free(so); free(stmp); free(sws); if (sdec) free(sdec);
+        free(dec_vals);
     }
+    for (int k = 0; k < nkeep; k++) free(keep[k]);
 
     /* commit guided_eps = (k * median flat_nf)^2, k = cfg->denoise_k (profile: conservative 3.0
      * ~0.002 preserves detail, aggressive 4.2 ~0.004). Default 4.2 if unset. Unless pre-set. */
@@ -638,9 +751,8 @@ tile_done:
         double k = cfg->denoise_k > 0 ? cfg->denoise_k : 4.2;
         cfg->guided_eps = (k * flat_nf_med) * (k * flat_nf_med);
     }
-    /* commit measured PSF anisotropy (median over sample tiles, gated + clamped).
-     * NOTE: the pass-1 sample deconvs above ran isotropic; only pass 2 uses the ratio
-     * (a negligible inconsistency in the dec-range percentiles). */
+    /* commit measured PSF anisotropy (median over sample sub-blocks, gated + clamped).
+     * NOTE: the dec-range sample deconvs above ran isotropic; only pass 2 uses the ratio. */
     if (nani >= 5) {
         double ratio = median_sorted(anisos, nani);
         if (ratio >= 1.05) {
@@ -671,159 +783,60 @@ tile_done:
             cfg->air_cut_u8 = phys_floor; cfg->air_cut_band = 4;
         }
     }
-    /* commit deconv global range. */
-    int have_dec_range = 0; double dec_lo = 0.0, dec_hi = 1.0;
-    if (cfg->do_deconv && dec_n > 0) {
-        qsort(dec_vals, dec_n, sizeof(double), cmp_double);
-        dec_lo = percentile_sorted(dec_vals, dec_n, 0.1);
-        dec_hi = percentile_sorted(dec_vals, dec_n, 99.9);
-        if (dec_hi - dec_lo < 1e-6) { dec_lo = 0.0; dec_hi = 1.0; }
-        have_dec_range = 1;
-    }
-    free(dec_vals);
     /* (downsample removed -- the volume is not meaningfully oversampled; the auto-factor rested on
      * an unreliable PSF sigma. PSF is still measured above, but only for the auto-deconv gate.) */
     if (verbose) fprintf(stderr, "[calib] samples=%d flat_nf_n=%d guided_eps=%.5f air_cut=%d band=%d psf_med=%.2f deconv=%d halo=%d\n",
                          nsamp, nfloor, cfg->guided_eps, cfg->air_cut_u8, cfg->air_cut_band, cfg->psf_med, cfg->do_deconv, halo);
 
-    /* ===================== PASS 1b: global norm + z-drift + dering (streaming) ===================== */
-    fy_hist_state nhist; fy_hist_init(&nhist);
-    double *zsums = (double *)calloc(Z, sizeof(double));
-    long *zcnts = (long *)calloc(Z, sizeof(long));
-    float *zfactor = NULL;
-    int have_norm = 0, have_zdrift = 0, have_dering = 0;
-    fy_dering *der = NULL;
-
-    if (cfg->do_normalize || cfg->do_zdrift || cfg->do_dering) {
-        long ptile = tile > 256 ? tile : 256;
-        long pnz = ceil_div(Z, ptile), pny = ceil_div(Y, ptile), pnx = ceil_div(X, ptile);
-        long pntiles = pnz * pny * pnx;
-        if (cfg->do_dering) {
-            der = (fy_dering *)malloc(sizeof(fy_dering));
-            /* slab = 2 pass-1b z-tiles, so each tile lands in exactly ONE slab (lock-free merge) */
-            if (!der || fy_dering_init(der, Z, Y, X, cfg->dering_cy > 0 ? cfg->dering_cy : -1,
-                                       cfg->dering_cx > 0 ? cfg->dering_cx : -1,
-                                       (int)(2 * ptile), 8) != 0) {
-                free(der); der = NULL;
-            }
-        }
-        #pragma omp parallel
-        {
-            fy_hist_state lh; fy_hist_init(&lh);
-            double *ls = (double *)calloc(Z, sizeof(double));
-            long *lc = (long *)calloc(Z, sizeof(long));
-            unsigned char *pb = (unsigned char *)malloc((size_t)ptile * ptile * ptile);
-            float *pf = (float *)malloc(sizeof(float) * (size_t)ptile * ptile * ptile);
-            fy_dering dt; int have_dt = der && fy_dering_tile_init(&dt, der) == 0;
-            #pragma omp for schedule(dynamic)
-            for (long t = 0; t < pntiles; t++) {
-                long iz = t / (pny * pnx), r = t % (pny * pnx), iy = r / pnx, ix = r % pnx;
-                /* SAMPLE: read EVERY z-slab (the z-drift trend needs full z-coverage) but only
-                 * a hash-selected fraction of (y,x) tiles, sized by a CALIBRATION I/O BUDGET
-                 * (default 200 GB, cfg->calib_budget_gb) -- on a 27 TB volume the old strided
-                 * 25% sweep was ~7 TB of reads before processing could start. The stats
-                 * (norm histogram, per-z papyrus mean, ring profiles) converge on samples;
-                 * a floor keeps >=~32 tiles expected per z-slab for the z-drift profile. */
-                if (pny >= 4 || pnx >= 4) {
-                    double total_gb = (double)Z * Y * X / 1e9;
-                    double budget = cfg->calib_budget_gb > 0 ? cfg->calib_budget_gb : 200.0;
-                    double frac = total_gb > budget ? budget / total_gb : 1.0;
-                    double floorf_ = 32.0 / ((double)pny * pnx);
-                    if (frac < floorf_) frac = floorf_;
-                    if (frac < 1.0) {
-                        unsigned int hsh = (unsigned int)(iz * 73856093L) ^ (unsigned int)(iy * 19349663L)
-                                         ^ (unsigned int)(ix * 83492791L);
-                        hsh ^= hsh >> 16; hsh *= 0x7feb352dU; hsh ^= hsh >> 15; hsh *= 0x846ca68bU; hsh ^= hsh >> 16;
-                        if (hsh > (unsigned int)(frac * 4294967295.0)) continue;
-                    }
-                }
-                long z0 = iz * ptile, y0 = iy * ptile, x0 = ix * ptile;
-                long dz = lmin(ptile, Z - z0), dy = lmin(ptile, Y - y0), dx = lmin(ptile, X - x0);
-                size_t n = (size_t)dz * dy * dx;
-                if (fy_zarr_read(&zin, z0, y0, x0, dz, dy, dx, pb) != 0) continue;
-                if (!any_nonzero(pb, n)) continue;
-                if (cfg->do_normalize) fy_hist_accumulate_u8(&lh, pb, n);
-                if (have_dt) {
-                    fy_dering_tile_reset(&dt);
-                    fy_dering_accumulate_u8(&dt, pb, y0, x0, dz, dy, dx, 2);
-                    #pragma omp critical (dering_merge)
-                    fy_dering_merge_tile(der, (int)(z0 / der->slab_z), &dt);
-                }
-                if (cfg->do_zdrift) {
-                    /* z-drift only needs a coarse PER-Z trend (mean papyrus brightness per slice)
-                     * to decide coherence/slope -- accumulate on a 4x4 spatial SUBSAMPLE in x,y
-                     * (16x less work, statistically identical per-z mean over a 256-tile slab). */
-                    const int ss = 4;
-                    for (long z = 0; z < dz; z++) {
-                        const unsigned char *sl = pb + (size_t)z * dy * dx;
-                        double s = 0; long c = 0;
-                        for (long yy = 0; yy < dy; yy += ss)
-                            for (long xx = 0; xx < dx; xx += ss) {
-                                float v = sl[(size_t)yy * dx + xx] * (1.0f / 255.0f);
-                                if (v > 0.10f) { s += v; c++; }
-                            }
-                        ls[z0 + z] += s; lc[z0 + z] += c;
-                    }
-                }
-            }
-            #pragma omp critical
-            {
-                if (cfg->do_normalize) fy_hist_merge(&nhist, &lh);
-                for (long z = 0; z < Z; z++) { zsums[z] += ls[z]; zcnts[z] += lc[z]; }
-            }
-            if (have_dt) fy_dering_free(&dt);
-            free(ls); free(lc); free(pb); free(pf);
-        }
-        /* dering gate: only keep rings that pass the sector vote (>=2 radii detected) */
-        if (der) {
-            long ndet = fy_dering_finalize(der, 15, 100, 0.5, 6.0);
-            if (der->have_rings) have_dering = 1;
-            else { fy_dering_free(der); free(der); der = NULL; }
-            if (verbose) fprintf(stderr, "[pass1] dering: %ld ring radii detected -> %s\n",
-                                 ndet, have_dering ? "subtracting" : "skipped");
-        }
-        /* norm gate: only if (hi-lo)/255 < 0.40 */
-        if (cfg->do_normalize && nhist.total > 0) {
-            int lo = fy_hist_percentile_u8(&nhist, 0.5);
-            int hi = fy_hist_percentile_u8(&nhist, 99.5);
-            if ((hi - lo) / 255.0 < 0.40 && hi > lo) { cfg->norm_lo = lo; cfg->norm_hi = hi; have_norm = 1; }
-        }
-        /* z-drift gate: coherence>=0.5 AND slope_frac>=0.05 AND beam_drift>=0.05 */
-        if (cfg->do_zdrift) {
-            long valid = 0; for (long z = 0; z < Z; z++) if (zcnts[z] > 0) valid++;
-            if (valid >= 8) {
-                zfactor = (float *)malloc(sizeof(float) * Z);
-                fy_zdrift_finalize(zsums, zcnts, (int)Z, zfactor);
-                double sx = 0, sy = 0, sxx = 0, sxy = 0; long nv = 0;
-                double *prof = (double *)malloc(sizeof(double) * Z);
-                for (long z = 0; z < Z; z++) {
-                    prof[z] = zcnts[z] ? zsums[z] / zcnts[z] : -1;
-                    if (prof[z] >= 0) { sx += z; sy += prof[z]; sxx += (double)z * z; sxy += (double)z * prof[z]; nv++; }
-                }
-                double slope = (nv * sxy - sx * sy) / (nv * sxx - sx * sx + 1e-12);
-                double icpt = (sy - slope * sx) / (nv + 1e-12);
-                double lmn = 1e30, lmx = -1e30, totvar = 0, prev = -1;
-                double *medacc = (double *)malloc(sizeof(double) * (nv > 0 ? nv : 1)); long nmed = 0;
-                for (long z = 0; z < Z; z++) if (prof[z] >= 0) {
-                    double lin = slope * z + icpt; if (lin < lmn) lmn = lin; if (lin > lmx) lmx = lin;
-                    if (prev >= 0) totvar += fabs(prof[z] - prev); prev = prof[z];
-                    medacc[nmed++] = prof[z];
-                }
-                double lin_span = lmx - lmn;
-                double coherence = lin_span / (totvar + 1e-9);
-                double med = median_sorted(medacc, (int)nmed);
-                double slope_frac = lin_span / (med + 1e-9);
-                double beam = (cfg->machine_current_start > 0)
-                    ? fabs(cfg->machine_current_stop - cfg->machine_current_start) / cfg->machine_current_start : -1;
-                int meta_ok = (beam < 0) || (beam >= 0.05);
-                if (coherence >= 0.5 && slope_frac >= 0.05 && meta_ok) have_zdrift = 1;
-                free(prof); free(medacc);
-            }
-        }
-        if (!have_zdrift) { free(zfactor); zfactor = NULL; }
-        if (verbose) fprintf(stderr, "[pass1] norm=%d(lo=%d hi=%d) zdrift=%d\n",
-                             have_norm, cfg->norm_lo, cfg->norm_hi, have_zdrift);
+    /* dering gate: only keep rings that pass the sector vote (>=2 radii detected) */
+    if (der) {
+        long ndet = fy_dering_finalize(der, 15, 100, 0.5, 6.0);
+        if (der->have_rings) have_dering = 1;
+        else { fy_dering_free(der); free(der); der = NULL; }
+        if (verbose) fprintf(stderr, "[pass1] dering: %ld ring radii detected -> %s\n",
+                             ndet, have_dering ? "subtracting" : "skipped");
     }
+    /* norm gate: only if (hi-lo)/255 < 0.40 */
+    if (cfg->do_normalize && nhist.total > 0) {
+        int lo = fy_hist_percentile_u8(&nhist, 0.5);
+        int hi = fy_hist_percentile_u8(&nhist, 99.5);
+        if ((hi - lo) / 255.0 < 0.40 && hi > lo) { cfg->norm_lo = lo; cfg->norm_hi = hi; have_norm = 1; }
+    }
+    /* z-drift gate: coherence>=0.5 AND slope_frac>=0.05 AND beam_drift>=0.05 */
+    if (cfg->do_zdrift) {
+        long valid = 0; for (long z = 0; z < Z; z++) if (zcnts[z] > 0) valid++;
+        if (valid >= 8) {
+            zfactor = (float *)malloc(sizeof(float) * Z);
+            fy_zdrift_finalize(zsums, zcnts, (int)Z, zfactor);
+            double sx = 0, sy = 0, sxx = 0, sxy = 0; long nv = 0;
+            double *prof = (double *)malloc(sizeof(double) * Z);
+            for (long z = 0; z < Z; z++) {
+                prof[z] = zcnts[z] ? zsums[z] / zcnts[z] : -1;
+                if (prof[z] >= 0) { sx += z; sy += prof[z]; sxx += (double)z * z; sxy += (double)z * prof[z]; nv++; }
+            }
+            double slope = (nv * sxy - sx * sy) / (nv * sxx - sx * sx + 1e-12);
+            double icpt = (sy - slope * sx) / (nv + 1e-12);
+            double lmn = 1e30, lmx = -1e30, totvar = 0, prev = -1;
+            double *medacc = (double *)malloc(sizeof(double) * (nv > 0 ? nv : 1)); long nmed = 0;
+            for (long z = 0; z < Z; z++) if (prof[z] >= 0) {
+                double lin = slope * z + icpt; if (lin < lmn) lmn = lin; if (lin > lmx) lmx = lin;
+                if (prev >= 0) totvar += fabs(prof[z] - prev); prev = prof[z];
+                medacc[nmed++] = prof[z];
+            }
+            double lin_span = lmx - lmn;
+            double coherence = lin_span / (totvar + 1e-9);
+            double med = median_sorted(medacc, (int)nmed);
+            double slope_frac = lin_span / (med + 1e-9);
+            double beam = (cfg->machine_current_start > 0)
+                ? fabs(cfg->machine_current_stop - cfg->machine_current_start) / cfg->machine_current_start : -1;
+            int meta_ok = (beam < 0) || (beam >= 0.05);
+            if (coherence >= 0.5 && slope_frac >= 0.05 && meta_ok) have_zdrift = 1;
+            free(prof); free(medacc);
+        }
+    }
+    if (!have_zdrift) { free(zfactor); zfactor = NULL; }
+    if (verbose) fprintf(stderr, "[pass1] norm=%d(lo=%d hi=%d) zdrift=%d\n",
+                         have_norm, cfg->norm_lo, cfg->norm_hi, have_zdrift);
 
     /* publish resolved calibration STATE into cfg so fy_process_chunk (fused export) can use it. */
     cfg->have_norm = have_norm; cfg->have_zdrift = have_zdrift;
