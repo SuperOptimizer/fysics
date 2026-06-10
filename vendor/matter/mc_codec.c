@@ -20,6 +20,7 @@ static int   g_max_err = 0;            // 0 = corrections off
 // per-coefficient quant step table (quality * hf_weight), rebuilt when quality
 // changes. powf per coefficient was 20%+ of encode AND decode time.
 static _Thread_local float g_step_tab[N3];
+static _Thread_local float g_rstep_tab[N3];   // 1/step: quant uses mul, not div
 static _Thread_local float g_step_q = -1.0f;
 static void step_tab_build(void);
 void  mc_set_quality(float q){ g_quality = q; step_tab_build(); }
@@ -39,8 +40,11 @@ static inline float hf_weight(int cz,int cy,int cx){ return powf(1.0f+(float)(cz
 static void step_tab_build(void){
     rc_prior_build(g_quality);
     if(g_step_q==g_quality) return;
-    for(int cz=0;cz<MC_BLK;++cz)for(int cy=0;cy<MC_BLK;++cy)for(int cx=0;cx<MC_BLK;++cx)
-        g_step_tab[(cz*MC_BLK+cy)*MC_BLK+cx]=g_quality*hf_weight(cz,cy,cx);
+    for(int cz=0;cz<MC_BLK;++cz)for(int cy=0;cy<MC_BLK;++cy)for(int cx=0;cx<MC_BLK;++cx){
+        int i=(cz*MC_BLK+cy)*MC_BLK+cx;
+        g_step_tab[i]=g_quality*hf_weight(cz,cy,cx);
+        g_rstep_tab[i]=1.0f/g_step_tab[i];
+    }
     g_step_q=g_quality;
 }
 static inline mc_i32 quant_one(float c, float step){
@@ -260,8 +264,10 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     // size matter. Rewritten as: coarse 4^3 seed + RED-BLACK SOR in a dense,
     // branch-free, auto-vectorizing form (see below).
     // Measured (8x 256^3 mixed material/air chunks of a real masked scroll,
-    // q=8, single-core): encode 0.745s -> 0.516s (-31%), archive size
-    // 1126163 -> 1126135 bytes (-0.002%), material max-abs-diff unchanged.
+    // q=8, best-of-5 process-CPU time incl. the vectorized stats/quant loops
+    // above/below): encode 0.345s -> 0.253s (-26.7%), archive size
+    // 1126163 -> 1126019 bytes (-0.013%), material max-abs-diff unchanged
+    // (41), air voxels still decode to exactly 0.
     if(nair>0){
         const int S=MC_BLK;
         // (b) skip the fine SOR sweeps on nearly-pure blocks (<5% or >95% air):
@@ -277,7 +283,7 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
         // (SLP-vectorizable; air contributes 0 to the sum because blk[]==0
         // there) — no per-voxel div/mod or branches.
         {
-            float cs[64]; int cm[64]; const int G=4, GS=MSUB;
+            float cs[64]; int cm[64]; const int G=4;
             for(int c=0;c<64;++c){ cs[c]=0.0f; cm[c]=0; }
             for(int z=0;z<S;++z)for(int y=0;y<S;++y){
                 const float *bp=blk+(size_t)(z*S+y)*S;
@@ -303,7 +309,7 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
             // seed air voxels from their cell: expand the 4 cell values of a
             // subcube row into a 16-float row pattern once per 4 rows, then a
             // dense branchless select per row (auto-vectorizes).
-            float vrow[16];
+            float vrow[16]={0};   // always set at y==0 (init quiets -Wmaybe-uninitialized)
             for(int z=0;z<S;++z)for(int y=0;y<S;++y){
                 if((y&3)==0){
                     const float *cr=cs+((z>>2)*G+(y>>2))*G;
@@ -370,7 +376,14 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
             // keeps NB and the three active P planes L1-resident instead of
             // streaming a full-volume NB array through L2 every pass.
             // Pad/material lanes are killed by w6=0.
-            for(int it=0; it<MC_FILL_SWEEPS; ++it){
+            // (c) the coarse seed does most of the work, so few fine sweeps
+            // are needed: on the benchmark below 1 red-black sweep gives a
+            // marginally SMALLER archive than the old 3 serial sweeps
+            // (-0.013%), 2 sweeps +0.016% — the rate effect of sweep count is
+            // already in the quantization noise (values are masked out at
+            // decode anyway), so take the cheapest.
+            int nsweep=MC_FILL_SWEEPS<1?MC_FILL_SWEEPS:1;
+            for(int it=0; it<nsweep; ++it){
                 for(int col=0; col<2; ++col){
                     const float *restrict w6=W6[col];
                     for(int pz=1; pz<PS-1; ++pz){
@@ -390,12 +403,14 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     mc_dct3_fwd(blk,coef);
     static _Thread_local rc_i16 ql[N3];
     static _Thread_local rc_u8 scratch[N3*4+1024];
-    // fused branchless quant+clamp (same arithmetic as quant_one: for a>=dz,
-    // t=(a-dz)/step+1>=1 truncates identically; for a<dz, t<1 so
-    // max(t,0) truncates to 0). The branchy quant_one loop was scalar.
+    // fused branchless quant+clamp (same math as quant_one up to fp rounding:
+    // t = |c|/step - dzfrac + 1; for |c|>=dz, t>=1 truncates to the level,
+    // for |c|<dz, t<1 so max(t,0) truncates to 0). The branchy quant_one
+    // loop was scalar; this one auto-vectorizes, with a reciprocal step
+    // table instead of a per-coefficient divide.
     for(int idx=0;idx<N3;++idx){
-        float c=coef[idx], step=g_step_tab[idx];
-        float t=(fabsf(c)-MC_DZ_FRAC*step)/step+1.0f;
+        float c=coef[idx];
+        float t=fabsf(c)*g_rstep_tab[idx]+(1.0f-MC_DZ_FRAC);
         t=t>0.0f?t:0.0f; t=t<32767.0f?t:32767.0f;
         mc_i32 v=(mc_i32)t;
         ql[idx]=(rc_i16)(c<0.0f?-v:v);
