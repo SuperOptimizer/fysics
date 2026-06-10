@@ -348,6 +348,7 @@ typedef struct {
     long ntx,nty,nbz,nunits;
     long pz,py,px;              /* padded dims (multiples of 2*MCC for L1 alignment) */
     atomic_long next, fail, skipped, l0app, l1app;
+    atomic_long dl_fetch, dl_gate, wk_busy, units_done;   /* live telemetry gauges */
     atomic_long io_open, io_miss, io_bytes;
     bandq q;
 } sched;
@@ -398,7 +399,10 @@ static void *download_worker(void *arg){
             for(long g0=0; g0<nneed; g0+=32){
                 long gN=nneed-g0<32?nneed-g0:32;
                 size_t gest=(size_t)gN*(size_t)z0->cz*z0->cy*z0->cx;
+                atomic_fetch_add(&sc->dl_gate,1);
                 have_tok=cc_gate_reserve(gest,have_tok);
+                atomic_fetch_sub(&sc->dl_gate,1);
+                atomic_fetch_add(&sc->dl_fetch,1);
                 char paths[32][1500]; s3_range_req reqs[32]; s3_response rsp[32];
                 centry *ces[32]; int owner[32]; long ownidx[32]; long nown=0;
                 memset(rsp,0,sizeof rsp);
@@ -451,6 +455,7 @@ static void *download_worker(void *arg){
                     chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ces[i];chunks[nch].fetched=1;nch++;
                 }
                 cc_settle(gest);
+                atomic_fetch_sub(&sc->dl_fetch,1);
                 /* pass 2: NON-OWNERS rendezvous with the concurrent fetch and share
                  * its bytes (fetched=0: resident bytes are tracked by the cache itself -- the owner's band
                  * carries those bytes). bytes==NULL = owner saw absent/failed; the
@@ -523,7 +528,8 @@ static void *compute_worker(void *arg){
         long ti=bb.ti;
         long bz=ti%sc->nbz, txy=ti/sc->nbz, ty=txy/sc->ntx, tx=txy%sc->ntx;
         long vx0=tx*SB, vy0=ty*SB, vz0=bz*BAND;
-        if(bb.empty){ atomic_fetch_add(&sc->skipped,1); goto release; }
+        if(bb.empty){ atomic_fetch_add(&sc->skipped,1); atomic_fetch_add(&sc->units_done,1); goto release; }
+        atomic_fetch_add(&sc->wk_busy,1);
         {
         /* assemble the halo'd raw band (clamped to the volume) */
         long rz0=vz0-h<0?0:vz0-h, ry0=vy0-h<0?0:vy0-h, rx0=vx0-h<0?0:vx0-h;
@@ -604,6 +610,8 @@ static void *compute_worker(void *arg){
             else atomic_fetch_add(&sc->l1app,1);
         }
         }
+        atomic_fetch_sub(&sc->wk_busy,1);
+        atomic_fetch_add(&sc->units_done,1);
 release:
         for(int i=0;i<bb.nch;++i){
             if(bb.chunks[i].ce) cc_release(bb.chunks[i].ce);
@@ -612,6 +620,24 @@ release:
         free(bb.chunks);
     }
     free(raw);free(proc);free(l1);free(cbuf);free(tin);free(tout);
+    return NULL;
+}
+
+/* live telemetry: one line every 10s -- where are the bands? */
+static void *stats_worker(void *arg){
+    sched *sc=arg;
+    for(;;){
+        sleep(10);
+        long done=atomic_load(&sc->units_done);
+        if(done>=sc->nunits) break;
+        pthread_mutex_lock(&g_cc.m);
+        size_t res=g_cc.bytes, cap=g_cc.cap; long hits=g_cc.hits, miss=g_cc.misses;
+        pthread_mutex_unlock(&g_cc.m);
+        pthread_mutex_lock(&sc->q.m); int qn=sc->q.count, qc=sc->q.cap; pthread_mutex_unlock(&sc->q.m);
+        fprintf(stderr,"[t] units %ld/%ld (skip %ld) | q %d/%d | res %.1f/%.1fGB | dl fetch %ld gate %ld | wk busy %ld | cache %ld/%ld\n",
+            done, sc->nunits, atomic_load(&sc->skipped), qn, qc, res/1e9, cap/1e9,
+            atomic_load(&sc->dl_fetch), atomic_load(&sc->dl_gate), atomic_load(&sc->wk_busy), hits, hits+miss);
+    }
     return NULL;
 }
 
@@ -769,6 +795,7 @@ int main(int argc, char **argv){
                    "%d compute + %d io threads, queue %d\n",
             sc.nunits,sc.ntx,sc.nty,sc.nbz,SB,BAND,sc.halo,nc_,ni_,qc_);
 
+    pthread_t stat_t; pthread_create(&stat_t,NULL,stats_worker,&sc); pthread_detach(stat_t);
     pthread_t *iot=malloc(ni_*sizeof *iot), *cot=malloc(nc_*sizeof *cot);
     for(int i=0;i<ni_;i++) pthread_create(&iot[i],NULL,download_worker,&sc);
     for(int i=0;i<nc_;i++) pthread_create(&cot[i],NULL,compute_worker,&sc);
