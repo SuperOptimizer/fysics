@@ -503,3 +503,24 @@ Verified research findings and primary documentation cited above:
 
 Empirical findings: `docs/empirical-analysis.md` (PHerc0139, 2026-06-05). fysics kernel
 behavior and rule-outs: `README.md`, `fysics.h`.
+
+### mca_export streaming-pipeline postmortem (2026-06-10, measured on the 27 TB Paris4 2.4 µm export)
+
+Hard-won invariants for the fused S3->process->archive pipeline; violating any of
+them reproduces a specific observed failure:
+
+1. **All RAM consumers live inside ONE accounted budget.** Resident chunk bytes
+   (cache + queued bands + in-process bands + PRE-RESERVED in-flight transfers)
+   are tracked as a single number under the cache lock and gate fetches. Parallel
+   counters desynced twice (cache-hit double-subtract; owner-release vs sharers).
+2. **Worker footprint is measured, not estimated**: ~1.3 GB/worker at SB=512
+   (~1 GB of it encoder TLS), ~2.3 GB at SB=1024. Sizing from buffer sums OOM'd.
+3. **The fetch gate needs a progress token** (one cap-exempt downloader) or
+   all-downloaders-mid-band deadlocks; pending-entry waits must be bounded.
+4. **Pinning invariant**: (queue depth + workers) x band_max bytes <= cap/2, or
+   downloaders serialize through the token (observed at 58/64 gated). Queue depth
+   is now derived from this.
+5. **Small bands (SB=512) beat big ones**: lower pinned set, smaller workers,
+   full-width compute. Winning config on a 32-thread/64 GB box: 32 compute +
+   64 io (blocked threads are free), queue from invariant 4, ~12 GB budget ->
+   ~11 Gbit/s sustained S3 input, NIC-bound (the correct end state).
