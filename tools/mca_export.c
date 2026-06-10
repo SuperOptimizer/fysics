@@ -786,12 +786,21 @@ int main(int argc, char **argv){
      * measured ~1.3 GB/worker at SB=512 incl. encoder TLS), io = 2x ncpu. */
     int nc_=nthreads>0?nthreads:(int)(ncpu<2?2:ncpu);
     int ni_=niothreads>0?niothreads:(is_s3(in)?(int)(ncpu*2):(nc_<4?nc_:4));
+    /* downloaders' worst-case in-flight band footprints must fit the budget
+     * (gated otherwise -> token-serialized crawl): clamp the io pool to it */
+    { long capb=(long)((mem_gb==24.0?ncpu/4.0:mem_gb)+(cache_gb==12.0?ncpu/8.0:cache_gb))*1000000000L;
+      int maxio=(int)(capb*7/10/band_max);
+      if(niothreads<=0 && ni_>maxio && maxio>=4) ni_=maxio; }
     /* queue depth from the PINNING INVARIANT: bands held by queue+workers pin
      * their chunk bytes in the resident budget; if (qcap+nc_)*band_max >= cap the
      * downloaders all gate and fetches serialize through the progress token
      * (observed: 58/64 downloaders cond-waiting, 6 fetching). Keep worst-case
      * pinned bytes <= half the budget so fetch headroom always exists. */
-    long band_max=(long)SB*SB*BAND;
+    /* band_max must be the halo-rounded chunk FOOTPRINT, not core voxels: a
+     * SB=512 band fetches (4+2)^3 chunks for a 4^3 core (~3.4x) -- sizing on
+     * core bytes let 64 in-flight bands pin 27GB against a 12GB cap. Assume
+     * 128^3 input chunks (the fleet standard) for the estimate. */
+    long band_max=((SB/128)+2)*((SB/128)+2)*((BAND/128)+2)*2097152L;
     long cap_b=(long)((mem_gb==24.0?ncpu/4.0:mem_gb)*1e9)+(long)((cache_gb==12.0?ncpu/8.0:cache_gb)*1e9);
     int qc_=qcap>0?qcap:(int)(cap_b/2/band_max-nc_);
     if(qcap<=0){ if(qc_<4)qc_=4; if(qc_>nc_*2)qc_=nc_*2; }
