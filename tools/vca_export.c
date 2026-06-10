@@ -224,7 +224,7 @@ static void cc_release(centry *e){
 }
 
 /* ------------------------------------------------------------ band queue */
-typedef struct { long ccz,ccy,ccx; u8 *bytes; size_t len; centry *ce; } cchunk;
+typedef struct { long ccz,ccy,ccx; u8 *bytes; size_t len; centry *ce; int fetched; } cchunk;
 typedef struct { long ti; cchunk *chunks; int nch; int empty; } bandbuf;
 typedef struct {
     bandbuf *slot; int cap,head,tail,count,closed,active_prod;
@@ -279,10 +279,9 @@ static void *download_worker(void *arg){
     for(;;){
         long ti=atomic_fetch_add(&sc->next,1);
         if(ti>=sc->nunits) break;
-        pthread_mutex_lock(&sc->im);
-        while(atomic_load(&sc->inflight)>0 && atomic_load(&sc->inflight)>sc->inflight_cap)
-            pthread_cond_wait(&sc->icv,&sc->im);
-        pthread_mutex_unlock(&sc->im);
+        long band_bytes=0;   /* gate per CHUNK below (per-band gating lets N
+                              * downloaders overshoot the cap N-fold before any
+                              * accounting); band_bytes>0 guarantees progress */
         long bz=ti%sc->nbz, txy=ti/sc->nbz, ty=txy/sc->ntx, tx=txy%sc->ntx;
         long vx0=tx*sc->SB, vy0=ty*sc->SB, vz0=bz*sc->BAND;
         long vx1=vx0+sc->SB, vy1=vy0+sc->SB, vz1=vz0+sc->BAND;
@@ -300,9 +299,14 @@ static void *download_worker(void *arg){
                 int core = (qz>=vz0/z0->cz && qz*z0->cz<vz1 && qy>=vy0/z0->cy && qy*z0->cy<vy1
                             && qx>=vx0/z0->cx && qx*z0->cx<vx1);
                 centry *ce=cc_get(qz,qy,qx);
-                u8 *got; size_t gn;
+                u8 *got; size_t gn; int fetched=0;
                 if(ce){ got=ce->bytes; gn=ce->len; if(core) any=1; }
                 else {
+                    pthread_mutex_lock(&sc->im);
+                    while(band_bytes>0 && atomic_load(&sc->inflight)>sc->inflight_cap)
+                        pthread_cond_wait(&sc->icv,&sc->im);
+                    pthread_mutex_unlock(&sc->im);
+                    fetched=1;
                     char p[1500]; snprintf(p,sizeof p,"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
                     atomic_fetch_add(&sc->io_open,1);
                     gn=0; int err=0; got=src_get(p,&gn,&err);
@@ -311,11 +315,12 @@ static void *download_worker(void *arg){
                     if(core) any=1;
                     atomic_fetch_add(&sc->io_bytes,(long)gn);
                     atomic_fetch_add(&sc->inflight,(long)gn);
+                    band_bytes+=(long)gn;
                     ce=cc_put(qz,qy,qx,got,gn);
                 }
                 if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
                 chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
-                chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ce;nch++;
+                chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ce;chunks[nch].fetched=fetched;nch++;
             }
         }
         bandbuf b={ti,chunks,nch,any?0:1};
@@ -436,7 +441,7 @@ static void *compute_worker(void *arg){
         }
 release:
         { long rel=0;
-          for(int i=0;i<bb.nch;++i){ rel+=(long)bb.chunks[i].len; cc_release(bb.chunks[i].ce); }
+          for(int i=0;i<bb.nch;++i){ if(bb.chunks[i].fetched) rel+=(long)bb.chunks[i].len; cc_release(bb.chunks[i].ce); }
           atomic_fetch_sub(&sc->inflight,rel);
           pthread_mutex_lock(&sc->im); pthread_cond_broadcast(&sc->icv); pthread_mutex_unlock(&sc->im); }
         free(bb.chunks);

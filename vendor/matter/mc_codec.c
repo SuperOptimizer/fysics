@@ -204,7 +204,6 @@ void mc_dec_fracmap(const uint8_t *in, uint32_t len, uint8_t *frac){
 int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     int n=N3, any=0;
     static _Thread_local float blk[N3], coef[N3];
-    static _Thread_local mc_i32 lv[N3];
     long sum=0,cnt=0;
 #if MC_SIMD_NEON
     {   uint32x4_t s32=vdupq_n_u32(0), c32=vdupq_n_u32(0);
@@ -274,19 +273,23 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
         // (each cell = mean of its material voxels, air cells relaxed), then
         // seed fine air voxels from their cell before the fine SOR sweeps.
         // Lands much closer than a flat dc start, so few sweeps converge.
-        // Accumulation runs dense per subcube row (air contributes 0 to the
-        // sum because blk[]==0 there) — no per-voxel div/mod or branches.
+        // Accumulation runs per (z,y) row with 4-wide unrolled segment sums
+        // (SLP-vectorizable; air contributes 0 to the sum because blk[]==0
+        // there) — no per-voxel div/mod or branches.
         {
             float cs[64]; int cm[64]; const int G=4, GS=MSUB;
-            for(int sz=0;sz<G;++sz)for(int sy=0;sy<G;++sy)for(int sx=0;sx<G;++sx){
-                float s=0; int m=0;
-                for(int z=0;z<GS;++z)for(int y=0;y<GS;++y){
-                    size_t r=(size_t)((sz*GS+z)*S+(sy*GS+y))*S+sx*GS;
-                    for(int x=0;x<GS;++x){ s+=blk[r+x]; m+=vox[r+x]!=0; }
+            for(int c=0;c<64;++c){ cs[c]=0.0f; cm[c]=0; }
+            for(int z=0;z<S;++z)for(int y=0;y<S;++y){
+                const float *bp=blk+(size_t)(z*S+y)*S;
+                const mc_u8 *vp=vox+(size_t)(z*S+y)*S;
+                int cb=((z>>2)*G+(y>>2))*G;
+                for(int sx=0;sx<G;++sx){
+                    const float *b4=bp+4*sx; const mc_u8 *v4=vp+4*sx;
+                    cs[cb+sx]+=b4[0]+b4[1]+b4[2]+b4[3];
+                    cm[cb+sx]+=(v4[0]!=0)+(v4[1]!=0)+(v4[2]!=0)+(v4[3]!=0);
                 }
-                int c=(sz*G+sy)*G+sx;
-                cm[c]=m; cs[c]=m?s/(float)m:0.0f;
             }
+            for(int c=0;c<64;++c) cs[c]=cm[c]?cs[c]/(float)cm[c]:0.0f;
             for(int it=0;it<6;++it){                      // coarse relax (air cells)
                 for(int cz=0;cz<G;++cz)for(int cy=0;cy<G;++cy)for(int cx=0;cx<G;++cx){
                     int c=(cz*G+cy)*G+cx; if(cm[c]) continue;
@@ -297,12 +300,18 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
                     if(k) cs[c]=a/k;
                 }
             }
-            for(int sz=0;sz<G;++sz)for(int sy=0;sy<G;++sy)for(int sx=0;sx<G;++sx){
-                float v=cs[(sz*G+sy)*G+sx];
-                for(int z=0;z<GS;++z)for(int y=0;y<GS;++y){
-                    size_t r=(size_t)((sz*GS+z)*S+(sy*GS+y))*S+sx*GS;
-                    for(int x=0;x<GS;++x) blk[r+x]=vox[r+x]?blk[r+x]:v;
+            // seed air voxels from their cell: expand the 4 cell values of a
+            // subcube row into a 16-float row pattern once per 4 rows, then a
+            // dense branchless select per row (auto-vectorizes).
+            float vrow[16];
+            for(int z=0;z<S;++z)for(int y=0;y<S;++y){
+                if((y&3)==0){
+                    const float *cr=cs+((z>>2)*G+(y>>2))*G;
+                    for(int x=0;x<S;++x) vrow[x]=cr[x>>2];
                 }
+                float *bp=blk+(size_t)(z*S+y)*S;
+                const mc_u8 *vp=vox+(size_t)(z*S+y)*S;
+                for(int x=0;x<S;++x) bp[x]=vp[x]?bp[x]:vrow[x];
             }
         }
         // (a) RED-BLACK SOR (two-color Gauss-Seidel, omega=1.6) in a DENSE
@@ -323,8 +332,7 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
         if(do_fine){
             enum { PS=MC_BLK+2, PP=PS*PS, PN=PS*PS*PS };
             static _Thread_local float P[PN];              // pads stay 0
-            static _Thread_local float WD[PN];             // dense w, pads stay 0
-            static _Thread_local float W6[2][PN];
+            static _Thread_local float W6[2][PN];          // pads stay 0
             // parity mask (voxel color) and in-block neighbor count are both
             // block-independent: build once per thread.
             static _Thread_local float PM[PN], CNT[PN];
@@ -337,35 +345,41 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
                 }
                 pm_init=1;
             }
+            // rows: copy P + build per-color weights in one vectorized pass.
+            // Only real-voxel lanes are ever written, so pad/gap lanes of P
+            // and W6 keep their static-zero values across blocks.
             const float O6=1.6f/6.0f;
-            for(int z=0;z<S;++z)for(int y=0;y<S;++y){      // rows: copy + dense w
+            for(int z=0;z<S;++z)for(int y=0;y<S;++y){
                 const mc_u8 *vp=vox+(size_t)(z*S+y)*S;
                 const float *bp=blk+(size_t)(z*S+y)*S;
                 int pb=((z+1)*PS+(y+1))*PS+1;
+                const float *pm=PM+pb;
                 for(int x=0;x<S;++x){
                     P[pb+x]=bp[x];
-                    WD[pb+x]=vp[x]?0.0f:O6;
+                    float w=vp[x]?0.0f:O6, a=w*pm[x];
+                    W6[1][pb+x]=a; W6[0][pb+x]=w-a;
                 }
             }
-            for(int i=PP;i<PN-PP;++i){                     // split w by color
-                float a=WD[i]*PM[i];
-                W6[1][i]=a; W6[0][i]=WD[i]-a;
-            }
-            // each color pass = two FLAT dense loops over the padded array:
-            // (1) neighbor sums into NB (pure reads of P), (2) masked update
-            // of P. Exact red-black Gauss-Seidel: this color's neighbors are
-            // all the OTHER color, untouched within the pass, so the snapshot
-            // in NB is the live value. Splitting removes the read-after-write
-            // dependence that kept the fused in-place loop scalar; both loops
-            // auto-vectorize. Pad/material lanes are killed by w6=0.
-            static _Thread_local float NB[PN];
+            // each color pass = per z-plane: (1) dense neighbor sums into a
+            // small plane buffer NB (pure reads of P), (2) masked update of
+            // the plane. Exact red-black Gauss-Seidel: this color's neighbors
+            // are all the OTHER color, untouched within the pass, so the
+            // snapshot in NB is the live value. Splitting removes the
+            // read-after-write dependence that kept the fused in-place loop
+            // scalar; both loops auto-vectorize (AVX/NEON). Plane blocking
+            // keeps NB and the three active P planes L1-resident instead of
+            // streaming a full-volume NB array through L2 every pass.
+            // Pad/material lanes are killed by w6=0.
             for(int it=0; it<MC_FILL_SWEEPS; ++it){
                 for(int col=0; col<2; ++col){
                     const float *restrict w6=W6[col];
-                    for(int i=PP;i<PN-PP;++i)
-                        NB[i]=P[i-1]+P[i+1]+P[i-PS]+P[i+PS]+P[i-PP]+P[i+PP];
-                    for(int i=PP;i<PN-PP;++i)
-                        P[i]+=w6[i]*(NB[i]-CNT[i]*P[i]);
+                    for(int pz=1; pz<PS-1; ++pz){
+                        float NB[PP]; const int b=pz*PP;
+                        for(int k=0;k<PP;++k)
+                            NB[k]=P[b+k-1]+P[b+k+1]+P[b+k-PS]+P[b+k+PS]+P[b+k-PP]+P[b+k+PP];
+                        for(int k=0;k<PP;++k)
+                            P[b+k]+=w6[b+k]*(NB[k]-CNT[b+k]*P[b+k]);
+                    }
                 }
             }
             for(int z=0;z<S;++z)for(int y=0;y<S;++y)       // material rows are
@@ -374,10 +388,18 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
         }
     }
     mc_dct3_fwd(blk,coef);
-    for(int idx=0;idx<N3;++idx) lv[idx]=quant_one(coef[idx],g_step_tab[idx]);
     static _Thread_local rc_i16 ql[N3];
     static _Thread_local rc_u8 scratch[N3*4+1024];
-    for(int i=0;i<n;++i){ mc_i32 v=lv[i]; ql[i]=(rc_i16)(v>32767?32767:v<-32768?-32768:v); }
+    // fused branchless quant+clamp (same arithmetic as quant_one: for a>=dz,
+    // t=(a-dz)/step+1>=1 truncates identically; for a<dz, t<1 so
+    // max(t,0) truncates to 0). The branchy quant_one loop was scalar.
+    for(int idx=0;idx<N3;++idx){
+        float c=coef[idx], step=g_step_tab[idx];
+        float t=(fabsf(c)-MC_DZ_FRAC*step)/step+1.0f;
+        t=t>0.0f?t:0.0f; t=t<32767.0f?t:32767.0f;
+        mc_i32 v=(mc_i32)t;
+        ql[idx]=(rc_i16)(c<0.0f?-v:v);
+    }
 
     // max-error corrections: locally reconstruct and list voxels with |err| > tau.
     static _Thread_local uint16_t cpos[N3]; static _Thread_local mc_i32 cdel[N3];

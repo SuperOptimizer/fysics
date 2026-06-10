@@ -402,7 +402,8 @@ int fy_process_buffer(const fy_pipeline_cfg *cfg, const unsigned char *u8buf,
     if (cfg->have_dering && cfg->dering) fy_dering_apply(cfg->dering, f, rz0, ry0, rx0, hz, hy, hx,
         cfg->have_norm ? 1.0 / (cfg->norm_hi - cfg->norm_lo) : 1.0 / 255.0);
     if (cfg->have_zdrift && cfg->zdrift_factor) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, cfg->zdrift_factor);
-    memcpy(orig, f, sizeof(float) * hn);
+    memcpy(orig, f, sizeof(float) * hn);   /* (fused conversions tried; the dering/zdrift
+                                            * paths need f finalized first, so the copy stays) */
     { double ecy = cfg->dering_cy > 0 ? cfg->dering_cy : (vol_y - 1) / 2.0;
       double ecx = cfg->dering_cx > 0 ? cfg->dering_cx : (vol_x - 1) / 2.0;
       process_tile(f, orig, u8buf, (int)hz, (int)hy, (int)hx, cfg,
