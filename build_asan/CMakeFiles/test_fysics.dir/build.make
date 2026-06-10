@@ -97,6 +97,8 @@ test_fysics: CMakeFiles/test_fysics.dir/tests/test_fysics.c.o
 test_fysics: CMakeFiles/test_fysics.dir/build.make
 test_fysics: CMakeFiles/test_fysics.dir/compiler_depend.ts
 test_fysics: libfysics.a
+test_fysics: /usr/lib/x86_64-linux-gnu/libcurl.so
+test_fysics: /usr/lib/x86_64-linux-gnu/libcurl.so
 test_fysics: /usr/lib/gcc/x86_64-linux-gnu/15/libgomp.so
 test_fysics: /usr/lib/x86_64-linux-gnu/libpthread.a
 test_fysics: CMakeFiles/test_fysics.dir/link.txt

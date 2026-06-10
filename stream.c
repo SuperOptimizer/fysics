@@ -109,51 +109,6 @@ void fy_norm_apply_u8(const unsigned char *in, float *out, size_t n,
     }
 }
 
-/* ---- GLOBAL GLCAE mapping (the global stage, computed once) ----
- * The global GLCAE stage is exactly a histogram -> lambda-blend -> CDF mapping.
- * We compute it from the WHOLE-VOLUME histogram in finalize, then apply the same
- * 256-entry lookup to every chunk in pass 2. (Defined in glcae.c via the shared
- * global_mapping logic exposed below.) */
-extern void fy_global_glcae_mapping_from_hist(const long *hist, long total, int *t_out);
-
-void fy_glcae_global_finalize(const fy_hist_state *s, int *mapping_out) {
-    fy_global_glcae_mapping_from_hist(s->hist, s->total, mapping_out);
-}
-/* pass 2: apply the global GLCAE lookup to a u8 chunk -> float [0,1] */
-void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
-                              const int *mapping) {
-    float inv = 1.0f / (float)(L - 1);
-    for (size_t i = 0; i < n; i++) out[i] = mapping[in[i]] * inv;
-}
-
-/* ---- auto air/papyrus threshold (Otsu) from the global histogram ----
- * Replaces a hardcoded threshold: finds the intensity that best separates the two
- * modes (air vs papyrus) by maximizing between-class variance (Otsu's method) over
- * the volume's actual histogram. Returns the threshold as a [0,1] fraction (u8/255),
- * matching the air_thresh convention. */
-float fy_auto_air_thresh(const fy_hist_state *s) {
-    long total = s->total;
-    if (total <= 0) return 0.15f;
-    /* total intensity */
-    double sumAll = 0;
-    for (int i = 0; i < 256; i++) sumAll += (double)i * s->hist[i];
-    double wB = 0, sumB = 0, maxVar = -1;
-    int best = 38; /* ~0.15*255 fallback */
-    for (int t = 0; t < 256; t++) {
-        wB += s->hist[t];
-        if (wB == 0) continue;
-        double wF = total - wB;
-        if (wF == 0) break;
-        sumB += (double)t * s->hist[t];
-        double mB = sumB / wB;
-        double mF = (sumAll - sumB) / wF;
-        double var = wB * wF * (mB - mF) * (mB - mF);
-        if (var > maxVar) { maxVar = var; best = t; }
-    }
-    return (float)best / 255.0f;
-}
-
-
 /* ---- segmentation-quality metrics (math in C; Python is glue) ----
  * Computed from a 256-bin histogram so they're O(256), not O(N*thresholds).
  * Build the histogram with fy_hist_accumulate_u8 (or pass counts directly). */
@@ -162,36 +117,6 @@ float fy_auto_air_thresh(const fy_hist_state *s) {
  *   J(t) = (mu_hi - mu_lo)^2 / (var_lo + var_hi) * (min(n_lo,n_hi)/N / 0.5)
  * The balance term penalizes degenerate (mode-collapsed) splits. Returns best J; writes
  * the argmax threshold to *best_t. Intensities normalized to [0,1] (u8/255). */
-double fy_haralick_shapiro(const long hist[256], int lo, int hi, int min_count, int *best_t) {
-    double n = 0, cx[256], cx2[256], c[256];
-    double acc = 0, accx = 0, accx2 = 0;
-    for (int i = 0; i < 256; i++) {
-        double xi = (double)i / 255.0;
-        acc += hist[i]; accx += hist[i] * xi; accx2 += hist[i] * xi * xi;
-        c[i] = acc; cx[i] = accx; cx2[i] = accx2;
-    }
-    n = c[255];
-    double totx = cx[255];
-    if (lo < 1) lo = 1; if (hi > 256) hi = 256;
-    double best = -1; int bt = lo;
-    for (int t = lo; t < hi; t++) {
-        double na = c[t-1], nb = n - na;
-        if (na < min_count || nb < min_count) continue;
-        double ma = cx[t-1] / na, mb = (totx - cx[t-1]) / nb;
-        double va = cx2[t-1] / na - ma * ma;
-        double vb = (cx2[255] - cx2[t-1]) / nb - mb * mb;
-        double bal = (na < nb ? na : nb) / n / 0.5;
-        double J = (mb - ma) * (mb - ma) / (va + vb + 1e-9) * bal;
-        if (J > best) { best = J; bt = t; }
-    }
-    if (best_t) *best_t = bt;
-    return best;
-}
-
-/* Bimodal valley depth from a histogram: smooth (box-5), exclude rails (0,254,255), find the
- * two dominant modes and the valley between them. depth = 1 - h_valley/min(h_dark,h_light) in
- * [0,1] (higher=deeper=better separated). Writes dark/light/valley bins if non-NULL. Returns
- * -1 if not bimodal. */
 double fy_valley_depth(const long hist[256], int *dark_out, int *light_out, int *valley_out) {
     double hf[256];
     for (int i = 0; i < 256; i++) {
@@ -224,36 +149,6 @@ double fy_valley_depth(const long hist[256], int *dark_out, int *light_out, int 
     return 1.0 - vmin / (mn + 1e-12);
 }
 
-
-/* ---- whole-pipeline quality metrics (math in C; Python glue) ----
- * Computed in one pass over a float volume in [0,1]. */
-
-/* Edge/sheet sharpness: mean gradient magnitude (central differences). Higher = sharper
- * boundaries (papyrus sheet edges). Skips a 1-voxel border. */
-double fy_edge_sharpness(const float *v, int nz, int ny, int nx) {
-    double s = 0; long cnt = 0;
-    for (int z = 1; z < nz-1; z++)
-        for (int y = 1; y < ny-1; y++)
-            for (int x = 1; x < nx-1; x++) {
-                size_t i = ((size_t)z*ny + y)*nx + x;
-                double gz = v[i+(size_t)ny*nx] - v[i-(size_t)ny*nx];
-                double gy = v[i+nx] - v[i-nx];
-                double gx = v[i+1] - v[i-1];
-                s += sqrt(gx*gx + gy*gy + gz*gz); cnt++;
-            }
-    return cnt ? s/cnt*0.5 : 0;
-}
-
-/* Dynamic-range usage: fraction of the [0,1] range actually occupied by the bulk (1-99
- * percentile span) -- how well the volume uses its bit depth. From a histogram. */
-double fy_dynamic_range_usage(const long hist[256]) {
-    double n = 0; for (int i = 0; i < 256; i++) n += hist[i];
-    if (n <= 0) return 0;
-    double acc = 0; int lo = 0, hi = 255;
-    for (int i = 0; i < 256; i++) { acc += hist[i]; if (acc >= 0.01*n) { lo = i; break; } }
-    acc = 0; for (int i = 255; i >= 0; i--) { acc += hist[i]; if (acc >= 0.01*n) { hi = i; break; } }
-    return (hi - lo) / 255.0;
-}
 
 /* Flat-region noise: median local std over flat (low-gradient) blocks -- the noise floor.
  * blk=block size, samples nonoverlapping blocks, keeps flat ones (low mean-gradient), returns

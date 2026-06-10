@@ -4,7 +4,7 @@
 # compile C with /usr/bin/cc
 C_DEFINES = 
 
-C_INCLUDES = -I/home/forrest/fysics
+C_INCLUDES = -I/home/forrest/fysics -I/home/forrest/fysics/vendor/libs3
 
 C_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -g -std=gnu11 -fPIE -Ofast -ffast-math -funroll-loops -fno-math-errno -march=native -mtune=native -fopenmp
 

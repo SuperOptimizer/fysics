@@ -46,6 +46,23 @@ static long lmax(long a, long b) { return a > b ? a : b; }
 static void u8_to_f01(const unsigned char *in, float *out, size_t n) {
     for (size_t i = 0; i < n; i++) out[i] = in[i] * (1.0f / 255.0f);
 }
+/* deterministic per-voxel dither in [0,1): integer hash of the GLOBAL voxel coordinate,
+ * so the quantization is tiling-invariant (seam-free) and bit-reproducible. Used as
+ * out = floor(v*255 + d) -- an unbiased dithered quantizer (E[out] = v*255), which kills
+ * the contour banding that round-to-nearest leaves in flat papyrus regions. */
+static inline float dither01(long z, long y, long x) {
+    unsigned int h = (unsigned int)(z * 73856093L) ^ (unsigned int)(y * 19349663L)
+                   ^ (unsigned int)(x * 83492791L);
+    h ^= h >> 16; h *= 0x7feb352dU; h ^= h >> 15; h *= 0x846ca68bU; h ^= h >> 16;
+    return (float)(h >> 8) * (1.0f / 16777216.0f);
+}
+/* quantize one processed voxel (f in [0,1] nominal) to u8 at GLOBAL coords (gz,gy,gx) */
+static inline unsigned char quant_u8(float v, long gz, long gy, long gx, int no_dither) {
+    float t = v * 255.0f + (no_dither ? 0.5f : dither01(gz, gy, gx));
+    if (t <= 0.0f) return 0;
+    int q = (int)t;                 /* floor for non-negative t */
+    return q > 255 ? 255 : (unsigned char)q;
+}
 static int any_nonzero(const unsigned char *b, size_t n) {
     for (size_t i = 0; i < n; i++) if (b[i]) return 1;
     return 0;
@@ -312,6 +329,8 @@ int fy_process_chunk(const fy_zarr *zin, const fy_pipeline_cfg *cfg,
     air = 0;
     if (cfg->have_norm) fy_norm_apply_u8(u8, f, hn, (unsigned char)cfg->norm_lo, (unsigned char)cfg->norm_hi);
     else u8_to_f01(u8, f, hn);
+    if (cfg->have_dering && cfg->dering) fy_dering_apply(cfg->dering, f, rz0, ry0, rx0, hz, hy, hx,
+        cfg->have_norm ? 1.0 / (cfg->norm_hi - cfg->norm_lo) : 1.0 / 255.0);
     if (cfg->have_zdrift && cfg->zdrift_factor) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, cfg->zdrift_factor);
     memcpy(orig, f, sizeof(float) * hn);
     process_tile(f, orig, u8, (int)hz, (int)hy, (int)hx, cfg,
@@ -319,10 +338,9 @@ int fy_process_chunk(const fy_zarr *zin, const fy_pipeline_cfg *cfg,
     { long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0, oi = 0;
       for (long zz = iz0; zz < iz0 + tz; zz++)
       for (long yy = iy0; yy < iy0 + ty; yy++)
-      for (long xx = ix0; xx < ix0 + tx; xx++) {
-          float v = f[((size_t)zz * hy + yy) * hx + xx] * 255.0f + 0.5f;
-          out[oi++] = v < 0 ? 0 : (v > 255 ? 255 : (unsigned char)v);
-      } }
+      for (long xx = ix0; xx < ix0 + tx; xx++)
+          out[oi++] = quant_u8(f[((size_t)zz * hy + yy) * hx + xx],
+                               rz0 + zz, ry0 + yy, rx0 + xx, cfg->no_dither); }
 done:
     if (all_air) *all_air = air;
     free(u8); free(f); free(orig); free(b1); free(b2); free(ws);
@@ -498,17 +516,27 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     if (verbose) fprintf(stderr, "[calib] samples=%d flat_nf_n=%d guided_eps=%.5f air_cut=%d band=%d psf_med=%.2f deconv=%d halo=%d\n",
                          nsamp, nfloor, cfg->guided_eps, cfg->air_cut_u8, cfg->air_cut_band, cfg->psf_med, cfg->do_deconv, halo);
 
-    /* ===================== PASS 1b: global norm + z-drift (streaming) ===================== */
+    /* ===================== PASS 1b: global norm + z-drift + dering (streaming) ===================== */
     fy_hist_state nhist; fy_hist_init(&nhist);
     double *zsums = (double *)calloc(Z, sizeof(double));
     long *zcnts = (long *)calloc(Z, sizeof(long));
     float *zfactor = NULL;
-    int have_norm = 0, have_zdrift = 0;
+    int have_norm = 0, have_zdrift = 0, have_dering = 0;
+    fy_dering *der = NULL;
 
-    if (cfg->do_normalize || cfg->do_zdrift) {
+    if (cfg->do_normalize || cfg->do_zdrift || cfg->do_dering) {
         long ptile = tile > 256 ? tile : 256;
         long pnz = ceil_div(Z, ptile), pny = ceil_div(Y, ptile), pnx = ceil_div(X, ptile);
         long pntiles = pnz * pny * pnx;
+        if (cfg->do_dering) {
+            der = (fy_dering *)malloc(sizeof(fy_dering));
+            /* slab = 2 pass-1b z-tiles, so each tile lands in exactly ONE slab (lock-free merge) */
+            if (!der || fy_dering_init(der, Z, Y, X, cfg->dering_cy > 0 ? cfg->dering_cy : -1,
+                                       cfg->dering_cx > 0 ? cfg->dering_cx : -1,
+                                       (int)(2 * ptile), 8) != 0) {
+                free(der); der = NULL;
+            }
+        }
         #pragma omp parallel
         {
             fy_hist_state lh; fy_hist_init(&lh);
@@ -516,6 +544,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             long *lc = (long *)calloc(Z, sizeof(long));
             unsigned char *pb = (unsigned char *)malloc((size_t)ptile * ptile * ptile);
             float *pf = (float *)malloc(sizeof(float) * (size_t)ptile * ptile * ptile);
+            fy_dering dt; int have_dt = der && fy_dering_tile_init(&dt, der) == 0;
             #pragma omp for schedule(dynamic)
             for (long t = 0; t < pntiles; t++) {
                 long iz = t / (pny * pnx), r = t % (pny * pnx), iy = r / pnx, ix = r % pnx;
@@ -531,6 +560,12 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                 if (fy_zarr_read(&zin, z0, y0, x0, dz, dy, dx, pb) != 0) continue;
                 if (!any_nonzero(pb, n)) continue;
                 if (cfg->do_normalize) fy_hist_accumulate_u8(&lh, pb, n);
+                if (have_dt) {
+                    fy_dering_tile_reset(&dt);
+                    fy_dering_accumulate_u8(&dt, pb, y0, x0, dz, dy, dx, 2);
+                    #pragma omp critical (dering_merge)
+                    fy_dering_merge_tile(der, (int)(z0 / der->slab_z), &dt);
+                }
                 if (cfg->do_zdrift) {
                     /* z-drift only needs a coarse PER-Z trend (mean papyrus brightness per slice)
                      * to decide coherence/slope -- accumulate on a 4x4 spatial SUBSAMPLE in x,y
@@ -553,7 +588,16 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                 if (cfg->do_normalize) fy_hist_merge(&nhist, &lh);
                 for (long z = 0; z < Z; z++) { zsums[z] += ls[z]; zcnts[z] += lc[z]; }
             }
+            if (have_dt) fy_dering_free(&dt);
             free(ls); free(lc); free(pb); free(pf);
+        }
+        /* dering gate: only keep rings that pass the sector vote (>=2 radii detected) */
+        if (der) {
+            long ndet = fy_dering_finalize(der, 15, 100, 0.5, 6.0);
+            if (der->have_rings) have_dering = 1;
+            else { fy_dering_free(der); free(der); der = NULL; }
+            if (verbose) fprintf(stderr, "[pass1] dering: %ld ring radii detected -> %s\n",
+                                 ndet, have_dering ? "subtracting" : "skipped");
         }
         /* norm gate: only if (hi-lo)/255 < 0.40 */
         if (cfg->do_normalize && nhist.total > 0) {
@@ -602,6 +646,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     cfg->have_norm = have_norm; cfg->have_zdrift = have_zdrift;
     cfg->have_dec_range = have_dec_range; cfg->dec_lo = dec_lo; cfg->dec_hi = dec_hi;
     cfg->zdrift_factor = zfactor; cfg->vol_z = Z; cfg->halo = halo;
+    cfg->have_dering = have_dering; cfg->dering = der;
 
     /* CALIBRATE-ONLY mode (out_root==NULL): used by fy_calibrate for the fused export. Keep zfactor
      * alive in cfg (caller owns it); free the histogram accumulators. Do NOT free zfactor here. */
@@ -619,7 +664,7 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     /* ===================== PASS 2: parallel per-tile ===================== */
     long ntz = ceil_div(Z, tile), nty = ceil_div(Y, tile), ntx = ceil_div(X, tile);
     long ntiles = ntz * nty * ntx;
-    long out_done = 0;
+    long out_done = 0, io_fail = 0;
     if (verbose) fprintf(stderr, "[pass2] %ld tiles, halo=%d\n", ntiles, halo);
 
     #pragma omp parallel
@@ -643,12 +688,19 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             long rz1 = lmin(Z, z0 + tz + halo), ry1 = lmin(Y, y0 + ty + halo), rx1 = lmin(X, x0 + tx + halo);
             long hz = rz1 - rz0, hy = ry1 - ry0, hx = rx1 - rx0;
             size_t hn = (size_t)hz * hy * hx;
-            if (fy_zarr_read(&zin, rz0, ry0, rx0, hz, hy, hx, u8) != 0) continue;
+            if (fy_zarr_read(&zin, rz0, ry0, rx0, hz, hy, hx, u8) != 0) {
+                /* a failed read MUST NOT silently leave a fill-value hole in the output */
+                #pragma omp atomic
+                io_fail++;
+                continue;
+            }
             if (!any_nonzero(u8, hn)) continue;
 
-            /* (a) INTENSITY CORRECTIONS FIRST: normalize then z-drift (gated). */
+            /* (a) INTENSITY CORRECTIONS FIRST: normalize, dering, then z-drift (gated). */
             if (have_norm) fy_norm_apply_u8(u8, f, hn, (unsigned char)cfg->norm_lo, (unsigned char)cfg->norm_hi);
             else u8_to_f01(u8, f, hn);
+            if (have_dering) fy_dering_apply(der, f, rz0, ry0, rx0, hz, hy, hx,
+                have_norm ? 1.0 / (cfg->norm_hi - cfg->norm_lo) : 1.0 / 255.0);
             if (have_zdrift) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, zfactor);
             memcpy(orig, f, sizeof(float) * hn);
 
@@ -658,15 +710,18 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
 
             long iz0 = z0 - rz0, iy0 = y0 - ry0, ix0 = x0 - rx0;
 
-            /* tile == output chunk: convert the inner tile to u8 and write the chunk directly. */
+            /* tile == output chunk: convert the inner tile to u8 (dithered, global-coord
+             * keyed -> seam-free) and write the chunk directly. */
             long oi = 0;
             for (long zz = iz0; zz < iz0 + tz; zz++)
             for (long yy = iy0; yy < iy0 + ty; yy++)
-            for (long xx = ix0; xx < ix0 + tx; xx++) {
-                float v = f[((size_t)zz * hy + yy) * hx + xx] * 255.0f + 0.5f;
-                ob[oi++] = v < 0 ? 0 : (v > 255 ? 255 : (unsigned char)v);
+            for (long xx = ix0; xx < ix0 + tx; xx++)
+                ob[oi++] = quant_u8(f[((size_t)zz * hy + yy) * hx + xx],
+                                    rz0 + zz, ry0 + yy, rx0 + xx, cfg->no_dither);
+            if (fy_zarr_write_chunk(&zout, iz, iy, ix, ob, tz, ty, tx) != 0) {
+                #pragma omp atomic
+                io_fail++;
             }
-            fy_zarr_write_chunk(&zout, iz, iy, ix, ob, tz, ty, tx);
             #pragma omp atomic
             out_done++;
             if (verbose && (out_done % 64 == 0)) {
@@ -679,5 +734,10 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
 
     if (verbose) fprintf(stderr, "\n[done] %ld tiles, out shape %ldx%ldx%ld\n", out_done, Z, Y, X);
     free(zsums); free(zcnts); free(zfactor);
+    if (der) { fy_dering_free(der); free(der); cfg->dering = NULL; }
+    if (io_fail > 0) {
+        fprintf(stderr, "[pass2] ERROR: %ld tile read/write failures -- output is INCOMPLETE\n", io_fail);
+        return 1;
+    }
     return 0;
 }

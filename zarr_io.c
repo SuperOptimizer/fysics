@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <time.h>
 #ifdef FYSICS_S3
 #include "vendor/libs3/libs3.h"
 static s3_client *g_fy_s3 = NULL;
@@ -30,26 +31,44 @@ static void fy_s3_ensure(void){
 }
 #endif
 /* fetch one S3 object into `out` (up to cn bytes; exact=1 requires >=cn, else accept short and
- * zero-fill the tail). Returns 1 if handled (S3), 0 if not an S3 path (caller falls back local). */
+ * zero-fill the tail). A MISSING object (HTTP 404) is a legitimate sparse-zarr chunk -> fill.
+ * Any OTHER failure (transport error, 5xx, throttling) is retried with backoff and, if it
+ * persists, reported as a hard error -- it must NEVER silently become fill, or a transient
+ * network blip writes undetectable air into a multi-TB output.
+ * Returns: 1 = handled OK (data or legit 404 fill), 0 = not an S3 path, -1 = S3 error. */
 static int fy_s3_get(const char *path, unsigned char *out, long cn, unsigned char fill, int exact){
 #ifdef FYSICS_S3
     if(strncmp(path,"s3://",5)!=0) return 0;
     fy_s3_ensure();
-    if(!g_fy_s3){ memset(out,fill,cn); return 1; }
-    s3_response r; memset(&r,0,sizeof r);
-    s3_status st=s3_get(g_fy_s3,path,&r);
-    if(st==S3_OK && r.status==200 && r.body){
-        long have=(long)r.body_len;
-        if(exact && have<cn){ memset(out,fill,cn); }
-        else { long cp=have<cn?have:cn; memcpy(out,r.body,cp); if(cp<cn) memset(out+cp,0,cn-cp); }
-    } else memset(out,fill,cn);
-    s3_response_free(&r);
-    return 1;
+    if(!g_fy_s3){ fprintf(stderr,"zarr: S3 client init failed for %s\n",path); return -1; }
+    const int max_tries = 5;
+    for(int try = 0; try < max_tries; try++){
+        if(try > 0){ /* backoff: 0.2s, 0.4s, 0.8s, 1.6s */
+            struct timespec ts; long ms = 200L << (try - 1);
+            ts.tv_sec = ms / 1000; ts.tv_nsec = (ms % 1000) * 1000000L;
+            nanosleep(&ts, NULL);
+        }
+        s3_response r; memset(&r,0,sizeof r);
+        s3_status st=s3_get(g_fy_s3,path,&r);
+        if(st==S3_OK && r.status==200 && r.body){
+            long have=(long)r.body_len;
+            if(exact && have<cn) memset(out,fill,cn);   /* short object = stored edge chunk */
+            else { long cp=have<cn?have:cn; memcpy(out,r.body,cp); if(cp<cn) memset(out+cp,0,cn-cp); }
+            s3_response_free(&r);
+            return 1;
+        }
+        if(st==S3_OK && r.status==404){ memset(out,fill,cn); s3_response_free(&r); return 1; }
+        if(try == max_tries-1)
+            fprintf(stderr,"zarr: S3 GET failed after %d tries (status=%d http=%ld): %s\n",
+                    max_tries, (int)st, (long)r.status, path);
+        s3_response_free(&r);
+    }
+    return -1;
 #else
     (void)path;(void)out;(void)cn;(void)fill;(void)exact; return 0;
 #endif
 }
-/* chunk read: requires the full chunk (exact). */
+/* chunk read: requires the full chunk (exact). Same return codes as fy_s3_get. */
 static int fy_s3_read_chunk(const char *path, unsigned char *out, long cn, unsigned char fill){
     return fy_s3_get(path, out, cn, fill, 1);
 }
@@ -84,7 +103,9 @@ int fy_zarr_open(fy_zarr *z, const char *root) {
         /* fetch .zarray over S3 (a tiny JSON object). read_chunk's S3 path needs a fixed length,
          * so do a dedicated small GET here. */
         unsigned char tmp[4096]; memset(tmp,0,sizeof tmp);
-        if (!fy_s3_get(path, tmp, sizeof(tmp)-1, 0, 0)) { fprintf(stderr,"zarr: S3 not compiled in (need FYSICS_S3) for %s\n", path); return 1; }
+        int s3 = fy_s3_get(path, tmp, sizeof(tmp)-1, 0, 0);
+        if (s3 == 0) { fprintf(stderr,"zarr: S3 not compiled in (need FYSICS_S3) for %s\n", path); return 1; }
+        if (s3 < 0)  { fprintf(stderr,"zarr: S3 error fetching %s\n", path); return 1; }
         memcpy(buf, tmp, sizeof(buf)-1); buf[sizeof(buf)-1]=0; n = strlen(buf);
         if (n == 0) { fprintf(stderr, "zarr: no %s (S3)\n", path); return 1; }
     } else {
@@ -129,17 +150,21 @@ int fy_zarr_create(fy_zarr *z, const char *root, const long shape[3], const long
 
 /* read one chunk (cz,cy,cx) into `out`, laid out with the chunk's TRUE stored extent
  * (ez,ey,ex) -- EDGE chunks are stored smaller than the nominal chunk size (matching how
- * fy_zarr_write_chunk wrote them). Fills with z->fill if the file is absent or short. */
-static void read_chunk(const fy_zarr *z, long cz, long cy, long cx,
-                       long ez, long ey, long ex, unsigned char *out) {
+ * fy_zarr_write_chunk wrote them). Fills with z->fill if the chunk is absent (sparse zarr).
+ * Returns 0 on success (incl. fill), 1 on a real I/O error (S3 failure after retries). */
+static int read_chunk(const fy_zarr *z, long cz, long cy, long cx,
+                      long ez, long ey, long ex, unsigned char *out) {
     long cn = ez * ey * ex;
     char path[2048];
     snprintf(path, sizeof(path), "%s/0/%ld/%ld/%ld", z->root, cz, cy, cx);
-    if (fy_s3_read_chunk(path, out, cn, z->fill)) return;   /* S3 path (if FYSICS_S3 & s3://) */
+    int s3 = fy_s3_read_chunk(path, out, cn, z->fill);   /* S3 path (if FYSICS_S3 & s3://) */
+    if (s3 == 1) return 0;
+    if (s3 == -1) return 1;
     FILE *f = fopen(path, "rb");
-    if (!f) { memset(out, z->fill, cn); return; }
+    if (!f) { memset(out, z->fill, cn); return 0; }      /* absent = sparse fill */
     size_t got = fread(out, 1, cn, f); fclose(f);
     if ((long)got < cn) memset(out + got, z->fill, cn - got);
+    return 0;
 }
 
 /* read an arbitrary region [z0..z0+dz) into `out` (dz*dy*dx, C order), assembling from chunks. */
@@ -158,7 +183,7 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
             for (long gx = x0; gx < x0 + dx; ) {
                 long cx = gx / C2, lx = gx - cx * C2, hx = (lx + (x0 + dx - gx) < C2) ? lx + (x0 + dx - gx) : C2;
                 long ex = (z->shape[2] - cx * C2 < C2) ? (z->shape[2] - cx * C2) : C2;
-                read_chunk(z, cz, cy, cx, ez, ey, ex, cb);   /* laid out with TRUE strides ez,ey,ex */
+                if (read_chunk(z, cz, cy, cx, ez, ey, ex, cb) != 0) { free(cb); return 1; }
                 /* clamp the copy span to the chunk's true extent (halo reads near the volume edge
                  * must not read past the stored data). */
                 long hzc = hz < ez ? hz : ez, hyc = hy < ey ? hy : ey, hxc = hx < ex ? hx : ex;

@@ -30,9 +30,9 @@ Be honest about what we can defensibly claim on ESRF/BM18 data:
 | **u8 → physical attenuation** | ✅ **exact** | metadata window (`target_window_f32_min/max`) inverted per-volume → consistent physical units across volumes (`fy_u8_to_phys`). |
 | **per-volume noise model** | ✅ measured | `fy_estimate_noise` fits `var=g·I+b` from the data; the level varies **1.5–3.3× scroll-to-scroll** so it must be estimated per-volume, not hardcoded. |
 | **partial delta_beta (fine vols)** | ✅ measured | full inversion over-inverts ≤4.3 µm volumes; `fy_auto_deltabeta_scale` backs off to ~0.35× (measured optimum). |
-| **guided / NLM denoise** | ✅ safe, generic | guided filter is the recommended denoiser; strength auto-set from the measured noise. Apply *after* deconv. |
+| **guided denoise** | ✅ safe, generic | guided filter is the recommended denoiser; strength auto-set from the measured noise. Apply *after* deconv. |
 | FBP ramp filter inversion | ❌ not clean | sinogram-domain, pre-backprojection — not invertible from the reconstructed volume. **Not implemented.** |
-| ring-artifact removal | ⚠️ heuristic | residual rings have no metadata model; standard suppression is heuristic, not a physics inverse. |
+| **residual ring removal** | ✅ detect-then-subtract | `fy_dering_*`: rings detected by an angular **sector sign-consistency vote** at the metadata rotation axis (a spiral wrap drifts in radius with angle and fails the vote; a true ring doesn't — verified on PHerc0139 2.4 µm: 267 ring radii, 93 % of ring energy removed in one pass). Only the detected component is subtracted; not a physics inverse, but measured, gated, and structure-safe. On by default in the pipeline (`--no-dering` to disable; `--dering-center y x` to override the axis). |
 
 So fysics provides a **physics-exact Paganin deblur** (contrast restoration), a
 **per-volume-calibrated denoise**, and **exact physical-unit recovery**. The deblur
@@ -115,7 +115,7 @@ iteration + I/O** (use your existing fast zarr reader). Operators split two ways
 neighborhood, so process one chunk **+ a halo** independently (embarrassingly
 parallel). Halo = `fy_kernel_halo()` (~15 vox).
 
-**GLOBAL ops** (normalization, GLCAE global stage) — need whole-volume statistics,
+**GLOBAL ops** (normalization, ring detection) — need whole-volume statistics,
 so they are **two-pass streaming**:
 
 ```c
@@ -126,21 +126,19 @@ for (each chunk)            /* your I/O loop */
 /* (parallel? accumulate per-thread, then fy_hist_merge) */
 
 /* FINALIZE: compute the mapping ONCE from the global histogram */
-int glcae_map[256];  fy_glcae_global_finalize(&st, glcae_map);
 unsigned char lo, hi; fy_norm_finalize(&st, 0.5, 99.5, &lo, &hi);
 
 /* PASS 2: apply the SAME mapping to every chunk -> consistent everywhere */
 for (each chunk) {
     fy_norm_apply_u8(chunk_u8, tmpf, chunk_n, lo, hi);      /* global normalize */
-    fy_glcae_global_apply_u8(chunk_u8, outf, chunk_n, glcae_map);  /* global GLCAE */
-    /* + local ops on chunk+halo: fy_deconvolve, fy_bilateral_denoise, ... */
-    fy_float_to_u8(outf, out_u8, chunk_n);                  /* write back u8 */
+    /* + local ops on chunk+halo: fy_deconvolve, fy_guided_denoise, ... */
+    fy_float_to_u8(tmpf, out_u8, chunk_n);                  /* write back u8 */
 }
 ```
 
 The global state is a 256-long histogram (a few KB) — **20TB never sits in RAM**,
-and a per-slice operation never sees inconsistent global stats. Verified: chunked
-two-pass GLCAE == whole-volume processing, **bit-identical**.
+and a per-chunk operation never sees inconsistent global stats. (The ring
+detector follows the same two-pass pattern with a per-slab radial profile.)
 
 ## Build (CMake)
 
@@ -159,12 +157,21 @@ shared (`libfysics.so`) library plus the public header.
 
 | region | time | throughput |
 |---|---|---|
-| 8×512×512 (viewer slab) | ~150 ms | ~14 Mvox/s |
-| 64×256×256 | ~420 ms | ~10 Mvox/s |
-| 256×256×256 (batch tile) | ~1.6 s | ~10 Mvox/s |
+| 8×512×512 (viewer slab) | ~107 ms | ~20 Mvox/s |
+| 64×256×256 | ~355 ms | ~12 Mvox/s |
+| 256×256×256 (batch tile) | ~1.27 s | ~13 Mvox/s |
+| 176×176×176 (real halo'd 128-tile) | ~0.49 s | ~11 Mvox/s (was 1.69 s: 3.5×) |
 
-Interactive for viewer-sized regions; the FFT is the cost (self-contained radix-2,
-auto-vectorized). A finer FFT (radix-4/split-radix) would speed it further if needed.
+Interactive for viewer-sized regions; the FFT is the cost (self-contained, sizes
+2^k and 3·2^k via a radix-3 split, precomputed twiddle tables so the butterflies
+vectorize). Sizes pad to `fy_next_fft_size()` — a 176³ halo'd tile costs a 192³
+FFT, not 256³. The Wiener weight is applied through a radial LUT (no per-voxel
+sqrt/exp). The guided denoise uses subsampled coefficients by default (He & Sun
+fast guided filter, s=2): ~3× faster, visually identical; set
+`cfg.guided_subsample = 1` for the exact path. Output u8 quantization is
+dithered by default (hash of the global voxel coordinate: unbiased, seam-free,
+reproducible) to prevent banding in flat papyrus; `cfg.no_dither = 1` restores
+round-to-nearest.
 
 ## Verification
 

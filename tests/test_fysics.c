@@ -53,6 +53,132 @@ static void test_fft_roundtrip(void) {
     free(re); free(im); free(orig);
 }
 
+static void test_fft_radix3(void) {
+    /* 1-D radix-3 (n = 3*2^k) vs naive DFT */
+    int n = 48;
+    float re[48], im[48], dre[48], dim[48], re2[48], im2[48];
+    for (int i = 0; i < n; i++) {
+        re[i] = sinf(i * 0.7f) + 0.3f * cosf(i * 1.3f);
+        im[i] = 0.2f * sinf(i * 0.31f);
+        re2[i] = re[i]; im2[i] = im[i];
+    }
+    naive_dft(re, im, dre, dim, n, -1);
+    fy_fft1d(re2, im2, n, -1);
+    double maxerr = 0;
+    for (int i = 0; i < n; i++) {
+        double e = fabs(re2[i] - dre[i]) + fabs(im2[i] - dim[i]);
+        if (e > maxerr) maxerr = e;
+    }
+    CHECK(maxerr < 1e-3, "fft1d radix-3 (n=48) matches naive DFT");
+
+    /* 3-D round-trip on mixed sizes (12, 8, 24) incl. radix-3 axes */
+    int nz = 12, ny = 8, nx = 24, nn = nz*ny*nx;
+    float *rr = malloc(sizeof(float)*nn), *ii = calloc(nn, sizeof(float));
+    float *orig = malloc(sizeof(float)*nn);
+    for (int i = 0; i < nn; i++) { rr[i] = (float)((i*2654435761u) % 1000) / 1000.0f; orig[i] = rr[i]; }
+    fy_fft3d(rr, ii, nz, ny, nx, -1);
+    fy_fft3d(rr, ii, nz, ny, nx, +1);
+    fy_fft3d_normalize(rr, ii, nz, ny, nx);
+    maxerr = 0;
+    for (int i = 0; i < nn; i++) { double e = fabs(rr[i] - orig[i]); if (e > maxerr) maxerr = e; }
+    CHECK(maxerr < 1e-4, "fft3d radix-3 sizes round-trip");
+    free(rr); free(ii); free(orig);
+
+    CHECK(fy_next_fft_size(176) == 192 && fy_next_fft_size(128) == 128 &&
+          fy_next_fft_size(160) == 192 && fy_next_fft_size(97) == 128,
+          "fy_next_fft_size picks 3*2^k when smaller");
+}
+
+static void test_guided_fast(void) {
+    /* fast (s=2) vs exact guided filter: same smoothing, small pointwise difference */
+    int nz = 32, ny = 32, nx = 32, n = nz*ny*nx;
+    float *in = malloc(sizeof(float)*n), *e = malloc(sizeof(float)*n), *fst = malloc(sizeof(float)*n);
+    float *ws = malloc(sizeof(float)*fy_guided_ws_floats(nz,ny,nx));
+    unsigned int rng = 12345;
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        rng = rng*1664525u + 1013904223u;
+        float noise = ((rng >> 8) & 0xFFFF) / 65535.0f - 0.5f;
+        float sig = (x < nx/2) ? 0.3f : 0.7f;        /* step edge + noise */
+        in[((size_t)z*ny+y)*nx+x] = sig + 0.05f * noise;
+    }
+    double eps = 0.01*0.01 * 4;
+    fy_guided_denoise_ws(in, e, nz, ny, nx, 2, eps, ws);
+    fy_guided_denoise_fast_ws(in, fst, nz, ny, nx, 2, eps, 2, ws);
+    double mad = 0, edge_exact = 0, edge_fast = 0;
+    for (int i = 0; i < n; i++) mad += fabs(fst[i] - e[i]);
+    mad /= n;
+    /* edge must survive in both: mean difference across the step */
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) {
+        size_t L = ((size_t)z*ny+y)*nx + nx/2 - 4, R = ((size_t)z*ny+y)*nx + nx/2 + 4;
+        edge_exact += e[R] - e[L]; edge_fast += fst[R] - fst[L];
+    }
+    edge_exact /= nz*ny; edge_fast /= nz*ny;
+    CHECK(mad < 0.01, "fast guided filter tracks exact (mean |diff| < 0.01)");
+    CHECK(edge_fast > 0.8 * edge_exact, "fast guided filter preserves edges");
+    free(in); free(e); free(fst); free(ws);
+}
+
+static void test_dering(void) {
+    /* phantom: spiral winding (must SURVIVE) + true rings (must be detected+removed) + noise */
+    int nz = 32, ny = 256, nx = 256;
+    double cy = 127.5, cx = 127.5;
+    size_t n = (size_t)nz * ny * nx;
+    unsigned char *vol = malloc(n);
+    unsigned int rng = 777;
+    const double R1 = 60, A1 = +10, R2 = 110, A2 = -8;  /* injected rings (u8) */
+    for (int z = 0; z < nz; z++)
+        for (int y = 0; y < ny; y++)
+            for (int x = 0; x < nx; x++) {
+                double dy = y - cy, dx = x - cx;
+                double r = sqrt(dy*dy + dx*dx), th = atan2(dy, dx);
+                /* spiral wraps: radius drifts 192 px/turn (period 24) -> a full wrap
+                 * period crosses each 45-degree sector, like the real winding */
+                double v = 128 + 30 * cos(2*M_PI*(r - 192*th/(2*M_PI)) / 24);
+                v += A1 * exp(-(r-R1)*(r-R1)/(2*0.8*0.8));   /* ring 1 */
+                v += A2 * exp(-(r-R2)*(r-R2)/(2*0.8*0.8));   /* ring 2 */
+                rng = rng*1664525u + 1013904223u;
+                v += ((rng >> 8) & 0xFF) / 25.5 - 5.0;        /* +-5 noise */
+                vol[((size_t)z*ny+y)*nx+x] = (unsigned char)(v < 1 ? 1 : (v > 255 ? 255 : v));
+            }
+    fy_dering d;
+    CHECK(fy_dering_init(&d, nz, ny, nx, -1, -1, 64, 8) == 0, "dering init");
+    fy_dering dt;
+    CHECK(fy_dering_tile_init(&dt, &d) == 0, "dering tile init");
+    fy_dering_accumulate_u8(&dt, vol, 0, 0, nz, ny, nx, 1);
+    fy_dering_merge_tile(&d, 0, &dt);
+    long ndet = fy_dering_finalize(&d, 15, 50, 2.0, 15.0);
+    CHECK(d.have_rings, "dering detects rings");
+    /* detected at the injected radii, correct signs */
+    float r1 = 0, r2 = 0;
+    for (int r = (int)R1-1; r <= (int)R1+1; r++) if (fabsf(d.ring[r]) > fabsf(r1)) r1 = d.ring[r];
+    for (int r = (int)R2-1; r <= (int)R2+1; r++) if (fabsf(d.ring[r]) > fabsf(r2)) r2 = d.ring[r];
+    CHECK(r1 > 4.0f, "ring 1 (+10 u8) detected");
+    CHECK(r2 < -3.0f, "ring 2 (-8 u8) detected");
+    /* spiral must NOT trigger detections away from the rings */
+    int false_pos = 0;
+    for (int r = 20; r < 120; r++)
+        if (fabs(r - R1) > 4 && fabs(r - R2) > 4 && d.ring[r] != 0) false_pos++;
+    CHECK(false_pos <= 3, "spiral winding not flagged as rings (sector vote)");
+    /* apply and verify the ring is actually removed from the volume */
+    float *f = malloc(sizeof(float)*n);
+    for (size_t i = 0; i < n; i++) f[i] = vol[i] * (1.0f/255.0f);
+    fy_dering_apply(&d, f, 0, 0, 0, nz, ny, nx, 1.0/255.0);
+    /* residual ring at R1: angular mean minus local radial baseline, before vs after */
+    double before = 0, after = 0, base_b = 0, base_a = 0; long c1 = 0, cb = 0;
+    for (int z = 0; z < nz; z++)
+        for (int y = 0; y < ny; y++)
+            for (int x = 0; x < nx; x++) {
+                double r = sqrt((y-cy)*(y-cy) + (x-cx)*(x-cx));
+                size_t i = ((size_t)z*ny+y)*nx+x;
+                if (fabs(r - R1) < 1.0) { before += vol[i]/255.0; after += f[i]; c1++; }
+                else if (fabs(r - R1) > 5 && fabs(r - R1) < 8) { base_b += vol[i]/255.0; base_a += f[i]; cb++; }
+            }
+    double resid_b = before/c1 - base_b/cb, resid_a = after/c1 - base_a/cb;
+    CHECK(fabs(resid_a) < 0.4 * fabs(resid_b), "apply removes >60% of ring amplitude");
+    (void)ndet;
+    fy_dering_free(&dt); fy_dering_free(&d); free(vol); free(f);
+}
+
 static void test_paganin_transfer(void) {
     fy_physics p = {1000.0, 78.0, 220.0, 2.4, 1.2, 4.0};
     /* nabu reference values (cycles/voxel grid, px=2.4): computed in python */
@@ -94,143 +220,26 @@ static void test_halo_reasonable(void) {
 }
 
 
-static void test_nlm_denoises(void) {
-    int nz=16,ny=24,nx=24,n=nz*ny*nx;
-    float *clean=malloc(4*n),*noisy=malloc(4*n),*out=malloc(4*n);
-    /* smooth structure + noise */
-    unsigned s=12345;
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        double v=0.5+0.4*sin(x*0.4)*cos(y*0.3);
-        clean[(z*ny+y)*nx+x]=(float)v;
-        s=s*1103515245u+12345u; double nse=((s>>16)&0x7fff)/32768.0-0.5;
-        noisy[(z*ny+y)*nx+x]=(float)(v+0.15*nse);
-    }
-    fy_nlm_denoise(noisy,out,nz,ny,nx,0.15,4,1);
-    /* denoised should be closer to clean than noisy was */
-    double en=0,eo=0;
-    for(int i=0;i<n;i++){double a=noisy[i]-clean[i],b=out[i]-clean[i];en+=a*a;eo+=b*b;}
-    CHECK(eo<en, "NLM reduces error vs clean (denoises)");
-    printf("      (noisy MSE=%.5f -> denoised MSE=%.5f)\n", en/n, eo/n);
-    free(clean);free(noisy);free(out);
-}
-static void test_bilateral_denoises(void){
-    int nz=16,ny=24,nx=24,n=nz*ny*nx;
-    float *clean=malloc(4*n),*noisy=malloc(4*n),*out=malloc(4*n);
-    unsigned s=999;
-    /* smooth spatial structure so neighbors are genuinely similar */
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        double v=0.5+0.3*sin(x*0.25)*sin(y*0.2);
-        clean[(z*ny+y)*nx+x]=(float)v;
-        s=s*1103515245u+12345u;double nse=((s>>16)&0x7fff)/32768.0-0.5;
-        noisy[(z*ny+y)*nx+x]=(float)(v+0.08*nse);
-    }
-    /* sigma_range >= noise amplitude so the filter averages across noise */
-    fy_bilateral_denoise(noisy,out,nz,ny,nx,1.5,0.10,2);
-    double en=0,eo=0;for(int i=0;i<n;i++){double a=noisy[i]-clean[i],b=out[i]-clean[i];en+=a*a;eo+=b*b;}
-    CHECK(eo<en,"bilateral reduces error vs clean");
-    printf("      (noisy MSE=%.5f -> denoised MSE=%.5f)\n", en/n, eo/n);
-    free(clean);free(noisy);free(out);
-}
 
 
-static void test_process_recipe(void){
-    fy_physics p={1000,78,220,2.4,1.2,4.0};
-    int nz=16,ny=64,nx=64,n=nz*ny*nx;
-    float*in=malloc(4*n),*out=malloc(4*n);
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        double v=(y%20<10)?0.6+0.1*sin(x*0.5):0.05; // sheets + air
-        in[(z*ny+y)*nx+x]=(float)v;
-    }
-    fy_recipe r=fy_recipe_default();
-    int rc=fy_process(in,out,nz,ny,nx,&p,&r);
-    CHECK(rc==0,"fy_process default runs");
-    int finite=1; for(int i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
-    CHECK(finite,"fy_process output finite");
-    fy_recipe d=fy_recipe_default();
-    CHECK(d.deconv_reg>0 && d.air_thresh>0,"default recipe sharpens + masks");
-    free(in);free(out);
-}
 
 
-static void test_streaming_global(void){
-    /* chunked two-pass GLCAE-global == whole-volume (the 20TB design) */
-    int n=8*32*32; unsigned char*vol=malloc(n);
-    for(int i=0;i<n;i++) vol[i]=(unsigned char)((i*7)%256);
-    fy_hist_state st; fy_hist_init(&st);
-    for(int z=0;z<8;z+=2) fy_hist_accumulate_u8(&st, vol+z*32*32, 2*32*32);
-    int mp[256]; fy_glcae_global_finalize(&st,mp);
-    float*oc=malloc(4*n);
-    for(int z=0;z<8;z+=2) fy_glcae_global_apply_u8(vol+z*32*32, oc+z*32*32, 2*32*32, mp);
-    fy_hist_state s2; fy_hist_init(&s2); fy_hist_accumulate_u8(&s2,vol,n);
-    int mp2[256]; fy_glcae_global_finalize(&s2,mp2);
-    float*ow=malloc(4*n); fy_glcae_global_apply_u8(vol,ow,n,mp2);
-    double md=0; for(int i=0;i<n;i++){double d=fabs(oc[i]-ow[i]);if(d>md)md=d;}
-    CHECK(md<1e-6,"streaming GLCAE-global == whole-volume (chunked correctness)");
-    free(vol);free(oc);free(ow);
-}
 
 
-static void test_gureyev_deconv(void){
-    fy_physics p={1000,77,220,2.403,1.2,4.0,0.6};
-    int nz=24,ny=24,nx=24,n=nz*ny*nx;
-    float*in=malloc(4*n),*out=malloc(4*n);
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        double r=(x-12.0)*(x-12.0)+(y-12.0)*(y-12.0)+(z-12.0)*(z-12.0);
-        in[(z*ny+y)*nx+x]=(float)exp(-r/30.0);
-    }
-    int rc=fy_deconvolve_gureyev(in,out,nz,ny,nx,&p,0.02);
-    CHECK(rc==0,"gureyev deconv runs");
-    int finite=1; for(int i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
-    CHECK(finite,"gureyev output finite");
-    double si=0,so=0,mi=0,mo=0;
-    for(int i=0;i<n;i++){mi+=in[i];mo+=out[i];} mi/=n;mo/=n;
-    for(int i=0;i<n;i++){si+=(in[i]-mi)*(in[i]-mi);so+=(out[i]-mo)*(out[i]-mo);}
-    CHECK(so>si,"gureyev sharpens (raises contrast vs input)");
-}
 
 
-static void test_fsc(void){
-    int nz=32,ny=32,nx=32,n=nz*ny*nx;
-    float*s=malloc(4*n),*b=malloc(4*n),*fr=malloc(4*24),*fc=malloc(4*24);
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++)
-        s[(z*ny+y)*nx+x]=(float)(0.5+0.3*sin(x*0.3)*cos(y*0.25)+0.15*sin(x*1.1));
-    /* FSC of a volume with itself = ~1 everywhere (perfect correlation) */
-    fy_fsc(s,s,nz,ny,nx,24,fr,fc);
-    int high=1; for(int k=1;k<12;k++) if(fc[k]<0.9f) high=0;
-    CHECK(high,"FSC(vol,vol) ~ 1 (self-correlation)");
-    /* blurred resolves <= structured */
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        double a=0;int c=0;for(int dx=-2;dx<=2;dx++){int xx=x+dx;if(xx<0||xx>=nx)continue;a+=s[(z*ny+y)*nx+xx];c++;}
-        b[(z*ny+y)*nx+x]=(float)(a/c);}
-    float rs=-1; int rc=fy_fsc_self(s,nz,ny,nx,12,0.5f,&rs,NULL,NULL);
-    CHECK(rc==0 && rs>=0.0f && rs<=1.0f,"FSC self returns valid resolution fraction");
-    free(s);free(b);free(fr);free(fc);
-}
 
 
-static void test_zdrift(void){
-    int nz=80,ny=24,nx=24,n=nz*ny*nx;
-    float*v=malloc(4*n);
-    for(int z=0;z<nz;z++){float d=1.0f-0.13f*z/(nz-1);
-        for(int i=0;i<ny*nx;i++) v[(size_t)z*ny*nx+i]=0.6f*d;}
-    fy_correct_zdrift(v,nz,ny,nx,0.1f);
-    double m0=0,mN=0; for(int i=0;i<ny*nx;i++){m0+=v[i];mN+=v[(size_t)(nz-1)*ny*nx+i];}
-    m0/=ny*nx; mN/=ny*nx;
-    CHECK(fabs(m0-mN)/m0 < 0.03,"z-drift removed (slice0 ~ sliceN after)");
-    free(v);
-}
 
 
-static void test_auto_thresh(void){
-    fy_hist_state s; fy_hist_init(&s);
-    for(int i=0;i<256;i++){
-        long air=(long)(100000*exp(-(i-25.0)*(i-25.0)/200.0));
-        long pap=(long)(120000*exp(-(i-160.0)*(i-160.0)/2000.0));
-        s.hist[i]=air+pap; s.total+=air+pap;
-    }
-    float th=fy_auto_air_thresh(&s);
-    CHECK(th>0.1f && th<0.5f,"Otsu auto air-threshold lands in the valley");
-}
+
+
+
+
+
+
+
+
 
 static void test_estimate_noise(void){
     /* synthetic volume: smooth signal + KNOWN white noise of std sigma.
@@ -275,53 +284,9 @@ static void test_estimate_noise(void){
     free(v); free(v2);
 }
 
-static void test_compact(void){
-    int nz=48,ny=48,nx=48; size_t n=(size_t)nz*ny*nx;
-    float *v=malloc(4*n), *out=malloc(4*n);
-    /* OVERSAMPLED volume: only low frequencies -> downsample 2x should be ~lossless */
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++)
-        v[((size_t)z*ny+y)*nx+x]=(float)(0.5+0.3*sin(x*0.15)*cos(y*0.13)*sin(z*0.12));
-    int oz,oy,ox;
-    int rc=fy_downsample(v,out,nz,ny,nx,2.0,&oz,&oy,&ox);
-    CHECK(rc==0 && oz==24 && oy==24 && ox==24, "downsample 2x gives half-size grid");
-    /* oversampled (smooth) volume -> recommends a shrink */
-    double f_smooth=fy_recommend_downsample(v,nz,ny,nx,0.03);
-    CHECK(f_smooth>1.0, "oversampled volume -> recommends downsample >1x");
-    /* HIGH-frequency volume (detail at Nyquist) -> NOT compactible */
-    float *hf=malloc(4*n);
-    unsigned s=77;
-    for(int i=0;i<(int)n;i++){ s=s*1103515245u+12345u; hf[i]=0.5f+0.4f*(((s>>16)&1)?1:-1); } /* checkerboard-ish */
-    double f_hf=fy_recommend_downsample(hf,nz,ny,nx,0.03);
-    CHECK(f_hf < f_smooth, "high-freq volume less compactible than smooth one");
-    free(v);free(out);free(hf);
-}
 
-static void test_gat_and_quality(void){
-    /* GAT forward->inverse round-trips exactly */
-    size_t n=1000; float *in=malloc(4*n),*t=malloc(4*n),*back=malloc(4*n);
-    for(size_t i=0;i<n;i++) in[i]=0.01f+0.0009f*i;  /* spread of intensities */
-    double g=0.02,b=1e-4;
-    fy_gat_forward(in,t,n,g,b);
-    fy_gat_inverse(t,back,n,g,b);
-    double maxe=0; for(size_t i=0;i<n;i++){double e=fabs(back[i]-in[i]); if(e>maxe)maxe=e;}
-    CHECK(maxe<1e-4, "GAT forward->inverse round-trips");
-    free(in);free(t);free(back);
-    /* quality denoise reduces error vs clean on a noisy textured volume */
-    int nz=24,ny=24,nx=24; size_t m=(size_t)nz*ny*nx;
-    float *clean=malloc(4*m),*noisy=malloc(4*m),*out=malloc(4*m);
-    unsigned s=4242;
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        double v=0.4+0.25*sin(x*0.5)*cos(y*0.4);
-        clean[((size_t)z*ny+y)*nx+x]=(float)v;
-        s=s*1103515245u+12345u; double nse=((s>>16)&0x7fff)/32768.0-0.5;
-        noisy[((size_t)z*ny+y)*nx+x]=(float)(v+0.06*nse);
-    }
-    int rc=fy_denoise_quality(noisy,out,nz,ny,nx);
-    CHECK(rc==0,"fy_denoise_quality runs");
-    double en=0,eo=0; for(size_t i=0;i<m;i++){double a=noisy[i]-clean[i],bb=out[i]-clean[i];en+=a*a;eo+=bb*bb;}
-    CHECK(eo<en,"quality denoise reduces error vs clean");
-    free(clean);free(noisy);free(out);
-}
+
+
 
 static void test_deltabeta_scale(void){
     /* fine/strong-filter volume (small H_nyq) -> partial inversion (<1);
@@ -350,27 +315,7 @@ static void test_dewindow(void){
     CHECK(fabs(a-b)>1.0, "fixed physical level -> different u8 per volume (the whole point)");
 }
 
-static void test_sheetness(void){
-    int nz=32,ny=32,nx=32; size_t n=(size_t)nz*ny*nx;
-    float*in=malloc(4*n),*out=malloc(4*n);
-    /* thin bright sheet (single z-plane) on dark bg -> after blur, a plate */
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++)
-        in[((size_t)z*ny+y)*nx+x]=(z==16)?0.8f:0.05f;
-    fy_sheetness(in,out,nz,ny,nx,2.0,0.5,0.5,-1,1);
-    float on=out[((size_t)16*ny+16)*nx+16], off=out[((size_t)8*ny+16)*nx+16];
-    CHECK(on>0.5f && off<0.05f, "sheetness lights up plate, dark off it");
-    /* selectivity: a tube and a blob must score far lower than a sheet */
-    for(size_t i=0;i<n;i++)in[i]=0.05f;
-    for(int x=0;x<nx;x++) in[((size_t)16*ny+16)*nx+x]=0.8f;
-    fy_sheetness(in,out,nz,ny,nx,2.0,0.5,0.5,-1,1);
-    float tube=out[((size_t)16*ny+16)*nx+16];
-    for(size_t i=0;i<n;i++)in[i]=0.05f;
-    in[((size_t)16*ny+16)*nx+16]=0.8f;
-    fy_sheetness(in,out,nz,ny,nx,2.0,0.5,0.5,-1,1);
-    float blob=out[((size_t)16*ny+16)*nx+16];
-    CHECK(on>2.0f*tube && on>2.0f*blob, "sheetness selective (sheet >> tube,blob)");
-    free(in);free(out);
-}
+
 
 /* ============ registration (register.c) ================================== */
 
@@ -394,6 +339,158 @@ static void make_struct_vol(float *v, int nz, int ny, int nx) {
         v[(z*ny+y)*nx+x] = (float)val;
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* ============ LAYER 2: deformable / Demons =============================== */
+
+/* a textured volume: blobs + several octaves of sinusoid so there is gradient
+ * EVERYWHERE (Demons needs texture; flat regions suffer the aperture problem). */
+static void make_textured_vol(float *v, int nz, int ny, int nx) {
+    make_struct_vol(v, nz, ny, nx);
+    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
+        double fz=(double)z/nz, fy=(double)y/ny, fx=(double)x/nx;
+        double t = 0.06*sin(18.0*fx)*sin(15.0*fy)
+                 + 0.05*cos(13.0*fz+1.0)*sin(11.0*fx)
+                 + 0.04*sin(21.0*fy+0.3)*cos(17.0*fz);
+        double val = v[(z*ny+y)*nx+x] + t;
+        if (val < 0) val = 0; if (val > 1) val = 1;
+        v[(z*ny+y)*nx+x] = (float)val;
+    }
+}
+
+/* build a known SMOOTH (low-frequency sinusoidal) displacement field, pull
+ * convention, amplitude `amp` voxels. This is the field that GENERATES moving
+ * from fixed: moving(x) = fixed(x + u(x)) ... but we want the registration to
+ * recover the field that pulls moving back to fixed. We instead define moving =
+ * warp_field(fixed, +u) and let demons recover ~ +u (so warp_field(moving,u_rec)
+ * reproduces fixed). */
+static void make_true_field(float *ux, float *uy, float *uz, int nz,int ny,int nx, double amp) {
+    for (int z=0; z<nz; z++) for (int y=0; y<ny; y++) for (int x=0; x<nx; x++) {
+        double fz=(double)z/nz, fy=(double)y/ny, fx=(double)x/nx;
+        size_t i=(z*ny+y)*nx+x;
+        ux[i]=(float)(amp*sin(2.0*M_PI*fy)*cos(2.0*M_PI*fz));
+        uy[i]=(float)(amp*sin(2.0*M_PI*fx)*cos(1.0*M_PI*fz));
+        uz[i]=(float)(amp*0.7*sin(2.0*M_PI*fx)*sin(1.5*M_PI*fy));
+    }
+}
+
+static double pearson(const float *a, const float *b, size_t n) {
+    double sa=0,sb=0,saa=0,sbb=0,sab=0;
+    for(size_t i=0;i<n;i++){sa+=a[i];sb+=b[i];saa+=(double)a[i]*a[i];sbb+=(double)b[i]*b[i];sab+=(double)a[i]*b[i];}
+    double ma=sa/n,mb=sb/n,cov=sab/n-ma*mb,va=saa/n-ma*ma,vb=sbb/n-mb*mb;
+    double d=sqrt(va*vb); return d<1e-12?0.0:cov/d;
+}
+
+/* mean |gradient| magnitude of a field component (smoothness proxy) */
+static double field_grad_mag(const float *u, int nz,int ny,int nx) {
+    double s=0; long c=0;
+    for(int z=1;z<nz-1;z++)for(int y=1;y<ny-1;y++)for(int x=1;x<nx-1;x++){
+        size_t i=(z*ny+y)*nx+x;
+        double gx=0.5*(u[i+1]-u[i-1]);
+        double gy=0.5*(u[i+nx]-u[i-nx]);
+        double gz=0.5*(u[i+nx*ny]-u[i-nx*ny]);
+        s+=sqrt(gx*gx+gy*gy+gz*gz); c++;
+    }
+    return c? s/c : 0;
+}
+
+
+
+
+
+
+
+
+
+/* ============ LANDMARK affine fit + multi-resolution fusion ============== */
+
+static double det33(const double *M) { /* linear part of a 3x4, leading 3 cols */
+    return M[0]*(M[5]*M[10]-M[6]*M[9]) - M[1]*(M[4]*M[10]-M[6]*M[8])
+         + M[2]*(M[4]*M[9]-M[5]*M[8]);
+}
+
+
+
+
+
+
+
+
+
+/* ---- phase correlation: recover a KNOWN sub-voxel shift -------------------- */
+/* Build `moving` as `fixed` circularly shifted by a SUB-VOXEL (dz,dy,dx) using the
+ * Fourier shift theorem (multiply spectrum by exp(-i 2pi (k.s/N))) -- this is an
+ * EXACT band-limited sub-voxel translation, the proper ground truth for a sub-
+ * pixel phase-correlation test. `fixed` is broadband (random) texture, like real
+ * CT papyrus; phase correlation is a broadband estimator (a low-frequency-only
+ * field gives a broad, bias-prone peak -- not representative). */
+static void fourier_shift(const float *in, float *out, int nz,int ny,int nx,
+                          double sz,double sy,double sx) {
+    size_t N=(size_t)nz*ny*nx;
+    float *re=malloc(4*N),*im=calloc(N,4);
+    for (size_t i=0;i<N;i++) re[i]=in[i];
+    fy_fft3d(re,im,nz,ny,nx,-1);
+    for (int z=0;z<nz;z++) for (int y=0;y<ny;y++) for (int x=0;x<nx;x++) {
+        int kz=(z<=nz/2)?z:z-nz, ky=(y<=ny/2)?y:y-ny, kx=(x<=nx/2)?x:x-nx;
+        double ph = -2.0*M_PI*((double)kz*sz/nz + (double)ky*sy/ny + (double)kx*sx/nx);
+        double c=cos(ph), s=sin(ph);
+        size_t i=((size_t)z*ny+y)*nx+x;
+        float r=re[i], m=im[i];
+        re[i]=(float)(r*c - m*s); im[i]=(float)(r*s + m*c);
+    }
+    fy_fft3d(re,im,nz,ny,nx,+1);
+    fy_fft3d_normalize(re,im,nz,ny,nx);
+    for (size_t i=0;i<N;i++) out[i]=re[i];
+    free(re);free(im);
+}
+
+
+/* ---- mutual information: peaks at correct alignment ----------------------- */
+
+
+/* Coherence-enhancing diffusion: two parallel bright sheets separated by a thin
+ * dark gap, plus noise. CED must (a) drop the noise on the sheets AND (b) keep the
+ * dark gap dark (NOT merge the layers). A plain isotropic blur would fill the gap. */
+
+
+
+
+
+/* ---- IN-PLANE TEXTURE ENHANCER ----
+ * Volume: a thick bright SHEET (slab perpendicular to z, normal = +z) that carries a
+ * fine IN-PLANE ripple (high-freq sinusoid along x, within the sheet plane) = the
+ * "crackle" texture. PLUS a cross-sheet intensity STEP (background jumps across z) =
+ * the layering we must NOT amplify. PLUS noise everywhere. We assert:
+ *   (a) in-plane texture-band energy INCREASES after the filter;
+ *   (b) the cross-sheet step is NOT amplified (~unchanged/suppressed -- a plain unsharp
+ *       mask would boost it, the steered one must not);
+ *   (c) noise-only regions are NOT blown up: texture/noise ratio IMPROVES (gating). */
+
+
+
 
 /* build a 3x4 affine (output->input map) for rotation about center + iso scale
  * + translation. angles in radians (about z,y,x), s = iso scale, t = (z,y,x). */
@@ -484,19 +581,15 @@ static void test_warp_roundtrip(void) {
     free(in);free(mid);free(back);
 }
 
-static void test_downsample2x(void) {
-    int nz=32,ny=32,nx=32,n=nz*ny*nx;
-    float *in=malloc(4*n);
-    make_struct_vol(in,nz,ny,nx);
-    int dz,dy,dx;
-    float *out=malloc(4*(n/8));
-    int rc=fy_downsample2x(in,out,nz,ny,nx,&dz,&dy,&dx);
-    CHECK(rc==0 && dz==16 && dy==16 && dx==16, "downsample2x halves dims");
-    /* range preserved (anti-alias shouldn't blow up or zero the signal) */
-    float mn=1e9f,mx=-1e9f;
-    for(int i=0;i<dz*dy*dx;i++){if(out[i]<mn)mn=out[i];if(out[i]>mx)mx=out[i];}
-    CHECK(mx>0.5f && mn>=0.0f && mx<=1.01f, "downsample2x preserves dynamic range");
-    free(in);free(out);
+static void test_warp_field_identity(void) {
+    int nz=24,ny=24,nx=24; size_t n=(size_t)nz*ny*nx;
+    float *in=malloc(4*n),*out=malloc(4*n);
+    float *zx=calloc(n,4),*zy=calloc(n,4),*zz=calloc(n,4);
+    make_textured_vol(in,nz,ny,nx);
+    fy_warp_field(in,out,nz,ny,nx,zx,zy,zz);
+    double mad=interior_mad(in,out,nz,ny,nx,0);
+    CHECK(mad<1e-6, "warp_field with zero field == identity");
+    free(in);free(out);free(zx);free(zy);free(zz);
 }
 
 static void test_ncc_self(void) {
@@ -572,70 +665,6 @@ static void test_register_contrast(void) {
     /* MAD here compares warped (gamma'd) moving to original fixed -> intensities
      * differ by design; geometry is what we test, via NCC. */
     CHECK(ncc>0.97, "register robust to contrast change (NCC>0.97, multimodal-ready)");
-}
-
-/* ============ LAYER 2: deformable / Demons =============================== */
-
-/* a textured volume: blobs + several octaves of sinusoid so there is gradient
- * EVERYWHERE (Demons needs texture; flat regions suffer the aperture problem). */
-static void make_textured_vol(float *v, int nz, int ny, int nx) {
-    make_struct_vol(v, nz, ny, nx);
-    for (int z = 0; z < nz; z++) for (int y = 0; y < ny; y++) for (int x = 0; x < nx; x++) {
-        double fz=(double)z/nz, fy=(double)y/ny, fx=(double)x/nx;
-        double t = 0.06*sin(18.0*fx)*sin(15.0*fy)
-                 + 0.05*cos(13.0*fz+1.0)*sin(11.0*fx)
-                 + 0.04*sin(21.0*fy+0.3)*cos(17.0*fz);
-        double val = v[(z*ny+y)*nx+x] + t;
-        if (val < 0) val = 0; if (val > 1) val = 1;
-        v[(z*ny+y)*nx+x] = (float)val;
-    }
-}
-
-/* build a known SMOOTH (low-frequency sinusoidal) displacement field, pull
- * convention, amplitude `amp` voxels. This is the field that GENERATES moving
- * from fixed: moving(x) = fixed(x + u(x)) ... but we want the registration to
- * recover the field that pulls moving back to fixed. We instead define moving =
- * warp_field(fixed, +u) and let demons recover ~ +u (so warp_field(moving,u_rec)
- * reproduces fixed). */
-static void make_true_field(float *ux, float *uy, float *uz, int nz,int ny,int nx, double amp) {
-    for (int z=0; z<nz; z++) for (int y=0; y<ny; y++) for (int x=0; x<nx; x++) {
-        double fz=(double)z/nz, fy=(double)y/ny, fx=(double)x/nx;
-        size_t i=(z*ny+y)*nx+x;
-        ux[i]=(float)(amp*sin(2.0*M_PI*fy)*cos(2.0*M_PI*fz));
-        uy[i]=(float)(amp*sin(2.0*M_PI*fx)*cos(1.0*M_PI*fz));
-        uz[i]=(float)(amp*0.7*sin(2.0*M_PI*fx)*sin(1.5*M_PI*fy));
-    }
-}
-
-static double pearson(const float *a, const float *b, size_t n) {
-    double sa=0,sb=0,saa=0,sbb=0,sab=0;
-    for(size_t i=0;i<n;i++){sa+=a[i];sb+=b[i];saa+=(double)a[i]*a[i];sbb+=(double)b[i]*b[i];sab+=(double)a[i]*b[i];}
-    double ma=sa/n,mb=sb/n,cov=sab/n-ma*mb,va=saa/n-ma*ma,vb=sbb/n-mb*mb;
-    double d=sqrt(va*vb); return d<1e-12?0.0:cov/d;
-}
-
-/* mean |gradient| magnitude of a field component (smoothness proxy) */
-static double field_grad_mag(const float *u, int nz,int ny,int nx) {
-    double s=0; long c=0;
-    for(int z=1;z<nz-1;z++)for(int y=1;y<ny-1;y++)for(int x=1;x<nx-1;x++){
-        size_t i=(z*ny+y)*nx+x;
-        double gx=0.5*(u[i+1]-u[i-1]);
-        double gy=0.5*(u[i+nx]-u[i-nx]);
-        double gz=0.5*(u[i+nx*ny]-u[i-nx*ny]);
-        s+=sqrt(gx*gx+gy*gy+gz*gz); c++;
-    }
-    return c? s/c : 0;
-}
-
-static void test_warp_field_identity(void) {
-    int nz=24,ny=24,nx=24; size_t n=(size_t)nz*ny*nx;
-    float *in=malloc(4*n),*out=malloc(4*n);
-    float *zx=calloc(n,4),*zy=calloc(n,4),*zz=calloc(n,4);
-    make_textured_vol(in,nz,ny,nx);
-    fy_warp_field(in,out,nz,ny,nx,zx,zy,zz);
-    double mad=interior_mad(in,out,nz,ny,nx,0);
-    CHECK(mad<1e-6, "warp_field with zero field == identity");
-    free(in);free(out);free(zx);free(zy);free(zz);
 }
 
 static void test_demons_known_warp(void) {
@@ -726,200 +755,6 @@ static void test_register_full_affine_plus_demons(void) {
     free(tx);free(ty);free(tz);free(ux);free(uy);free(uz);
 }
 
-/* ============ LANDMARK affine fit + multi-resolution fusion ============== */
-
-static double det33(const double *M) { /* linear part of a 3x4, leading 3 cols */
-    return M[0]*(M[5]*M[10]-M[6]*M[9]) - M[1]*(M[4]*M[10]-M[6]*M[8])
-         + M[2]*(M[4]*M[9]-M[5]*M[8]);
-}
-
-static void test_affine_from_points_exact(void) {
-    /* known full affine: dst = A p + t, exact fit must recover it to ~0 residual */
-    double A[9] = {0.47, -0.01, 0.02,  0.015, 0.46, -0.008,  -0.01, 0.012, 0.48};
-    double t[3] = {120.0, -33.0, 57.0};
-    int n = 12;
-    double src[36], dst[36];
-    unsigned int s = 7u;
-    for (int i = 0; i < n; i++) {
-        for (int a = 0; a < 3; a++) { s = s*1103515245u+12345u; src[i*3+a] = (double)((s>>9)%2000); }
-        for (int r = 0; r < 3; r++)
-            dst[i*3+r] = A[r*3+0]*src[i*3+0]+A[r*3+1]*src[i*3+1]+A[r*3+2]*src[i*3+2]+t[r];
-    }
-    double M[12], rms = -1;
-    int rc = fy_affine_from_points(src, dst, n, 0, 0, 0.0, M, NULL, &rms);
-    double aerr = 0;
-    for (int r = 0; r < 3; r++) {
-        aerr += fabs(M[r*4+0]-A[r*3+0])+fabs(M[r*4+1]-A[r*3+1])+fabs(M[r*4+2]-A[r*3+2]);
-        aerr += fabs(M[r*4+3]-t[r]) * 1e-3;
-    }
-    printf("     [affine_from_points] rms=%.3e  coeff_err=%.3e\n", rms, aerr);
-    CHECK(rc==0, "affine_from_points returns success");
-    CHECK(rms < 1e-6, "affine_from_points exact fit residual ~0");
-    CHECK(aerr < 1e-4, "affine_from_points recovers the known matrix");
-}
-
-static void test_similarity_from_points(void) {
-    /* known similarity: scale*R*p + t, with a real rotation. Fit must recover it
-     * AND keep equal singular values (no shear) -- the multi-res scan model. */
-    double th = 0.21, s = 0.4701;
-    double R[9] = { cos(th),-sin(th),0,  sin(th),cos(th),0,  0,0,1 };
-    double tt[3] = {200.0, 88.0, -45.0};
-    int n = 10;
-    double src[30], dst[30];
-    unsigned int sd = 99u;
-    for (int i = 0; i < n; i++) {
-        for (int a=0;a<3;a++){ sd=sd*1103515245u+12345u; src[i*3+a]=(double)((sd>>9)%1500); }
-        for (int r=0;r<3;r++)
-            dst[i*3+r]= s*(R[r*3+0]*src[i*3+0]+R[r*3+1]*src[i*3+1]+R[r*3+2]*src[i*3+2]) + tt[r];
-    }
-    double M[12], rms=-1;
-    int rc = fy_affine_from_points(src, dst, n, 1, 0, 0.0, M, NULL, &rms);
-    double d = det33(M);
-    double scale_est = cbrt(fabs(d));
-    printf("     [similarity] rms=%.3e  est_scale=%.5f (true %.5f)\n", rms, scale_est, s);
-    CHECK(rc==0, "similarity fit returns success");
-    CHECK(rms < 1e-5, "similarity exact fit residual ~0");
-    CHECK(fabs(scale_est - s) < 1e-3, "similarity recovers the isotropic scale");
-}
-
-static void test_affine_ransac_outliers(void) {
-    /* 16 good correspondences + 6 gross outliers. RANSAC must reject outliers and
-     * recover the clean transform; plain LS would be corrupted. */
-    double A[9] = {0.5,0,0, 0,0.5,0, 0,0,0.5};
-    double t[3] = {10,20,30};
-    int n = 22;
-    double src[66], dst[66];
-    unsigned int s = 3u;
-    for (int i = 0; i < n; i++) {
-        for (int a=0;a<3;a++){ s=s*1103515245u+12345u; src[i*3+a]=(double)((s>>9)%1000); }
-        for (int r=0;r<3;r++)
-            dst[i*3+r]=A[r*3+0]*src[i*3+0]+A[r*3+1]*src[i*3+1]+A[r*3+2]*src[i*3+2]+t[r];
-        if (i >= 16) { /* corrupt the last 6 with large random offsets */
-            for (int r=0;r<3;r++){ s=s*1103515245u+12345u; dst[i*3+r]+=(double)((int)((s>>9)%800)-400);}
-        }
-    }
-    double Mls[12], Mr[12], rms_ls=-1, rms_r=-1; int inl[22];
-    fy_affine_from_points(src, dst, n, 0, 0, 0.0, Mls, NULL, &rms_ls);  /* plain LS */
-    int rc = fy_affine_from_points(src, dst, n, 0, 200, 2.0, Mr, inl, &rms_r); /* RANSAC */
-    int ninl = 0; for (int i=0;i<n;i++) ninl+=inl[i];
-    /* coeff error of RANSAC vs truth */
-    double aerr=0; for (int r=0;r<3;r++) for(int c=0;c<3;c++) aerr+=fabs(Mr[r*4+c]-A[r*3+c]);
-    printf("     [ransac] LS_rms=%.2f  RANSAC_rms=%.3e  inliers=%d/22  coeff_err=%.2e\n",
-           rms_ls, rms_r, ninl, aerr);
-    CHECK(rc==0, "ransac affine returns success");
-    CHECK(ninl==16, "ransac identifies exactly the 16 inliers");
-    CHECK(rms_r < 1e-6, "ransac residual ~0 on the clean inliers");
-    CHECK(aerr < 1e-4, "ransac recovers the clean transform despite outliers");
-    CHECK(rms_ls > 10.0, "plain least-squares IS corrupted by the outliers (control)");
-}
-
-static void test_fuse_denoises(void) {
-    /* Synthetic: a smooth low-freq "structure" + a fine high-freq detail. Make two
-     * INDEPENDENT noisy realizations sharing the same low band (fine: low+high+noise1;
-     * coarse: low+noise2, NO high band). Fusion must (a) lower the low-band noise vs
-     * the fine scan alone, and (b) keep the fine high-freq detail. */
-    int nz=48,ny=48,nx=48; size_t N=(size_t)nz*ny*nx;
-    float *low=malloc(4*N),*high=malloc(4*N);
-    float *fine=malloc(4*N),*coarse=malloc(4*N),*fused=malloc(4*N);
-    /* ground-truth low (smooth) and high (fine ripples) */
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        size_t i=(z*ny+y)*nx+x;
-        double fz=(double)z/nz,fy=(double)y/ny,fx=(double)x/nx;
-        low[i]=(float)(0.5+0.25*sin(3.0*fx*2*M_PI)*cos(2.0*fy*2*M_PI)*sin(1.5*fz*2*M_PI+0.4));
-        high[i]=(float)(0.12*sin(10.0*fx*2*M_PI)*sin(9.0*fy*2*M_PI+0.7));
-    }
-    /* two independent noise fields */
-    unsigned int s1=11u,s2=777u;
-    double sig=0.04;
-    for(size_t i=0;i<N;i++){
-        s1=s1*1103515245u+12345u; double n1=((double)((s1>>9)%10000)/10000.0-0.5)*2*1.732*sig;
-        s2=s2*1103515245u+12345u; double n2=((double)((s2>>9)%10000)/10000.0-0.5)*2*1.732*sig;
-        fine[i]=(float)(low[i]+high[i]+n1);
-        coarse[i]=(float)(low[i]+n2);   /* same low band, independent noise, no detail */
-    }
-    /* fuse: equal noise variances -> ~0.5/0.5 low-band average */
-    double v=sig*sig;
-    fy_fuse_multiscale(fine, coarse, NULL, nz,ny,nx, 3.0, v, v, 1.0, fused);
-
-    /* Measure LOW-BAND noise the way fusion defines it: low band = the same gaussian
-     * split (sigma=3) used inside the kernel, applied here as a wide box-blur proxy
-     * (radius 4 ~ sigma 2-3). noise = std of (lowpass(volume) - true_low_signal).
-     * Fusion averages two independent low bands -> ~1/sqrt(2) the noise of the fine
-     * low band alone. We compare fine-alone vs fused low-band error to true_low. */
-    /* Measure LOW-BAND noise: take (result - true_signal) -- this is pure noise since
-     * truth is noise-free -- and LOW-PASS it (the high band is undenoised by design, so
-     * we look only at the shared low band where fusion acts). fine's low-band noise is
-     * noise1; fused's is the 0.5/0.5 average of two INDEPENDENT noises -> lower std.
-     * Low-pass via 3 box-blur passes (radius 2 ~ gaussian sigma~2.8, matching split). */
-    float *rf=malloc(4*N),*rg=malloc(4*N),*tb=malloc(4*N);
-    for(size_t i=0;i<N;i++){ double truth=(double)low[i]+(double)high[i];
-        rf[i]=(float)(fine[i]-truth); rg[i]=(float)(fused[i]-truth); }
-    for(int pass=0;pass<2;pass++){
-        float *buf=(pass==0)?rf:rg;
-        for(int it=0;it<3;it++){
-            int rr=2;
-            for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-                double a=0;int cc=0;
-                for(int dz=-rr;dz<=rr;dz++)for(int dy=-rr;dy<=rr;dy++)for(int dx=-rr;dx<=rr;dx++){
-                    int zz=z+dz,yy=y+dy,xx=x+dx; if(zz<0||yy<0||xx<0||zz>=nz||yy>=ny||xx>=nx)continue;
-                    a+=buf[(zz*ny+yy)*nx+xx]; cc++; }
-                tb[(z*ny+y)*nx+x]=(float)(a/cc);
-            }
-            memcpy(buf,tb,N*4);
-        }
-    }
-    int R=6;
-    double err_fine=0, err_fused=0; long c=0;
-    for(int z=R;z<nz-R;z++)for(int y=R;y<ny-R;y++)for(int x=R;x<nx-R;x++){
-        size_t i=(z*ny+y)*nx+x;
-        err_fine+=(double)rf[i]*rf[i]; err_fused+=(double)rg[i]*rg[i]; c++;
-    }
-    err_fine=sqrt(err_fine/c); err_fused=sqrt(err_fused/c);
-    free(rf);free(rg);free(tb);
-    /* high-freq retention: the high band the kernel keeps is fine - gaussian(fine).
-     * Measure correlation of (fused minus its OWN wide blur) with the true high band. */
-    float *hb=malloc(4*N);
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        size_t i=(z*ny+y)*nx+x; double a=0; int cc=0;
-        for(int dz=-R;dz<=R;dz++)for(int dy=-R;dy<=R;dy++)for(int dx=-R;dx<=R;dx++){
-            int zz=z+dz,yy=y+dy,xx=x+dx; if(zz<0||yy<0||xx<0||zz>=nz||yy>=ny||xx>=nx)continue;
-            a+=fused[(zz*ny+yy)*nx+xx]; cc++; }
-        hb[i]=(float)(fused[i]-a/cc);
-    }
-    double hr=pearson(hb, high, N);
-    printf("     [fuse] low-band noise vs truth: fine-alone=%.5f  fused=%.5f  (ratio %.2f, ideal 0.71)  high-retention=%.3f\n",
-           err_fine, err_fused, err_fused/err_fine, hr);
-    CHECK(err_fused < err_fine*0.90, "fusion lowers low-band noise vs fine-alone (>10%)");
-    CHECK(hr > 0.5, "fusion retains the fine high-freq detail");
-    free(low);free(high);free(fine);free(coarse);free(fused);free(hb);
-}
-
-/* ---- phase correlation: recover a KNOWN sub-voxel shift -------------------- */
-/* Build `moving` as `fixed` circularly shifted by a SUB-VOXEL (dz,dy,dx) using the
- * Fourier shift theorem (multiply spectrum by exp(-i 2pi (k.s/N))) -- this is an
- * EXACT band-limited sub-voxel translation, the proper ground truth for a sub-
- * pixel phase-correlation test. `fixed` is broadband (random) texture, like real
- * CT papyrus; phase correlation is a broadband estimator (a low-frequency-only
- * field gives a broad, bias-prone peak -- not representative). */
-static void fourier_shift(const float *in, float *out, int nz,int ny,int nx,
-                          double sz,double sy,double sx) {
-    size_t N=(size_t)nz*ny*nx;
-    float *re=malloc(4*N),*im=calloc(N,4);
-    for (size_t i=0;i<N;i++) re[i]=in[i];
-    fy_fft3d(re,im,nz,ny,nx,-1);
-    for (int z=0;z<nz;z++) for (int y=0;y<ny;y++) for (int x=0;x<nx;x++) {
-        int kz=(z<=nz/2)?z:z-nz, ky=(y<=ny/2)?y:y-ny, kx=(x<=nx/2)?x:x-nx;
-        double ph = -2.0*M_PI*((double)kz*sz/nz + (double)ky*sy/ny + (double)kx*sx/nx);
-        double c=cos(ph), s=sin(ph);
-        size_t i=((size_t)z*ny+y)*nx+x;
-        float r=re[i], m=im[i];
-        re[i]=(float)(r*c - m*s); im[i]=(float)(r*s + m*c);
-    }
-    fy_fft3d(re,im,nz,ny,nx,+1);
-    fy_fft3d_normalize(re,im,nz,ny,nx);
-    for (size_t i=0;i<N;i++) out[i]=re[i];
-    free(re);free(im);
-}
 static void test_phase_correlate_subvoxel(void) {
     int nz=32,ny=32,nx=32,n=nz*ny*nx;   /* pow2: exact circular shift */
     float *f=malloc(4*n),*m=malloc(4*n);
@@ -979,351 +814,32 @@ static void test_mutual_information_peaks(void) {
     free(fixed);free(moving);free(noise);
 }
 
-/* Coherence-enhancing diffusion: two parallel bright sheets separated by a thin
- * dark gap, plus noise. CED must (a) drop the noise on the sheets AND (b) keep the
- * dark gap dark (NOT merge the layers). A plain isotropic blur would fill the gap. */
-static void test_coherence_diffusion_gap(void) {
-    int nz=48,ny=48,nx=48,n=nz*ny*nx;
-    float *clean=malloc(4*n), *noisy=malloc(4*n), *ced=malloc(4*n), *gauss=malloc(4*n);
-    /* two bright sheets perpendicular to x: a plane at x=22 and x=26 (3-vox gap at
-     * x=23,24,25 stays dark). Sheets span all y,z (planar -> coherent). */
-    int s1=22, s2=26;
-    for (int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        float v=0.1f;                         /* dark background */
-        if (x==s1-1||x==s1||x==s1+1) v=0.9f;  /* sheet 1 (3 vox thick) */
-        if (x==s2-1||x==s2||x==s2+1) v=0.9f;  /* sheet 2 */
-        clean[((size_t)z*ny+y)*nx+x]=v;
-    }
-    /* add noise */
-    unsigned int seed=1234567u;
-    for (int i=0;i<n;i++){ seed=seed*1103515245u+12345u;
-        float r=((float)((seed>>9)&1023)/1023.0f - 0.5f)*0.30f;
-        noisy[i]=clean[i]+r; }
-
-    double sigma=0.7, rho=3.0, tau=0.10, alpha=0.001; int iters=10;
-    int rc=fy_coherence_diffusion(noisy,ced,nz,ny,nx,sigma,rho,tau,iters,alpha);
-    CHECK(rc==0, "fy_coherence_diffusion returns 0");
-
-    /* matched-smoothing Gaussian blur for comparison (fills the gap -> the bad case).
-     * sigma chosen ~ along-sheet smoothing reach; reuse fy_sheetness path? just do a
-     * separable gaussian via the public guided? simplest: small explicit gaussian.   */
-    /* approximate a matched isotropic gaussian using repeated 3-pt smoothing */
-    memcpy(gauss,noisy,4*n);
-    for (int pass=0; pass<8; pass++){
-        float *tmp=malloc(4*n); memcpy(tmp,gauss,4*n);
-        for (int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-            int xm=x>0?x-1:0,xp=x<nx-1?x+1:nx-1;
-            int ym=y>0?y-1:0,yp=y<ny-1?y+1:ny-1;
-            int zm=z>0?z-1:0,zp=z<nz-1?z+1:nz-1;
-            size_t i=((size_t)z*ny+y)*nx+x;
-            gauss[i]=(tmp[((size_t)z*ny+y)*nx+xm]+tmp[((size_t)z*ny+y)*nx+xp]
-                     +tmp[((size_t)z*ny+ym)*nx+x]+tmp[((size_t)z*ny+yp)*nx+x]
-                     +tmp[((size_t)zm*ny+y)*nx+x]+tmp[((size_t)zp*ny+y)*nx+x]
-                     +tmp[i])/7.0f;
-        }
-        free(tmp);
-    }
-
-    /* (a) sheet-interior noise: std over the interior of sheet 1 (x=s1), central yz. */
-    #define INTERIOR(buf,xc) ({ double m=0,m2=0; int c=0; \
-        for(int z=8;z<nz-8;z++)for(int y=8;y<ny-8;y++){ \
-            double v=buf[((size_t)z*ny+y)*nx+(xc)]; m+=v;m2+=v*v;c++;} \
-        m/=c; sqrt(m2/c-m*m); })
-    double noisy_std=INTERIOR(noisy,s1);
-    double ced_std  =INTERIOR(ced,s1);
-    printf("     [ced] sheet-interior std: noisy=%.4f -> CED=%.4f\n", noisy_std, ced_std);
-    CHECK(ced_std < 0.6*noisy_std, "CED drops sheet-interior noise substantially (>40%)");
-
-    /* (b) GAP PRESERVATION: gap center is x=24. Contrast = sheet_mean - gap_min over
-     * the central region. CED must keep the gap dark; Gaussian fills it. */
-    #define GAPMIN(buf) ({ double mn=1e9; \
-        for(int z=12;z<nz-12;z++)for(int y=12;y<ny-12;y++){ \
-            double v=buf[((size_t)z*ny+y)*nx+24]; if(v<mn)mn=v;} mn; })
-    #define GAPMEAN(buf) ({ double m=0;int c=0; \
-        for(int z=12;z<nz-12;z++)for(int y=12;y<ny-12;y++){ \
-            m+=buf[((size_t)z*ny+y)*nx+24];c++;} m/c; })
-    #define SHEETMEAN(buf,xc) ({ double m=0;int c=0; \
-        for(int z=12;z<nz-12;z++)for(int y=12;y<ny-12;y++){ \
-            m+=buf[((size_t)z*ny+y)*nx+(xc)];c++;} m/c; })
-    double clean_gap=GAPMEAN(clean), clean_sheet=SHEETMEAN(clean,s1);
-    double ced_gap=GAPMEAN(ced),     ced_sheet=SHEETMEAN(ced,s1);
-    double gau_gap=GAPMEAN(gauss),   gau_sheet=SHEETMEAN(gauss,s1);
-    double clean_contrast=clean_sheet-clean_gap;
-    double ced_contrast  =ced_sheet-ced_gap;
-    double gau_contrast  =gau_sheet-gau_gap;
-    printf("     [ced] gap-mean: clean=%.3f CED=%.3f gauss=%.3f\n",clean_gap,ced_gap,gau_gap);
-    printf("     [ced] sheet-vs-gap contrast: clean=%.3f CED=%.3f(%.0f%%) gauss=%.3f(%.0f%%)\n",
-           clean_contrast, ced_contrast, 100*ced_contrast/clean_contrast,
-           gau_contrast, 100*gau_contrast/clean_contrast);
-    /* CED retains most of the gap contrast (>70% of clean) */
-    CHECK(ced_contrast > 0.70*clean_contrast, "CED PRESERVES the inter-sheet gap (>70% contrast retained)");
-    /* and is decisively better at it than matched gaussian blur */
-    CHECK(ced_contrast > 1.3*gau_contrast, "CED preserves the gap far better than a matched Gaussian blur");
-
-    free(clean);free(noisy);free(ced);free(gauss);
-}
-
-static void test_coherence_diffusion_auto(void) {
-    /* auto path runs end-to-end on a two-sheet+gap volume, denoises, keeps the gap */
-    int nz=40,ny=40,nx=40; size_t n=(size_t)nz*ny*nx;
-    float *in=malloc(4*n), *out=malloc(4*n);
-    unsigned s=271;
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        /* two bright x-y sheets at z=16 and z=22 (gap at z=19) */
-        double v=(z==16||z==22)?0.8:0.1;
-        s=s*1103515245u+12345u; double nse=((s>>16)&0x7fff)/32768.0-0.5;
-        in[((size_t)z*ny+y)*nx+x]=(float)(v+0.05*nse);
-    }
-    int rc=fy_coherence_diffusion_auto(in,out,nz,ny,nx,2);
-    CHECK(rc==0,"fy_coherence_diffusion_auto runs");
-    int finite=1; for(size_t i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
-    CHECK(finite,"auto CED output finite");
-    /* gap (z=19) stays darker than sheets (z=16) */
-    double gap=0,sheet=0; int c=0;
-    for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){gap+=out[((size_t)19*ny+y)*nx+x];sheet+=out[((size_t)16*ny+y)*nx+x];c++;}
-    CHECK(gap/c < 0.7*(sheet/c), "auto CED keeps the inter-sheet gap (gap<<sheet)");
-    free(in);free(out);
-}
-
-static void test_spectral_decompose(void){
-    /* synthetic 2-material volume at 4 energies. Papyrus: flat mu(E) (low-Z).
-     * Inclusion: steep photoelectric mu(E) ~ E^-3 (high-Z). Kernel must score the
-     * inclusion high-Z and papyrus ~0. */
-    int nz=8,ny=16,nx=16; size_t n=(size_t)nz*ny*nx;
-    double E[4]={43,62,77,89};
-    float *v[4]; for(int e=0;e<4;e++) v[e]=malloc(4*n);
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        size_t i=((size_t)z*ny+y)*nx+x;
-        int inclusion = (x>=6 && x<10 && y>=6 && y<10); /* central block = high-Z */
-        for(int e=0;e<4;e++){
-            double mu;
-            if(inclusion){
-                /* steep photoelectric ~ E^-3 (high-Z): high mu@43, near-floor mu@89,
-                 * matching the validated PHerc0343P high-Z signature */
-                mu = 0.20 * pow(43.0/E[e], 3.0) + 0.015;
-            } else {
-                /* papyrus: nearly flat ~0.07, tiny energy dependence */
-                mu = 0.07 * pow(43.0/E[e], 0.4);
-            }
-            v[e][i]=(float)mu;
-        }
-    }
-    float *slope=malloc(4*n), *highz=malloc(4*n);
-    const float* mup[4]={v[0],v[1],v[2],v[3]};
-    int rc=fy_spectral_decompose(mup,E,4,nz,ny,nx,slope,highz,0.01);
-    CHECK(rc==0,"fy_spectral_decompose runs");
-    /* mean high-Z score: inclusion >> papyrus */
-    double hi_in=0,hi_pap=0; int ci=0,cp=0;
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        size_t i=((size_t)z*ny+y)*nx+x; int inc=(x>=6&&x<10&&y>=6&&y<10);
-        if(inc){hi_in+=highz[i];ci++;} else {hi_pap+=highz[i];cp++;}
-    }
-    hi_in/=ci; hi_pap/=cp;
-    CHECK(hi_in > 0.3 && hi_pap < 0.1, "spectral: high-Z inclusion scores high, papyrus low");
-    /* slope: inclusion much steeper (more negative) than papyrus */
-    double sl_in=0,sl_pap=0; ci=cp=0;
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        size_t i=((size_t)z*ny+y)*nx+x; int inc=(x>=6&&x<10&&y>=6&&y<10);
-        if(inc){sl_in+=slope[i];ci++;} else {sl_pap+=slope[i];cp++;}
-    }
-    CHECK(sl_in/ci < sl_pap/cp - 0.5, "spectral: inclusion slope steeper (more negative) than papyrus");
-    for(int e=0;e<4;e++)free(v[e]); free(slope);free(highz);
-}
-/* ---- IN-PLANE TEXTURE ENHANCER ----
- * Volume: a thick bright SHEET (slab perpendicular to z, normal = +z) that carries a
- * fine IN-PLANE ripple (high-freq sinusoid along x, within the sheet plane) = the
- * "crackle" texture. PLUS a cross-sheet intensity STEP (background jumps across z) =
- * the layering we must NOT amplify. PLUS noise everywhere. We assert:
- *   (a) in-plane texture-band energy INCREASES after the filter;
- *   (b) the cross-sheet step is NOT amplified (~unchanged/suppressed -- a plain unsharp
- *       mask would boost it, the steered one must not);
- *   (c) noise-only regions are NOT blown up: texture/noise ratio IMPROVES (gating). */
-static void test_texture_enhance(void) {
-    int nz=48,ny=48,nx=48; size_t n=(size_t)nz*ny*nx;
-    float *vol=malloc(4*n), *out=malloc(4*n);
-    /* sheet occupies z in [18,30]; background below/above. In-plane ripple along x with
-     * period ~3 vox (fine texture). Cross-sheet step: background = 0.15 for z<24, 0.45
-     * for z>=24 (a layering step ACROSS the sheet normal). Sheet base brightness 0.7. */
-    double tex_period = 3.0;            /* fine in-plane texture period (vox)        */
-    double tex_amp    = 0.06;           /* faint texture amplitude                  */
-    /* Layout along z (the sheet-normal axis):
-     *   z<10        : background 0.15
-     *   z in [10,18): background 0.45   <- a CLEAN cross-sheet (layering) STEP at z=10,
-     *                                       a pure edge along the normal, away from sheet
-     *   z in [18,30): bright sheet 0.70 + fine in-plane ripple (the texture)
-     *   z>=30       : background 0.45
-     * The step at z=10 is the layering edge we must NOT amplify. */
-    unsigned int seed=99173u;
-    for (int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        int in_sheet = (z>=18 && z<30);
-        double base = (z<10)? 0.15 : 0.45;         /* cross-sheet layering step @z=10 */
-        double v = base;
-        if (in_sheet) {
-            /* bright sheet + fine in-plane ripple (function of x and y, NOT z) */
-            double ripple = tex_amp*sin(2.0*M_PI*x/tex_period)
-                          + tex_amp*0.6*sin(2.0*M_PI*y/tex_period);
-            v = 0.70 + ripple;
-        }
-        seed=seed*1103515245u+12345u;
-        double nse=((double)((seed>>9)&1023)/1023.0-0.5)*0.06;  /* +/-0.03 noise */
-        vol[((size_t)z*ny+y)*nx+x]=(float)(v+nse);
-    }
-
-    /* explicit call: sigma small, rho integrates within the sheet, gain=2.5, inplane
-     * low-pass radius 2.5 (> texture half-period so the ripple lands in the detail
-     * band), noise_floor = -1 (auto-derive gate from the detail's MAD -- the
-     * recommended self-calibrating mode). */
-    int rc=fy_texture_enhance(vol,out,nz,ny,nx, 0.7, 2.5, 2.5, 2.5, -1.0);
-    CHECK(rc==0,"fy_texture_enhance returns 0");
-    int finite=1; for(size_t i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
-    CHECK(finite,"texture-enhance output finite");
-
-    /* ---- (a) in-plane texture-band energy: variance along x within a sheet row,
-     * AVERAGED over rows, measured on a band-passed signal (subtract a length-5 moving
-     * mean to isolate the fine ripple from the slow trend). Center y,z to avoid halo. */
-    #define TEXBAND(buf) ({ double tot=0; int rows=0; \
-        for(int z=20;z<28;z++)for(int y=8;y<ny-8;y++){ \
-            double e=0; int c=0; \
-            for(int x=4;x<nx-4;x++){ \
-                double s=0; for(int t=-2;t<=2;t++) s+=buf[((size_t)z*ny+y)*nx+(x+t)]; \
-                double hp=buf[((size_t)z*ny+y)*nx+x]-s/5.0; \
-                e+=hp*hp; c++; } \
-            tot+=e/c; rows++; } tot/rows; })
-    double tex_in = TEXBAND(vol), tex_out = TEXBAND(out);
-    printf("     [tex] in-plane texture-band energy: in=%.6f -> out=%.6f (%.2fx)\n",
-           tex_in, tex_out, tex_out/tex_in);
-    CHECK(tex_out > 1.3*tex_in, "in-plane texture-band energy INCREASES (>1.3x)");
-
-    /* ---- compute a PLAIN (non-steered) isotropic unsharp mask at MATCHED gain for the
-     * comparison: it sharpens the cross-sheet edge too (it low-passes across the normal).
-     * The steered version must NOT (it only low-passes in-plane). */
-    float *plain=malloc(4*n), *lp=malloc(4*n);
-    memcpy(lp,vol,4*n);
-    /* isotropic 5x5x5 box low-pass, applied twice (~matched to inplane_scale reach) */
-    for(int pass=0;pass<2;pass++){ float *tmp=malloc(4*n); memcpy(tmp,lp,4*n);
-        for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){ double s=0;int c=0;
-            for(int dz=-2;dz<=2;dz++)for(int dy=-2;dy<=2;dy++)for(int dx=-2;dx<=2;dx++){
-                int zz=z+dz<0?0:(z+dz>=nz?nz-1:z+dz),yy=y+dy<0?0:(y+dy>=ny?ny-1:y+dy),xx=x+dx<0?0:(x+dx>=nx?nx-1:x+dx);
-                s+=tmp[((size_t)zz*ny+yy)*nx+xx];c++; }
-            lp[((size_t)z*ny+y)*nx+x]=(float)(s/c); }
-        free(tmp); }
-    for(size_t i=0;i<n;i++) plain[i]=(float)(vol[i]+2.5*(vol[i]-lp[i]));  /* gain 2.5 */
-
-    /* ---- (b) cross-sheet (layering) STEP RESPONSE at the z=10 background edge. The
-     * step is along the sheet NORMAL (z). We measure the max |z-gradient| across the edge
-     * (peak slope), averaged over the background xy-plane. A plain unsharp SHARPENS this
-     * edge (gradient up); the steered filter must leave it ~unchanged (not amplified). */
-    #define ZEDGE(buf) ({ double best=0; \
-        for(int zc=8;zc<=12;zc++){ double m=0;int c=0; \
-            for(int y=8;y<ny-8;y++)for(int x=8;x<nx-8;x++){ \
-                m+=fabs((double)buf[((size_t)(zc+1)*ny+y)*nx+x]-(double)buf[((size_t)(zc-1)*ny+y)*nx+x]); c++; } \
-            m/=c; if(m>best)best=m; } best; })
-    double step_in   = ZEDGE(vol);
-    double step_out  = ZEDGE(out);
-    double step_plain= ZEDGE(plain);
-    printf("     [tex] cross-sheet edge slope: in=%.4f -> steered=%.4f (%.2fx), plain-unsharp=%.4f (%.2fx)\n",
-           step_in, step_out, step_out/step_in, step_plain, step_plain/step_in);
-    CHECK(step_out < 1.15*step_in, "cross-sheet layering edge NOT amplified by steered filter (<1.15x)");
-    CHECK(step_out < 0.85*step_plain, "steered preserves layering FAR better than a plain unsharp mask");
-
-    /* ---- (c) texture/noise ratio: noise = std in a FLAT background slab (z=13..17,
-     * uniform 0.45 background -- no sheet, no ripple, no step). texture/noise must
-     * IMPROVE. */
-    #define NOISESTD(buf) ({ double m=0,m2=0;int c=0; \
-        for(int z=13;z<18;z++)for(int y=8;y<ny-8;y++)for(int x=8;x<nx-8;x++){ \
-            double v=buf[((size_t)z*ny+y)*nx+x]; m+=v;m2+=v*v;c++; } m/=c; sqrt(m2/c-m*m); })
-    double noise_in = NOISESTD(vol), noise_out = NOISESTD(out);
-    double tnr_in  = sqrt(tex_in)/(noise_in+1e-9);
-    double tnr_out = sqrt(tex_out)/(noise_out+1e-9);
-    /* and the plain unsharp's noise for reference */
-    double noise_plain = NOISESTD(plain);
-    printf("     [tex] flat-region noise std: in=%.5f -> steered=%.5f, plain=%.5f\n",
-           noise_in, noise_out, noise_plain);
-    printf("     [tex] texture/noise ratio: in=%.3f -> out=%.3f (%.2fx)\n",
-           tnr_in, tnr_out, tnr_out/tnr_in);
-    CHECK(tnr_out > 1.2*tnr_in, "texture/noise ratio IMPROVES (>1.2x) -- gating works");
-    CHECK(noise_out < 1.5*noise_in, "noise not blown up (gating caps flat-region amplification)");
-
-    free(plain);free(lp);
-    free(vol);free(out);
-    #undef TEXBAND
-    #undef ZEDGE
-    #undef NOISESTD
-}
-
-static void test_texture_enhance_auto(void) {
-    /* auto path runs end-to-end and lifts in-plane texture without exploding. */
-    int nz=44,ny=44,nx=44; size_t n=(size_t)nz*ny*nx;
-    float *in=malloc(4*n), *out=malloc(4*n);
-    unsigned s=4242u;
-    for(int z=0;z<nz;z++)for(int y=0;y<ny;y++)for(int x=0;x<nx;x++){
-        int in_sheet=(z>=18 && z<26);
-        double base=(z<22)?0.2:0.4;
-        double v=base;
-        if(in_sheet) v=0.7 + 0.06*sin(2.0*M_PI*x/3.0) + 0.04*sin(2.0*M_PI*y/3.0);
-        s=s*1103515245u+12345u; double nse=((s>>16)&0x7fff)/32768.0-0.5;
-        in[((size_t)z*ny+y)*nx+x]=(float)(v+0.04*nse);
-    }
-    int rc=fy_texture_enhance_auto(in,out,nz,ny,nx,2);
-    CHECK(rc==0,"fy_texture_enhance_auto runs");
-    int finite=1; for(size_t i=0;i<n;i++) if(!isfinite(out[i])) finite=0;
-    CHECK(finite,"auto texture-enhance output finite");
-    /* in-plane texture-band energy up inside the sheet */
-    #define TB(buf) ({ double tot=0;int rows=0; \
-        for(int z=20;z<25;z++)for(int y=8;y<ny-8;y++){ double e=0;int c=0; \
-            for(int x=4;x<nx-4;x++){ double sm=0; for(int t=-2;t<=2;t++) sm+=buf[((size_t)z*ny+y)*nx+(x+t)]; \
-                double hp=buf[((size_t)z*ny+y)*nx+x]-sm/5.0; e+=hp*hp;c++; } tot+=e/c;rows++; } tot/rows; })
-    double tin=TB(in), tout=TB(out);
-    printf("     [tex-auto] texture-band energy: in=%.6f -> out=%.6f (%.2fx)\n", tin,tout,tout/tin);
-    CHECK(tout > tin, "auto: in-plane texture-band energy increases");
-    #undef TB
-    free(in);free(out);
-}
-
 int main(void) {
     test_fft_vs_dft();
     test_fft_vs_dft();
     test_fft_roundtrip();
-    test_paganin_transfer();
-    test_deconvolve_sharpens();
-    test_halo_reasonable();
-    test_nlm_denoises();
-    test_bilateral_denoises();
-    test_process_recipe();
-    test_streaming_global();
-    test_gureyev_deconv();
-    test_fsc();
-    test_zdrift();
-    test_auto_thresh();
-    test_sheetness();
-    test_dewindow();
-    test_estimate_noise();
-    test_compact();
-    test_gat_and_quality();
-    test_deltabeta_scale();
+    test_fft_radix3();
+    test_guided_fast();
+    test_dering();
     test_warp_identity();
     test_warp_translation();
     test_warp_roundtrip();
-    test_downsample2x();
+    test_warp_field_identity();
     test_ncc_self();
     test_register_rigid();
     test_register_affine();
     test_register_contrast();
-    test_warp_field_identity();
     test_demons_known_warp();
     test_demons_regularization();
     test_register_full_affine_plus_demons();
-    test_affine_from_points_exact();
-    test_similarity_from_points();
-    test_affine_ransac_outliers();
-    test_fuse_denoises();
     test_phase_correlate_subvoxel();
     test_mutual_information_peaks();
-    test_coherence_diffusion_gap();
-    test_coherence_diffusion_auto();
-    test_spectral_decompose();
-    test_texture_enhance();
-    test_texture_enhance_auto();
+    test_paganin_transfer();
+    test_deconvolve_sharpens();
+    test_halo_reasonable();
+    test_dewindow();
+    test_estimate_noise();
+    test_deltabeta_scale();
     printf("\n%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures ? 1 : 0;
 }

@@ -211,6 +211,19 @@ fysics-process/fast:
 .PHONY : fysics-process/fast
 
 #=============================================================================
+# Target rules for targets named vca_export
+
+# Build rule for target.
+vca_export: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 vca_export
+.PHONY : vca_export
+
+# fast build rule for target.
+vca_export/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/build
+.PHONY : vca_export/fast
+
+#=============================================================================
 # Target rules for targets named test_fysics
 
 # Build rule for target.
@@ -236,140 +249,32 @@ bench_fysics/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/bench_fysics.dir/build.make CMakeFiles/bench_fysics.dir/build
 .PHONY : bench_fysics/fast
 
-calibrate.o: calibrate.c.o
-.PHONY : calibrate.o
+dering.o: dering.c.o
+.PHONY : dering.o
 
 # target to build an object file
-calibrate.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/calibrate.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/calibrate.c.o
-.PHONY : calibrate.c.o
+dering.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/dering.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/dering.c.o
+.PHONY : dering.c.o
 
-calibrate.i: calibrate.c.i
-.PHONY : calibrate.i
-
-# target to preprocess a source file
-calibrate.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/calibrate.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/calibrate.c.i
-.PHONY : calibrate.c.i
-
-calibrate.s: calibrate.c.s
-.PHONY : calibrate.s
-
-# target to generate assembly for a file
-calibrate.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/calibrate.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/calibrate.c.s
-.PHONY : calibrate.c.s
-
-clahe.o: clahe.c.o
-.PHONY : clahe.o
-
-# target to build an object file
-clahe.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/clahe.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/clahe.c.o
-.PHONY : clahe.c.o
-
-clahe.i: clahe.c.i
-.PHONY : clahe.i
+dering.i: dering.c.i
+.PHONY : dering.i
 
 # target to preprocess a source file
-clahe.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/clahe.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/clahe.c.i
-.PHONY : clahe.c.i
+dering.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/dering.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/dering.c.i
+.PHONY : dering.c.i
 
-clahe.s: clahe.c.s
-.PHONY : clahe.s
-
-# target to generate assembly for a file
-clahe.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/clahe.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/clahe.c.s
-.PHONY : clahe.c.s
-
-compact.o: compact.c.o
-.PHONY : compact.o
-
-# target to build an object file
-compact.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/compact.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/compact.c.o
-.PHONY : compact.c.o
-
-compact.i: compact.c.i
-.PHONY : compact.i
-
-# target to preprocess a source file
-compact.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/compact.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/compact.c.i
-.PHONY : compact.c.i
-
-compact.s: compact.c.s
-.PHONY : compact.s
+dering.s: dering.c.s
+.PHONY : dering.s
 
 # target to generate assembly for a file
-compact.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/compact.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/compact.c.s
-.PHONY : compact.c.s
-
-denoise.o: denoise.c.o
-.PHONY : denoise.o
-
-# target to build an object file
-denoise.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/denoise.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/denoise.c.o
-.PHONY : denoise.c.o
-
-denoise.i: denoise.c.i
-.PHONY : denoise.i
-
-# target to preprocess a source file
-denoise.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/denoise.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/denoise.c.i
-.PHONY : denoise.c.i
-
-denoise.s: denoise.c.s
-.PHONY : denoise.s
-
-# target to generate assembly for a file
-denoise.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/denoise.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/denoise.c.s
-.PHONY : denoise.c.s
-
-diffusion.o: diffusion.c.o
-.PHONY : diffusion.o
-
-# target to build an object file
-diffusion.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/diffusion.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/diffusion.c.o
-.PHONY : diffusion.c.o
-
-diffusion.i: diffusion.c.i
-.PHONY : diffusion.i
-
-# target to preprocess a source file
-diffusion.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/diffusion.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/diffusion.c.i
-.PHONY : diffusion.c.i
-
-diffusion.s: diffusion.c.s
-.PHONY : diffusion.s
-
-# target to generate assembly for a file
-diffusion.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/diffusion.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/diffusion.c.s
-.PHONY : diffusion.c.s
+dering.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/dering.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/dering.c.s
+.PHONY : dering.c.s
 
 fft.o: fft.c.o
 .PHONY : fft.o
@@ -398,87 +303,6 @@ fft.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/fft.c.s
 .PHONY : fft.c.s
 
-fsc.o: fsc.c.o
-.PHONY : fsc.o
-
-# target to build an object file
-fsc.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/fsc.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/fsc.c.o
-.PHONY : fsc.c.o
-
-fsc.i: fsc.c.i
-.PHONY : fsc.i
-
-# target to preprocess a source file
-fsc.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/fsc.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/fsc.c.i
-.PHONY : fsc.c.i
-
-fsc.s: fsc.c.s
-.PHONY : fsc.s
-
-# target to generate assembly for a file
-fsc.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/fsc.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/fsc.c.s
-.PHONY : fsc.c.s
-
-fuse.o: fuse.c.o
-.PHONY : fuse.o
-
-# target to build an object file
-fuse.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/fuse.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/fuse.c.o
-.PHONY : fuse.c.o
-
-fuse.i: fuse.c.i
-.PHONY : fuse.i
-
-# target to preprocess a source file
-fuse.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/fuse.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/fuse.c.i
-.PHONY : fuse.c.i
-
-fuse.s: fuse.c.s
-.PHONY : fuse.s
-
-# target to generate assembly for a file
-fuse.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/fuse.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/fuse.c.s
-.PHONY : fuse.c.s
-
-glcae.o: glcae.c.o
-.PHONY : glcae.o
-
-# target to build an object file
-glcae.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/glcae.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/glcae.c.o
-.PHONY : glcae.c.o
-
-glcae.i: glcae.c.i
-.PHONY : glcae.i
-
-# target to preprocess a source file
-glcae.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/glcae.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/glcae.c.i
-.PHONY : glcae.c.i
-
-glcae.s: glcae.c.s
-.PHONY : glcae.s
-
-# target to generate assembly for a file
-glcae.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/glcae.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/glcae.c.s
-.PHONY : glcae.c.s
-
 guided.o: guided.c.o
 .PHONY : guided.o
 
@@ -505,33 +329,6 @@ guided.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/guided.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/guided.c.s
 .PHONY : guided.c.s
-
-mask.o: mask.c.o
-.PHONY : mask.o
-
-# target to build an object file
-mask.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/mask.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/mask.c.o
-.PHONY : mask.c.o
-
-mask.i: mask.c.i
-.PHONY : mask.i
-
-# target to preprocess a source file
-mask.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/mask.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/mask.c.i
-.PHONY : mask.c.i
-
-mask.s: mask.c.s
-.PHONY : mask.s
-
-# target to generate assembly for a file
-mask.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/mask.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/mask.c.s
-.PHONY : mask.c.s
 
 musica.o: musica.c.o
 .PHONY : musica.o
@@ -668,33 +465,6 @@ pipeline.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/pipeline.c.s
 .PHONY : pipeline.c.s
 
-process.o: process.c.o
-.PHONY : process.o
-
-# target to build an object file
-process.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/process.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/process.c.o
-.PHONY : process.c.o
-
-process.i: process.c.i
-.PHONY : process.i
-
-# target to preprocess a source file
-process.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/process.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/process.c.i
-.PHONY : process.c.i
-
-process.s: process.c.s
-.PHONY : process.s
-
-# target to generate assembly for a file
-process.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/process.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/process.c.s
-.PHONY : process.c.s
-
 register.o: register.c.o
 .PHONY : register.o
 
@@ -721,87 +491,6 @@ register.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/register.c.s
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/register.c.s
 .PHONY : register.c.s
-
-rings.o: rings.c.o
-.PHONY : rings.o
-
-# target to build an object file
-rings.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/rings.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/rings.c.o
-.PHONY : rings.c.o
-
-rings.i: rings.c.i
-.PHONY : rings.i
-
-# target to preprocess a source file
-rings.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/rings.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/rings.c.i
-.PHONY : rings.c.i
-
-rings.s: rings.c.s
-.PHONY : rings.s
-
-# target to generate assembly for a file
-rings.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/rings.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/rings.c.s
-.PHONY : rings.c.s
-
-sheetness.o: sheetness.c.o
-.PHONY : sheetness.o
-
-# target to build an object file
-sheetness.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/sheetness.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/sheetness.c.o
-.PHONY : sheetness.c.o
-
-sheetness.i: sheetness.c.i
-.PHONY : sheetness.i
-
-# target to preprocess a source file
-sheetness.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/sheetness.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/sheetness.c.i
-.PHONY : sheetness.c.i
-
-sheetness.s: sheetness.c.s
-.PHONY : sheetness.s
-
-# target to generate assembly for a file
-sheetness.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/sheetness.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/sheetness.c.s
-.PHONY : sheetness.c.s
-
-spectral.o: spectral.c.o
-.PHONY : spectral.o
-
-# target to build an object file
-spectral.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/spectral.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/spectral.c.o
-.PHONY : spectral.c.o
-
-spectral.i: spectral.c.i
-.PHONY : spectral.i
-
-# target to preprocess a source file
-spectral.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/spectral.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/spectral.c.i
-.PHONY : spectral.c.i
-
-spectral.s: spectral.c.s
-.PHONY : spectral.s
-
-# target to generate assembly for a file
-spectral.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/spectral.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/spectral.c.s
-.PHONY : spectral.c.s
 
 stream.o: stream.c.o
 .PHONY : stream.o
@@ -878,33 +567,6 @@ tests/test_fysics.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_fysics.dir/build.make CMakeFiles/test_fysics.dir/tests/test_fysics.c.s
 .PHONY : tests/test_fysics.c.s
 
-texture.o: texture.c.o
-.PHONY : texture.o
-
-# target to build an object file
-texture.c.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/texture.c.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/texture.c.o
-.PHONY : texture.c.o
-
-texture.i: texture.c.i
-.PHONY : texture.i
-
-# target to preprocess a source file
-texture.c.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/texture.c.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/texture.c.i
-.PHONY : texture.c.i
-
-texture.s: texture.c.s
-.PHONY : texture.s
-
-# target to generate assembly for a file
-texture.c.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/texture.c.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/texture.c.s
-.PHONY : texture.c.s
-
 tools/fysics_process_main.o: tools/fysics_process_main.c.o
 .PHONY : tools/fysics_process_main.o
 
@@ -928,6 +590,105 @@ tools/fysics_process_main.s: tools/fysics_process_main.c.s
 tools/fysics_process_main.c.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics-process.dir/build.make CMakeFiles/fysics-process.dir/tools/fysics_process_main.c.s
 .PHONY : tools/fysics_process_main.c.s
+
+tools/vca_export.o: tools/vca_export.c.o
+.PHONY : tools/vca_export.o
+
+# target to build an object file
+tools/vca_export.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/tools/vca_export.c.o
+.PHONY : tools/vca_export.c.o
+
+tools/vca_export.i: tools/vca_export.c.i
+.PHONY : tools/vca_export.i
+
+# target to preprocess a source file
+tools/vca_export.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/tools/vca_export.c.i
+.PHONY : tools/vca_export.c.i
+
+tools/vca_export.s: tools/vca_export.c.s
+.PHONY : tools/vca_export.s
+
+# target to generate assembly for a file
+tools/vca_export.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/tools/vca_export.c.s
+.PHONY : tools/vca_export.c.s
+
+vendor/libs3/libs3.o: vendor/libs3/libs3.c.o
+.PHONY : vendor/libs3/libs3.o
+
+# target to build an object file
+vendor/libs3/libs3.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/vendor/libs3/libs3.c.o
+.PHONY : vendor/libs3/libs3.c.o
+
+vendor/libs3/libs3.i: vendor/libs3/libs3.c.i
+.PHONY : vendor/libs3/libs3.i
+
+# target to preprocess a source file
+vendor/libs3/libs3.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/vendor/libs3/libs3.c.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/vendor/libs3/libs3.c.i
+.PHONY : vendor/libs3/libs3.c.i
+
+vendor/libs3/libs3.s: vendor/libs3/libs3.c.s
+.PHONY : vendor/libs3/libs3.s
+
+# target to generate assembly for a file
+vendor/libs3/libs3.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics.dir/build.make CMakeFiles/fysics.dir/vendor/libs3/libs3.c.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fysics_shared.dir/build.make CMakeFiles/fysics_shared.dir/vendor/libs3/libs3.c.s
+.PHONY : vendor/libs3/libs3.c.s
+
+vendor/matter/mc_archive.o: vendor/matter/mc_archive.c.o
+.PHONY : vendor/matter/mc_archive.o
+
+# target to build an object file
+vendor/matter/mc_archive.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/vendor/matter/mc_archive.c.o
+.PHONY : vendor/matter/mc_archive.c.o
+
+vendor/matter/mc_archive.i: vendor/matter/mc_archive.c.i
+.PHONY : vendor/matter/mc_archive.i
+
+# target to preprocess a source file
+vendor/matter/mc_archive.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/vendor/matter/mc_archive.c.i
+.PHONY : vendor/matter/mc_archive.c.i
+
+vendor/matter/mc_archive.s: vendor/matter/mc_archive.c.s
+.PHONY : vendor/matter/mc_archive.s
+
+# target to generate assembly for a file
+vendor/matter/mc_archive.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/vendor/matter/mc_archive.c.s
+.PHONY : vendor/matter/mc_archive.c.s
+
+vendor/matter/mc_codec.o: vendor/matter/mc_codec.c.o
+.PHONY : vendor/matter/mc_codec.o
+
+# target to build an object file
+vendor/matter/mc_codec.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/vendor/matter/mc_codec.c.o
+.PHONY : vendor/matter/mc_codec.c.o
+
+vendor/matter/mc_codec.i: vendor/matter/mc_codec.c.i
+.PHONY : vendor/matter/mc_codec.i
+
+# target to preprocess a source file
+vendor/matter/mc_codec.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/vendor/matter/mc_codec.c.i
+.PHONY : vendor/matter/mc_codec.c.i
+
+vendor/matter/mc_codec.s: vendor/matter/mc_codec.c.s
+.PHONY : vendor/matter/mc_codec.s
+
+# target to generate assembly for a file
+vendor/matter/mc_codec.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vca_export.dir/build.make CMakeFiles/vca_export.dir/vendor/matter/mc_codec.c.s
+.PHONY : vendor/matter/mc_codec.c.s
 
 zarr_io.o: zarr_io.c.o
 .PHONY : zarr_io.o
@@ -1001,39 +762,16 @@ help:
 	@echo "... fysics-process"
 	@echo "... fysics_shared"
 	@echo "... test_fysics"
-	@echo "... calibrate.o"
-	@echo "... calibrate.i"
-	@echo "... calibrate.s"
-	@echo "... clahe.o"
-	@echo "... clahe.i"
-	@echo "... clahe.s"
-	@echo "... compact.o"
-	@echo "... compact.i"
-	@echo "... compact.s"
-	@echo "... denoise.o"
-	@echo "... denoise.i"
-	@echo "... denoise.s"
-	@echo "... diffusion.o"
-	@echo "... diffusion.i"
-	@echo "... diffusion.s"
+	@echo "... vca_export"
+	@echo "... dering.o"
+	@echo "... dering.i"
+	@echo "... dering.s"
 	@echo "... fft.o"
 	@echo "... fft.i"
 	@echo "... fft.s"
-	@echo "... fsc.o"
-	@echo "... fsc.i"
-	@echo "... fsc.s"
-	@echo "... fuse.o"
-	@echo "... fuse.i"
-	@echo "... fuse.s"
-	@echo "... glcae.o"
-	@echo "... glcae.i"
-	@echo "... glcae.s"
 	@echo "... guided.o"
 	@echo "... guided.i"
 	@echo "... guided.s"
-	@echo "... mask.o"
-	@echo "... mask.i"
-	@echo "... mask.s"
 	@echo "... musica.o"
 	@echo "... musica.i"
 	@echo "... musica.s"
@@ -1049,21 +787,9 @@ help:
 	@echo "... pipeline.o"
 	@echo "... pipeline.i"
 	@echo "... pipeline.s"
-	@echo "... process.o"
-	@echo "... process.i"
-	@echo "... process.s"
 	@echo "... register.o"
 	@echo "... register.i"
 	@echo "... register.s"
-	@echo "... rings.o"
-	@echo "... rings.i"
-	@echo "... rings.s"
-	@echo "... sheetness.o"
-	@echo "... sheetness.i"
-	@echo "... sheetness.s"
-	@echo "... spectral.o"
-	@echo "... spectral.i"
-	@echo "... spectral.s"
 	@echo "... stream.o"
 	@echo "... stream.i"
 	@echo "... stream.s"
@@ -1073,12 +799,21 @@ help:
 	@echo "... tests/test_fysics.o"
 	@echo "... tests/test_fysics.i"
 	@echo "... tests/test_fysics.s"
-	@echo "... texture.o"
-	@echo "... texture.i"
-	@echo "... texture.s"
 	@echo "... tools/fysics_process_main.o"
 	@echo "... tools/fysics_process_main.i"
 	@echo "... tools/fysics_process_main.s"
+	@echo "... tools/vca_export.o"
+	@echo "... tools/vca_export.i"
+	@echo "... tools/vca_export.s"
+	@echo "... vendor/libs3/libs3.o"
+	@echo "... vendor/libs3/libs3.i"
+	@echo "... vendor/libs3/libs3.s"
+	@echo "... vendor/matter/mc_archive.o"
+	@echo "... vendor/matter/mc_archive.i"
+	@echo "... vendor/matter/mc_archive.s"
+	@echo "... vendor/matter/mc_codec.o"
+	@echo "... vendor/matter/mc_codec.i"
+	@echo "... vendor/matter/mc_codec.s"
 	@echo "... zarr_io.o"
 	@echo "... zarr_io.i"
 	@echo "... zarr_io.s"

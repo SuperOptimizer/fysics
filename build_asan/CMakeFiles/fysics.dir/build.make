@@ -100,94 +100,24 @@ CMakeFiles/fysics.dir/paganin.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/paganin.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/paganin.c -o CMakeFiles/fysics.dir/paganin.c.s
 
-CMakeFiles/fysics.dir/denoise.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/denoise.c.o: /home/forrest/fysics/denoise.c
-CMakeFiles/fysics.dir/denoise.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building C object CMakeFiles/fysics.dir/denoise.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/denoise.c.o -MF CMakeFiles/fysics.dir/denoise.c.o.d -o CMakeFiles/fysics.dir/denoise.c.o -c /home/forrest/fysics/denoise.c
+CMakeFiles/fysics.dir/dering.c.o: CMakeFiles/fysics.dir/flags.make
+CMakeFiles/fysics.dir/dering.c.o: /home/forrest/fysics/dering.c
+CMakeFiles/fysics.dir/dering.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building C object CMakeFiles/fysics.dir/dering.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/dering.c.o -MF CMakeFiles/fysics.dir/dering.c.o.d -o CMakeFiles/fysics.dir/dering.c.o -c /home/forrest/fysics/dering.c
 
-CMakeFiles/fysics.dir/denoise.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/denoise.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/denoise.c > CMakeFiles/fysics.dir/denoise.c.i
+CMakeFiles/fysics.dir/dering.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/dering.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/dering.c > CMakeFiles/fysics.dir/dering.c.i
 
-CMakeFiles/fysics.dir/denoise.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/denoise.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/denoise.c -o CMakeFiles/fysics.dir/denoise.c.s
-
-CMakeFiles/fysics.dir/rings.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/rings.c.o: /home/forrest/fysics/rings.c
-CMakeFiles/fysics.dir/rings.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building C object CMakeFiles/fysics.dir/rings.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/rings.c.o -MF CMakeFiles/fysics.dir/rings.c.o.d -o CMakeFiles/fysics.dir/rings.c.o -c /home/forrest/fysics/rings.c
-
-CMakeFiles/fysics.dir/rings.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/rings.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/rings.c > CMakeFiles/fysics.dir/rings.c.i
-
-CMakeFiles/fysics.dir/rings.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/rings.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/rings.c -o CMakeFiles/fysics.dir/rings.c.s
-
-CMakeFiles/fysics.dir/mask.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/mask.c.o: /home/forrest/fysics/mask.c
-CMakeFiles/fysics.dir/mask.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building C object CMakeFiles/fysics.dir/mask.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/mask.c.o -MF CMakeFiles/fysics.dir/mask.c.o.d -o CMakeFiles/fysics.dir/mask.c.o -c /home/forrest/fysics/mask.c
-
-CMakeFiles/fysics.dir/mask.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/mask.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/mask.c > CMakeFiles/fysics.dir/mask.c.i
-
-CMakeFiles/fysics.dir/mask.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/mask.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/mask.c -o CMakeFiles/fysics.dir/mask.c.s
-
-CMakeFiles/fysics.dir/clahe.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/clahe.c.o: /home/forrest/fysics/clahe.c
-CMakeFiles/fysics.dir/clahe.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Building C object CMakeFiles/fysics.dir/clahe.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/clahe.c.o -MF CMakeFiles/fysics.dir/clahe.c.o.d -o CMakeFiles/fysics.dir/clahe.c.o -c /home/forrest/fysics/clahe.c
-
-CMakeFiles/fysics.dir/clahe.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/clahe.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/clahe.c > CMakeFiles/fysics.dir/clahe.c.i
-
-CMakeFiles/fysics.dir/clahe.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/clahe.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/clahe.c -o CMakeFiles/fysics.dir/clahe.c.s
-
-CMakeFiles/fysics.dir/glcae.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/glcae.c.o: /home/forrest/fysics/glcae.c
-CMakeFiles/fysics.dir/glcae.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Building C object CMakeFiles/fysics.dir/glcae.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/glcae.c.o -MF CMakeFiles/fysics.dir/glcae.c.o.d -o CMakeFiles/fysics.dir/glcae.c.o -c /home/forrest/fysics/glcae.c
-
-CMakeFiles/fysics.dir/glcae.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/glcae.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/glcae.c > CMakeFiles/fysics.dir/glcae.c.i
-
-CMakeFiles/fysics.dir/glcae.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/glcae.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/glcae.c -o CMakeFiles/fysics.dir/glcae.c.s
-
-CMakeFiles/fysics.dir/process.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/process.c.o: /home/forrest/fysics/process.c
-CMakeFiles/fysics.dir/process.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_8) "Building C object CMakeFiles/fysics.dir/process.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/process.c.o -MF CMakeFiles/fysics.dir/process.c.o.d -o CMakeFiles/fysics.dir/process.c.o -c /home/forrest/fysics/process.c
-
-CMakeFiles/fysics.dir/process.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/process.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/process.c > CMakeFiles/fysics.dir/process.c.i
-
-CMakeFiles/fysics.dir/process.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/process.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/process.c -o CMakeFiles/fysics.dir/process.c.s
+CMakeFiles/fysics.dir/dering.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/dering.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/dering.c -o CMakeFiles/fysics.dir/dering.c.s
 
 CMakeFiles/fysics.dir/stream.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/stream.c.o: /home/forrest/fysics/stream.c
 CMakeFiles/fysics.dir/stream.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_9) "Building C object CMakeFiles/fysics.dir/stream.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building C object CMakeFiles/fysics.dir/stream.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/stream.c.o -MF CMakeFiles/fysics.dir/stream.c.o.d -o CMakeFiles/fysics.dir/stream.c.o -c /home/forrest/fysics/stream.c
 
 CMakeFiles/fysics.dir/stream.c.i: cmake_force
@@ -201,7 +131,7 @@ CMakeFiles/fysics.dir/stream.c.s: cmake_force
 CMakeFiles/fysics.dir/guided.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/guided.c.o: /home/forrest/fysics/guided.c
 CMakeFiles/fysics.dir/guided.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Building C object CMakeFiles/fysics.dir/guided.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building C object CMakeFiles/fysics.dir/guided.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/guided.c.o -MF CMakeFiles/fysics.dir/guided.c.o.d -o CMakeFiles/fysics.dir/guided.c.o -c /home/forrest/fysics/guided.c
 
 CMakeFiles/fysics.dir/guided.c.i: cmake_force
@@ -215,7 +145,7 @@ CMakeFiles/fysics.dir/guided.c.s: cmake_force
 CMakeFiles/fysics.dir/musica.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/musica.c.o: /home/forrest/fysics/musica.c
 CMakeFiles/fysics.dir/musica.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_11) "Building C object CMakeFiles/fysics.dir/musica.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Building C object CMakeFiles/fysics.dir/musica.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/musica.c.o -MF CMakeFiles/fysics.dir/musica.c.o.d -o CMakeFiles/fysics.dir/musica.c.o -c /home/forrest/fysics/musica.c
 
 CMakeFiles/fysics.dir/musica.c.i: cmake_force
@@ -226,24 +156,10 @@ CMakeFiles/fysics.dir/musica.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/musica.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/musica.c -o CMakeFiles/fysics.dir/musica.c.s
 
-CMakeFiles/fysics.dir/fsc.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/fsc.c.o: /home/forrest/fysics/fsc.c
-CMakeFiles/fysics.dir/fsc.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_12) "Building C object CMakeFiles/fysics.dir/fsc.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/fsc.c.o -MF CMakeFiles/fysics.dir/fsc.c.o.d -o CMakeFiles/fysics.dir/fsc.c.o -c /home/forrest/fysics/fsc.c
-
-CMakeFiles/fysics.dir/fsc.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/fsc.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/fsc.c > CMakeFiles/fysics.dir/fsc.c.i
-
-CMakeFiles/fysics.dir/fsc.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/fsc.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/fsc.c -o CMakeFiles/fysics.dir/fsc.c.s
-
 CMakeFiles/fysics.dir/zdrift.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/zdrift.c.o: /home/forrest/fysics/zdrift.c
 CMakeFiles/fysics.dir/zdrift.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_13) "Building C object CMakeFiles/fysics.dir/zdrift.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Building C object CMakeFiles/fysics.dir/zdrift.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/zdrift.c.o -MF CMakeFiles/fysics.dir/zdrift.c.o.d -o CMakeFiles/fysics.dir/zdrift.c.o -c /home/forrest/fysics/zdrift.c
 
 CMakeFiles/fysics.dir/zdrift.c.i: cmake_force
@@ -254,24 +170,10 @@ CMakeFiles/fysics.dir/zdrift.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/zdrift.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/zdrift.c -o CMakeFiles/fysics.dir/zdrift.c.s
 
-CMakeFiles/fysics.dir/sheetness.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/sheetness.c.o: /home/forrest/fysics/sheetness.c
-CMakeFiles/fysics.dir/sheetness.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_14) "Building C object CMakeFiles/fysics.dir/sheetness.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/sheetness.c.o -MF CMakeFiles/fysics.dir/sheetness.c.o.d -o CMakeFiles/fysics.dir/sheetness.c.o -c /home/forrest/fysics/sheetness.c
-
-CMakeFiles/fysics.dir/sheetness.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/sheetness.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/sheetness.c > CMakeFiles/fysics.dir/sheetness.c.i
-
-CMakeFiles/fysics.dir/sheetness.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/sheetness.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/sheetness.c -o CMakeFiles/fysics.dir/sheetness.c.s
-
 CMakeFiles/fysics.dir/noise.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/noise.c.o: /home/forrest/fysics/noise.c
 CMakeFiles/fysics.dir/noise.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_15) "Building C object CMakeFiles/fysics.dir/noise.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_8) "Building C object CMakeFiles/fysics.dir/noise.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/noise.c.o -MF CMakeFiles/fysics.dir/noise.c.o.d -o CMakeFiles/fysics.dir/noise.c.o -c /home/forrest/fysics/noise.c
 
 CMakeFiles/fysics.dir/noise.c.i: cmake_force
@@ -285,7 +187,7 @@ CMakeFiles/fysics.dir/noise.c.s: cmake_force
 CMakeFiles/fysics.dir/register.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/register.c.o: /home/forrest/fysics/register.c
 CMakeFiles/fysics.dir/register.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_16) "Building C object CMakeFiles/fysics.dir/register.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_9) "Building C object CMakeFiles/fysics.dir/register.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/register.c.o -MF CMakeFiles/fysics.dir/register.c.o.d -o CMakeFiles/fysics.dir/register.c.o -c /home/forrest/fysics/register.c
 
 CMakeFiles/fysics.dir/register.c.i: cmake_force
@@ -299,7 +201,7 @@ CMakeFiles/fysics.dir/register.c.s: cmake_force
 CMakeFiles/fysics.dir/phasecorr.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/phasecorr.c.o: /home/forrest/fysics/phasecorr.c
 CMakeFiles/fysics.dir/phasecorr.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_17) "Building C object CMakeFiles/fysics.dir/phasecorr.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_10) "Building C object CMakeFiles/fysics.dir/phasecorr.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/phasecorr.c.o -MF CMakeFiles/fysics.dir/phasecorr.c.o.d -o CMakeFiles/fysics.dir/phasecorr.c.o -c /home/forrest/fysics/phasecorr.c
 
 CMakeFiles/fysics.dir/phasecorr.c.i: cmake_force
@@ -310,80 +212,10 @@ CMakeFiles/fysics.dir/phasecorr.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/phasecorr.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/phasecorr.c -o CMakeFiles/fysics.dir/phasecorr.c.s
 
-CMakeFiles/fysics.dir/compact.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/compact.c.o: /home/forrest/fysics/compact.c
-CMakeFiles/fysics.dir/compact.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_18) "Building C object CMakeFiles/fysics.dir/compact.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/compact.c.o -MF CMakeFiles/fysics.dir/compact.c.o.d -o CMakeFiles/fysics.dir/compact.c.o -c /home/forrest/fysics/compact.c
-
-CMakeFiles/fysics.dir/compact.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/compact.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/compact.c > CMakeFiles/fysics.dir/compact.c.i
-
-CMakeFiles/fysics.dir/compact.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/compact.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/compact.c -o CMakeFiles/fysics.dir/compact.c.s
-
-CMakeFiles/fysics.dir/fuse.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/fuse.c.o: /home/forrest/fysics/fuse.c
-CMakeFiles/fysics.dir/fuse.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_19) "Building C object CMakeFiles/fysics.dir/fuse.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/fuse.c.o -MF CMakeFiles/fysics.dir/fuse.c.o.d -o CMakeFiles/fysics.dir/fuse.c.o -c /home/forrest/fysics/fuse.c
-
-CMakeFiles/fysics.dir/fuse.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/fuse.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/fuse.c > CMakeFiles/fysics.dir/fuse.c.i
-
-CMakeFiles/fysics.dir/fuse.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/fuse.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/fuse.c -o CMakeFiles/fysics.dir/fuse.c.s
-
-CMakeFiles/fysics.dir/diffusion.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/diffusion.c.o: /home/forrest/fysics/diffusion.c
-CMakeFiles/fysics.dir/diffusion.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_20) "Building C object CMakeFiles/fysics.dir/diffusion.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/diffusion.c.o -MF CMakeFiles/fysics.dir/diffusion.c.o.d -o CMakeFiles/fysics.dir/diffusion.c.o -c /home/forrest/fysics/diffusion.c
-
-CMakeFiles/fysics.dir/diffusion.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/diffusion.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/diffusion.c > CMakeFiles/fysics.dir/diffusion.c.i
-
-CMakeFiles/fysics.dir/diffusion.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/diffusion.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/diffusion.c -o CMakeFiles/fysics.dir/diffusion.c.s
-
-CMakeFiles/fysics.dir/spectral.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/spectral.c.o: /home/forrest/fysics/spectral.c
-CMakeFiles/fysics.dir/spectral.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_21) "Building C object CMakeFiles/fysics.dir/spectral.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/spectral.c.o -MF CMakeFiles/fysics.dir/spectral.c.o.d -o CMakeFiles/fysics.dir/spectral.c.o -c /home/forrest/fysics/spectral.c
-
-CMakeFiles/fysics.dir/spectral.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/spectral.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/spectral.c > CMakeFiles/fysics.dir/spectral.c.i
-
-CMakeFiles/fysics.dir/spectral.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/spectral.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/spectral.c -o CMakeFiles/fysics.dir/spectral.c.s
-
-CMakeFiles/fysics.dir/texture.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/texture.c.o: /home/forrest/fysics/texture.c
-CMakeFiles/fysics.dir/texture.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_22) "Building C object CMakeFiles/fysics.dir/texture.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/texture.c.o -MF CMakeFiles/fysics.dir/texture.c.o.d -o CMakeFiles/fysics.dir/texture.c.o -c /home/forrest/fysics/texture.c
-
-CMakeFiles/fysics.dir/texture.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/texture.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/texture.c > CMakeFiles/fysics.dir/texture.c.i
-
-CMakeFiles/fysics.dir/texture.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/texture.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/texture.c -o CMakeFiles/fysics.dir/texture.c.s
-
 CMakeFiles/fysics.dir/zarr_io.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/zarr_io.c.o: /home/forrest/fysics/zarr_io.c
 CMakeFiles/fysics.dir/zarr_io.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_23) "Building C object CMakeFiles/fysics.dir/zarr_io.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_11) "Building C object CMakeFiles/fysics.dir/zarr_io.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/zarr_io.c.o -MF CMakeFiles/fysics.dir/zarr_io.c.o.d -o CMakeFiles/fysics.dir/zarr_io.c.o -c /home/forrest/fysics/zarr_io.c
 
 CMakeFiles/fysics.dir/zarr_io.c.i: cmake_force
@@ -394,24 +226,10 @@ CMakeFiles/fysics.dir/zarr_io.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/zarr_io.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/zarr_io.c -o CMakeFiles/fysics.dir/zarr_io.c.s
 
-CMakeFiles/fysics.dir/calibrate.c.o: CMakeFiles/fysics.dir/flags.make
-CMakeFiles/fysics.dir/calibrate.c.o: /home/forrest/fysics/calibrate.c
-CMakeFiles/fysics.dir/calibrate.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_24) "Building C object CMakeFiles/fysics.dir/calibrate.c.o"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/calibrate.c.o -MF CMakeFiles/fysics.dir/calibrate.c.o.d -o CMakeFiles/fysics.dir/calibrate.c.o -c /home/forrest/fysics/calibrate.c
-
-CMakeFiles/fysics.dir/calibrate.c.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/calibrate.c.i"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/calibrate.c > CMakeFiles/fysics.dir/calibrate.c.i
-
-CMakeFiles/fysics.dir/calibrate.c.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/calibrate.c.s"
-	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/calibrate.c -o CMakeFiles/fysics.dir/calibrate.c.s
-
 CMakeFiles/fysics.dir/pipeline.c.o: CMakeFiles/fysics.dir/flags.make
 CMakeFiles/fysics.dir/pipeline.c.o: /home/forrest/fysics/pipeline.c
 CMakeFiles/fysics.dir/pipeline.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_25) "Building C object CMakeFiles/fysics.dir/pipeline.c.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_12) "Building C object CMakeFiles/fysics.dir/pipeline.c.o"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/pipeline.c.o -MF CMakeFiles/fysics.dir/pipeline.c.o.d -o CMakeFiles/fysics.dir/pipeline.c.o -c /home/forrest/fysics/pipeline.c
 
 CMakeFiles/fysics.dir/pipeline.c.i: cmake_force
@@ -422,65 +240,55 @@ CMakeFiles/fysics.dir/pipeline.c.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/pipeline.c.s"
 	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/pipeline.c -o CMakeFiles/fysics.dir/pipeline.c.s
 
+CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o: CMakeFiles/fysics.dir/flags.make
+CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o: /home/forrest/fysics/vendor/libs3/libs3.c
+CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o: CMakeFiles/fysics.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_13) "Building C object CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -MD -MT CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o -MF CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o.d -o CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o -c /home/forrest/fysics/vendor/libs3/libs3.c
+
+CMakeFiles/fysics.dir/vendor/libs3/libs3.c.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing C source to CMakeFiles/fysics.dir/vendor/libs3/libs3.c.i"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -E /home/forrest/fysics/vendor/libs3/libs3.c > CMakeFiles/fysics.dir/vendor/libs3/libs3.c.i
+
+CMakeFiles/fysics.dir/vendor/libs3/libs3.c.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling C source to assembly CMakeFiles/fysics.dir/vendor/libs3/libs3.c.s"
+	/usr/bin/cc $(C_DEFINES) $(C_INCLUDES) $(C_FLAGS) -S /home/forrest/fysics/vendor/libs3/libs3.c -o CMakeFiles/fysics.dir/vendor/libs3/libs3.c.s
+
 # Object files for target fysics
 fysics_OBJECTS = \
 "CMakeFiles/fysics.dir/fft.c.o" \
 "CMakeFiles/fysics.dir/paganin.c.o" \
-"CMakeFiles/fysics.dir/denoise.c.o" \
-"CMakeFiles/fysics.dir/rings.c.o" \
-"CMakeFiles/fysics.dir/mask.c.o" \
-"CMakeFiles/fysics.dir/clahe.c.o" \
-"CMakeFiles/fysics.dir/glcae.c.o" \
-"CMakeFiles/fysics.dir/process.c.o" \
+"CMakeFiles/fysics.dir/dering.c.o" \
 "CMakeFiles/fysics.dir/stream.c.o" \
 "CMakeFiles/fysics.dir/guided.c.o" \
 "CMakeFiles/fysics.dir/musica.c.o" \
-"CMakeFiles/fysics.dir/fsc.c.o" \
 "CMakeFiles/fysics.dir/zdrift.c.o" \
-"CMakeFiles/fysics.dir/sheetness.c.o" \
 "CMakeFiles/fysics.dir/noise.c.o" \
 "CMakeFiles/fysics.dir/register.c.o" \
 "CMakeFiles/fysics.dir/phasecorr.c.o" \
-"CMakeFiles/fysics.dir/compact.c.o" \
-"CMakeFiles/fysics.dir/fuse.c.o" \
-"CMakeFiles/fysics.dir/diffusion.c.o" \
-"CMakeFiles/fysics.dir/spectral.c.o" \
-"CMakeFiles/fysics.dir/texture.c.o" \
 "CMakeFiles/fysics.dir/zarr_io.c.o" \
-"CMakeFiles/fysics.dir/calibrate.c.o" \
-"CMakeFiles/fysics.dir/pipeline.c.o"
+"CMakeFiles/fysics.dir/pipeline.c.o" \
+"CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o"
 
 # External object files for target fysics
 fysics_EXTERNAL_OBJECTS =
 
 libfysics.a: CMakeFiles/fysics.dir/fft.c.o
 libfysics.a: CMakeFiles/fysics.dir/paganin.c.o
-libfysics.a: CMakeFiles/fysics.dir/denoise.c.o
-libfysics.a: CMakeFiles/fysics.dir/rings.c.o
-libfysics.a: CMakeFiles/fysics.dir/mask.c.o
-libfysics.a: CMakeFiles/fysics.dir/clahe.c.o
-libfysics.a: CMakeFiles/fysics.dir/glcae.c.o
-libfysics.a: CMakeFiles/fysics.dir/process.c.o
+libfysics.a: CMakeFiles/fysics.dir/dering.c.o
 libfysics.a: CMakeFiles/fysics.dir/stream.c.o
 libfysics.a: CMakeFiles/fysics.dir/guided.c.o
 libfysics.a: CMakeFiles/fysics.dir/musica.c.o
-libfysics.a: CMakeFiles/fysics.dir/fsc.c.o
 libfysics.a: CMakeFiles/fysics.dir/zdrift.c.o
-libfysics.a: CMakeFiles/fysics.dir/sheetness.c.o
 libfysics.a: CMakeFiles/fysics.dir/noise.c.o
 libfysics.a: CMakeFiles/fysics.dir/register.c.o
 libfysics.a: CMakeFiles/fysics.dir/phasecorr.c.o
-libfysics.a: CMakeFiles/fysics.dir/compact.c.o
-libfysics.a: CMakeFiles/fysics.dir/fuse.c.o
-libfysics.a: CMakeFiles/fysics.dir/diffusion.c.o
-libfysics.a: CMakeFiles/fysics.dir/spectral.c.o
-libfysics.a: CMakeFiles/fysics.dir/texture.c.o
 libfysics.a: CMakeFiles/fysics.dir/zarr_io.c.o
-libfysics.a: CMakeFiles/fysics.dir/calibrate.c.o
 libfysics.a: CMakeFiles/fysics.dir/pipeline.c.o
+libfysics.a: CMakeFiles/fysics.dir/vendor/libs3/libs3.c.o
 libfysics.a: CMakeFiles/fysics.dir/build.make
 libfysics.a: CMakeFiles/fysics.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_26) "Linking C static library libfysics.a"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_14) "Linking C static library libfysics.a"
 	$(CMAKE_COMMAND) -P CMakeFiles/fysics.dir/cmake_clean_target.cmake
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/fysics.dir/link.txt --verbose=$(VERBOSE)
 

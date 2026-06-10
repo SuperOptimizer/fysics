@@ -36,9 +36,8 @@ find_package(OpenMP)
 find_package(CURL REQUIRED)
 set(FYSICS_LIBS3 ${CMAKE_CURRENT_SOURCE_DIR}/vendor/libs3/libs3.c)
 
-set(FYSICS_CORE_SRC fft.c paganin.c denoise.c rings.c mask.c clahe.c glcae.c process.c stream.c
-    guided.c musica.c fsc.c zdrift.c sheetness.c noise.c register.c phasecorr.c compact.c fuse.c
-    diffusion.c spectral.c texture.c zarr_io.c pipeline.c ${FYSICS_LIBS3})
+set(FYSICS_CORE_SRC fft.c paganin.c dering.c stream.c guided.c musica.c zdrift.c
+    noise.c register.c phasecorr.c zarr_io.c pipeline.c ${FYSICS_LIBS3})
 
 # ---- the library vc3d imports (S3-enabled) ----
 add_library(fysics STATIC ${FYSICS_CORE_SRC})

@@ -99,6 +99,8 @@ fysics-process: CMakeFiles/fysics-process.dir/compiler_depend.ts
 fysics-process: libfysics.a
 fysics-process: /usr/lib/gcc/x86_64-linux-gnu/15/libgomp.so
 fysics-process: /usr/lib/x86_64-linux-gnu/libpthread.a
+fysics-process: /usr/lib/x86_64-linux-gnu/libcurl.so
+fysics-process: /usr/lib/x86_64-linux-gnu/libcurl.so
 fysics-process: CMakeFiles/fysics-process.dir/link.txt
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/forrest/fysics/build_asan/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking C executable fysics-process"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/fysics-process.dir/link.txt --verbose=$(VERBOSE)

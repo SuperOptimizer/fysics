@@ -97,6 +97,8 @@ bench_fysics: CMakeFiles/bench_fysics.dir/tests/bench_fysics.c.o
 bench_fysics: CMakeFiles/bench_fysics.dir/build.make
 bench_fysics: CMakeFiles/bench_fysics.dir/compiler_depend.ts
 bench_fysics: libfysics.a
+bench_fysics: /usr/lib/x86_64-linux-gnu/libcurl.so
+bench_fysics: /usr/lib/x86_64-linux-gnu/libcurl.so
 bench_fysics: /usr/lib/gcc/x86_64-linux-gnu/15/libgomp.so
 bench_fysics: /usr/lib/x86_64-linux-gnu/libpthread.a
 bench_fysics: CMakeFiles/bench_fysics.dir/link.txt

@@ -29,6 +29,9 @@ static void usage(const char *prog) {
         "  --air-cut-aggr A  air-cut aggressiveness 0..1 (void-peak->valley, default 0.0)\n"
         "  --deconv       STORE matched-Wiener deconv (BM18 default: OFF, view-time only)\n"
         "  --musica       apply MUSICA viewing enhancement (default OFF)\n"
+        "  --no-dering    disable residual-ring detect+subtract (default ON, gated on detection)\n"
+        "  --dering-center Y X  rotation axis in voxels (default: volume center; use the\n"
+        "                 metadata rotation_axis_position if it differs)\n"
         "  --no-air-zero  disable the air-zero masking stage (default ON)\n"
         "  --meta PATH    metadata.json path (default: IN_ZARR/metadata.json)\n",
         prog);
@@ -51,7 +54,8 @@ static void apply_meta(fy_pipeline_cfg *c, const char *key, double v) {
 int main(int argc, char **argv) {
     if (argc < 3) { usage(argv[0]); return 2; }
     const char *in_zarr = argv[1], *out_zarr = argv[2];
-    int tile = 128, do_deconv = 0, do_musica = 0, do_air_zero = 1, scratch_passes = 5;
+    int tile = 128, do_deconv = 0, do_musica = 0, do_air_zero = 1, scratch_passes = 5, do_dering = 1;
+    double dering_cy = -1, dering_cx = -1;
     double air_cut_aggr = 0.0, denoise_k = 0.0;   /* 0 -> default 4.2 inside */
     const char *profile = NULL;
     char meta_path[PATH_MAX]; meta_path[0] = 0;
@@ -63,6 +67,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--deconv"))              do_deconv = 1;
         else if (!strcmp(argv[i], "--musica"))              do_musica = 1;
         else if (!strcmp(argv[i], "--no-air-zero"))         do_air_zero = 0;
+        else if (!strcmp(argv[i], "--no-dering"))           do_dering = 0;
+        else if (!strcmp(argv[i], "--dering-center") && i+2 < argc) { dering_cy = atof(argv[++i]); dering_cx = atof(argv[++i]); }
         else if (!strcmp(argv[i], "--scratch-passes") && i+1 < argc) scratch_passes = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--meta") && i+1 < argc)  snprintf(meta_path, sizeof(meta_path), "%s", argv[++i]);
         else { fprintf(stderr, "unknown arg: %s\n", argv[i]); usage(argv[0]); return 2; }
@@ -93,6 +99,7 @@ int main(int argc, char **argv) {
     cfg.scratch_passes = scratch_passes;
     cfg.do_normalize = 1; cfg.norm_lo = -1; cfg.norm_hi = -1;
     cfg.do_zdrift = 1; cfg.zdrift_factor = NULL;
+    cfg.do_dering = do_dering; cfg.dering_cy = dering_cy; cfg.dering_cx = dering_cx;
     cfg.do_musica = do_musica; cfg.musica_p = 0.6; cfg.musica_levels = 4; cfg.musica_core = 0.0;
 
     /* ---- locate read_meta.py: next to the binary, an installed ../share or the source

@@ -27,13 +27,14 @@ typedef struct {
     double pixel_um;          /* sample pixel size (micron/voxel) */
     double unsharp_sigma;     /* unsharp gaussian sigma (voxels); 0 disables */
     double unsharp_coeff;     /* unsharp coefficient; 0 disables */
-    double psf_sigma_vox;     /* Gaussian SYSTEM PSF width (voxels) for the Gureyev
+    double psf_sigma_vox;     /* Gaussian SYSTEM PSF width (voxels) for the matched
                                * deconvolution; 0 -> estimate ~0.5 vox default. */
 } fy_physics;
 
-/* ---- FFT (powers of two) ---- */
+/* ---- FFT (sizes 2^k and 3*2^k) ---- */
 int  fy_is_pow2(int n);
 int  fy_next_pow2(int n);
+int  fy_next_fft_size(int n);   /* smallest supported FFT size >= n (2^k or 3*2^k) */
 void fy_fft1d(float *re, float *im, int n, int sign);          /* sign -1 fwd, +1 inv */
 void fy_fft3d(float *re, float *im, int nz, int ny, int nx, int sign);
 void fy_fft3d_normalize(float *re, float *im, int nz, int ny, int nx);
@@ -42,7 +43,7 @@ void fy_fft3d_normalize(float *re, float *im, int nz, int ny, int nx);
  * STREAMING for WHOLE-VOLUME processing at 20TB+ (dense u8).
  * fysics does the per-chunk MATH; the CALLER owns chunk iteration + I/O.
  *   LOCAL ops (deconv/denoise/mask): process one chunk (+halo) independently.
- *   GLOBAL ops (normalize/GLCAE-global): TWO-PASS --
+ *   GLOBAL ops (normalize): TWO-PASS --
  *     pass1: fy_hist_accumulate_u8() over all chunks (tiny RAM)
  *     finalize: compute the mapping ONCE from the global histogram
  *     pass2: fy_*_apply_u8() per chunk with that mapping.
@@ -82,60 +83,12 @@ void fy_norm_finalize(const fy_hist_state *s, double lo_pct, double hi_pct,
 void fy_norm_apply_u8(const unsigned char *in, float *out, size_t n,
                       unsigned char lo, unsigned char hi);
 
-/* global GLCAE stage: compute the lambda-blended mapping once from the global
- * histogram, then apply the 256-entry lookup per chunk in pass 2. */
-void fy_glcae_global_finalize(const fy_hist_state *s, int *mapping_out /*[256]*/);
-/* auto air/papyrus threshold (Otsu) from the volume's histogram -- per-volume,
- * not a hardcoded constant. Returns a [0,1] fraction for fy_recipe.air_thresh. */
-float fy_auto_air_thresh(const fy_hist_state *s);
-
-/* ---- segmentation-quality metrics from a 256-bin histogram (O(256), math in C) ----
- * Haralick-Shapiro bias-guarded Fisher J over thresholds [lo,hi); returns best J, writes
- * argmax threshold to *best_t. Higher J = cleaner 2-class separation (balance term guards
- * against degenerate/mode-collapsed splits). min_count = min voxels per class. */
-double fy_haralick_shapiro(const long hist[256], int lo, int hi, int min_count, int *best_t);
 /* Bimodal valley depth (rails 0/254/255 excluded): 1 - h_valley/min(h_dark,h_light) in [0,1],
  * higher=deeper. Writes dark/light/valley bins (non-NULL). -1 if not bimodal. */
 double fy_valley_depth(const long hist[256], int *dark_out, int *light_out, int *valley_out);
 
-/* ---- whole-pipeline quality metrics (math in C) ----
- * Edge/sheet sharpness: mean gradient magnitude (higher=sharper boundaries). */
-double fy_edge_sharpness(const float *v, int nz, int ny, int nx);
-/* Dynamic-range usage: fraction of [0,1] occupied by the 1-99 percentile span (from histogram). */
-double fy_dynamic_range_usage(const long hist[256]);
 /* Flat-region noise: median local std over flat bright (papyrus) blocks -- the noise floor. */
 double fy_flat_noise(const float *v, int nz, int ny, int nx, int blk);
-void fy_glcae_global_apply_u8(const unsigned char *in, float *out, size_t n,
-                              const int *mapping);
-
-/* ---- one-call recipe: the validated processing chain ----
- * mask air (on the raw, clean valley) -> deconvolve -> re-mask (keep air clean)
- * -> optional denoise -> optional GLCAE contrast. This is the "do the good thing"
- * entry point for importers (e.g. vc3d). Toggle stages via the params; 0/<=0
- * disables a stage. Operates on a tile (with halo for deconv correctness).
- */
-typedef struct {
-    double deconv_reg;       /* Wiener strength (0.015 = measured knee; <=0 skips deconv) */
-    int    auto_deltabeta;   /* 1 -> scale delta_beta per regime (fy_auto_deltabeta_scale):
-                              * partial inversion on fine volumes, full on coarse. Recommended. */
-    float  air_thresh;       /* papyrus/air intensity threshold (0=skip masking) */
-    double denoise_bilateral;/* guided-denoise eps (<=0 skips; 0.05 light) */
-    int    auto_denoise;     /* 1 -> set guided eps from the volume's MEASURED noise
-                              * (fy_estimate_noise + fy_guided_eps_for_noise); overrides
-                              * denoise_bilateral. Self-calibrates per volume (the noise
-                              * level varies 1.5-3.3x scroll-to-scroll). Recommended. */
-    int    do_glcae;         /* 1 -> GLCAE contrast (legacy; prefer MUSICA) */
-    float  glcae_clip;       /* CLAHE clip limit for GLCAE (default 2.0) */
-    int    do_musica;        /* 1 -> MUSICA multiscale contrast (preferred) */
-    float  musica_p;         /* MUSICA gain exponent (<1 boosts faint; ~0.8) */
-    float  air_fill;         /* what to put in masked air: 0=zero it out (black),
-                              * <0=keep the smooth original (gray). Default 0. */
-} fy_recipe;
-
-fy_recipe fy_recipe_default(void);     /* the one good pipeline (punchy; glcae off) */
-
-int fy_process(const float *in, float *out, int nz, int ny, int nx,
-               const fy_physics *p, const fy_recipe *r);
 
 /* ---- transfer functions (evaluate H at a given radial freq in cycles/voxel) ---- */
 double fy_paganin_transfer(double f_cyc_per_voxel, const fy_physics *p);
@@ -168,38 +121,52 @@ double fy_auto_deltabeta_scale(const fy_physics *p);
  *        0.015) -- RECOMMENDED, since the right reg depends on the volume's physics.
  * The Wiener gain H/(H^2+reg) is additionally capped at FY_MAX_DECONV_GAIN so a
  * mis-set reg can never amplify the high-frequency noise floor without bound.
- * Dimensions are zero-padded internally to powers of two (reflect padding) so
- * arbitrary sizes work. Returns 0 on success, nonzero on allocation failure.
+ * Dimensions are reflect-padded internally to FFT-friendly sizes (2^k or 3*2^k)
+ * so arbitrary sizes work. Returns 0 on success, nonzero on allocation failure.
  */
 int fy_deconvolve(const float *in, float *out,
                   int nz, int ny, int nx,
                   const fy_physics *p, double reg);
 
-/* ---- Gureyev-Paganin deconvolution (arXiv 2601.07225) ----
- * Goes beyond inverting the Paganin filter: it also explicitly Tikhonov-deconvolves
- * the Gaussian SYSTEM PSF (detector+source blur), which the standard Paganin over-
- * regularizes against. NOTE: like the plain deconv this restores high-frequency
- * CONTRAST -- FRC testing (Poisson-thinning, 7+ volumes) showed NO SNR-limited
- * resolution gain from any of these linear deblurs; treat as contrast/sharpness
- * restoration, not resolution recovery. The combined Fourier filter:
- *   H(k) = (1 + b'*k^2) * [ G(k) / (G(k)^2 + gamma) ]
- * where (1 + b'*k^2) is the reduced-strength Paganin inverse (b' = paganin b minus
- * the PSF contribution) and G(k)=exp(-2 pi^2 sigma^2 k^2) is the Gaussian system
- * PSF, Tikhonov-regularized by gamma. p->psf_sigma_vox sets sigma; gamma = tikhonov.
- * Reduces to the plain Paganin inverse when psf_sigma_vox=0. */
-int fy_deconvolve_gureyev(const float *in, float *out,
-                          int nz, int ny, int nx,
-                          const fy_physics *p, double tikhonov);
-
-/* OPERATOR-MATCHED Wiener inverse of nabu's MEASURED effective operator: inverts ONLY
- * G_psf(psf_sigma_vox) * unsharp(coeff,sigma) -- NOT the full Paganin (nabu's unsharp already
- * removed most Paganin blur; measured effective blur ~1 vox, not the ~9.8 vox naive Paganin).
- * The ONLY linear deconv shown to move BM18 data TOWARD ground truth (RMSE 0.0225) without the
- * amplitude overshoot of the plain/gureyev inverses. tikhonov ~0.05. */
+/* OPERATOR-MATCHED Wiener inverse of nabu's MEASURED effective forward operator
+ * (system PSF x unsharp boost: the unsharp already largely undid the Paganin blur,
+ * so the net volume blur is only ~1 vox). p->psf_sigma_vox sets the PSF width
+ * (measure it; pipeline pass 1 does); unsharp coeff/sigma come from metadata.
+ * tikhonov <= 0 -> 0.05. The pipeline's default STORED deconv. */
 int fy_deconvolve_matched(const float *in, float *out,
                           int nz, int ny, int nx,
                           const fy_physics *p, double tikhonov);
 
+/* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
+ * Process region+halo, keep the inner region -> seam-free tiling. */
+int fy_kernel_halo(const fy_physics *p);
+
+/* ---- guided filter: the recommended fast edge-preserving denoiser ----
+ * (He, Sun, Tang; O(N) box-filter based). eps = range parameter (smaller preserves
+ * more texture; set from the measured noise via fy_guided_eps_for_noise), radius r
+ * voxels. Apply AFTER deconvolution. */
+int fy_guided_denoise(const float *in, float *out, int nz, int ny, int nx,
+                      int radius, double eps);
+/* workspace variant: caller supplies ws = fy_guided_ws_floats(nz,ny,nx) contiguous
+ * floats, reused across calls (the per-tile pipeline hot path). */
+int fy_guided_denoise_ws(const float *in, float *out, int nz, int ny, int nx,
+                         int radius, double eps, float *ws);
+size_t fy_guided_ws_floats(int nz, int ny, int nx);
+/* FAST variant (He & Sun 2015): coefficients computed on an s-times-decimated grid
+ * and trilinearly upsampled -- ~s^3 less box-filter work, visually identical at s=2.
+ * s<=1 (or a tile too small to decimate) falls back to the exact path. Same ws. */
+int fy_guided_denoise_fast_ws(const float *in, float *out, int nz, int ny, int nx,
+                              int radius, double eps, int s, float *ws);
+/* plain box smooth (mean over (2r+1)^3); tmp = n-float scratch; in/out may alias. */
+void fy_box_smooth(const float *in, float *out, float *tmp, int nz, int ny, int nx, int r);
+/* map a measured noise level to a detail-safe guided eps (~(3*noise_ref)^2) */
+double fy_guided_eps_for_noise(double noise_ref);
+
+/* ---- MUSICA multi-scale contrast enhancement (per-slice viewing aid) ----
+ * Laplacian pyramid with sublinear gain |x|^p; p in (0,1], levels ~4, core
+ * protects the low-contrast center band. */
+int fy_musica2d(const float *in, float *out, int ny, int nx,
+                int levels, float p, float core);
 
 /* ---- per-volume noise model estimation (drive the denoisers from DATA) ----
  * Measured across 145 cubes / 18 scrolls: the reconstructed-volume noise is
@@ -214,7 +181,7 @@ int fy_deconvolve_matched(const float *in, float *out,
  * The line fit can be fragile (slope sometimes ill-conditioned), so the ROBUST,
  * primary output is `noise_ref` = the estimated noise std at a reference intensity
  * (`ref_intensity`, e.g. 0.4 in [0,1]); g,b are secondary. Feed `noise_ref` to the
- * denoisers (NLM h, guided eps ~ noise_ref^2, bilateral sigma_range) so denoise
+ * denoiser (guided eps ~ noise_ref^2, fy_guided_eps_for_noise) so denoise
  * strength self-calibrates per volume. Operates on a representative region/chunk;
  * cheap and streaming-friendly (local arithmetic, one pass). */
 typedef struct {
@@ -233,131 +200,6 @@ int fy_estimate_noise(const float *in, int nz, int ny, int nx,
                       int win, double flat_pct, double ref_intensity,
                       fy_noise_model *out);
 
-/* ---- multi-energy spectral decomposition (per-voxel; needs co-registered input) ----
- * Given N CO-REGISTERED energy volumes of the same object, already on a common
- * physical-attenuation scale (fy_u8_to_phys per energy), output per-voxel material-
- * contrast channels that surface material a single energy cannot:
- *   slope_out (optional): log-log slope d ln mu / d ln E (Z proxy; more negative=higher Z)
- *   highz_out (optional): high-Z contrast score in [0,1] (steep photoelectric slope AND
- *             a confirming low-energy excess), gated so noise-dominated low-mu voxels=0.
- * PURELY LOCAL (one voxel in/out, no halo) -> ideal vc3d streaming filter. The
- * REGISTRATION of the energies to a common grid is a PREREQUISITE done upstream (see
- * fy_phase_correlate / fy_register_affine). Validated on PHerc0343P: surfaces a real,
- * coherent high-Z population invisible at any single energy. NOTE: this is material
- * CONTRAST, not a calibrated material ID (don't claim "ink" without labels).
- * mu_floor: gate; voxels with high-energy mu below it are noise -> scored 0. <=0 auto. */
-int fy_spectral_decompose(const float *const *mu, const double *energies, int n_energy,
-                          int nz, int ny, int nx,
-                          float *slope_out, float *highz_out, double mu_floor);
-
-/* Map an estimated noise level to a DETAIL-SAFE guided-filter eps. Measured (145
- * cubes): the detail-safe knee is eps ~= 0.014 * var of the data; expressed via the
- * noise level, eps ~= (k * noise_ref)^2 keeps mid-band detail >=95% while removing the
- * noise-floor portion. k~3 reproduces the measured knee. Use as:
- *   fy_noise_model nm; fy_estimate_noise(vol,...,&nm);
- *   fy_guided_denoise(vol,out,nz,ny,nx, 2, fy_guided_eps_for_noise(nm.noise_ref));
- * NOTE (measured): clean denoising is fundamentally limited -- at the detail-safe
- * setting only ~12-25% of noise is removed; pushing harder eats real detail. Guided
- * filter is the recommended denoiser (BM4D is ~10% better but ~150x slower; whitening
- * and TV both HURT -- do not use them). */
-double fy_guided_eps_for_noise(double noise_ref);
-
-/* ---- generalized Anscombe variance-stabilizing transform (GAT) ----
- * The noise is signal-dependent (var = g*I + b). GAT remaps intensities so the noise
- * variance becomes ~constant (~1), letting ONE denoiser strength work across the whole
- * intensity range. Exact closed-form forward + inverse (algebraic inverse, not the
- * biased Anscombe approximation). g,b come from fy_estimate_noise. If g~0 (additive
- * noise) GAT reduces to a scale -- harmless.
- *   forward: T = (2/g)*sqrt(g*I + b + 3/8 g^2)   (g>0)
- *   inverse: I = (g/4)*T^2 - b/g - (3/8)*g       (the exact unbiased inverse) */
-void fy_gat_forward(const float *in, float *out, size_t n, double g, double b);
-void fy_gat_inverse(const float *in, float *out, size_t n, double g, double b);
-
-/* ---- quality denoise tier: NLM in the GAT (stabilized) domain ----
- * Measured (4 voxel sizes): estimate the noise model, GAT-stabilize, run small-window
- * non-local-means (search_radius=1, patch_radius=1) at strength ~the stabilized noise
- * (~1), inverse-GAT. Cuts structure-leak ~half vs the guided filter (0.5 -> 0.23) at
- * ~2.4s/cube -- ~55x faster than full BM4D for nearly its quality. Self-calibrating:
- * estimates (g,b,noise_ref) from the data. Use this as the "quality" denoise; use
- * fy_guided_denoise (with fy_guided_eps_for_noise) as the fast ~0.2s tier. */
-int fy_denoise_quality(const float *in, float *out, int nz, int ny, int nx);
-
-/* ---- denoising (complements deconvolution; deconv amplifies noise) ----
- * NLM: non-local means, edge/texture preserving (papyrus is self-similar -> ideal).
- *   h = filter strength (~noise level), search_radius S, patch_radius P.
- * Bilateral: cheaper edge-preserving alternative. */
-int fy_nlm_denoise(const float *in, float *out, int nz, int ny, int nx,
-                   double h, int search_radius, int patch_radius);
-int fy_bilateral_denoise(const float *in, float *out, int nz, int ny, int nx,
-                         double sigma_spatial, double sigma_range, int radius);
-/* Guided filter: O(N) edge-preserving denoise (box-filter based, ~100x faster than
- * bilateral, no gradient reversal). eps = range (smaller preserves more texture),
- * radius r. The recommended FAST default for streaming large volumes. */
-int fy_guided_denoise(const float *in, float *out, int nz, int ny, int nx,
-                      int radius, double eps);
-/* workspace variant: caller supplies ws = fy_guided_ws_floats(nz,ny,nx) contiguous floats,
- * reused across many calls to avoid per-call malloc churn (the per-tile pipeline hot path). */
-int fy_guided_denoise_ws(const float *in, float *out, int nz, int ny, int nx,
-                         int radius, double eps, float *ws);
-size_t fy_guided_ws_floats(int nz, int ny, int nx);
-/* plain box smooth (mean over (2r+1)^3); tmp = n-float scratch; in/out may alias. */
-void fy_box_smooth(const float *in, float *out, float *tmp, int nz, int ny, int nx, int r);
-
-
-/* ---- ring-artifact removal (heuristic, not a physics inverse) ----
- * Concentric ring artifacts from detector defects. Removed via radial-profile
- * high-pass in polar coords. center<0 -> slice center. strength in [0,1],
- * smooth_win = radial high-pass window (e.g. 30; larger -> only sharper rings). */
-int fy_remove_rings(const float *in, float *out, int nz, int ny, int nx,
-                    double center_x, double center_y, double strength, int smooth_win);
-
-
-/* ---- papyrus/air masking (kills "air noise" -- deconv of empty gaps) ----
- * Papyrus is bright+textured, air is dark+flat. Build a soft mask and keep the
- * sharpening only on papyrus; air stays as the smooth original (or a constant). */
-int fy_papyrus_mask(const float *in, float *mask, int nz, int ny, int nx,
-                    float intensity_lo, float intensity_hi,
-                    float var_lo, float var_hi, int radius);
-int fy_apply_mask(const float *processed, const float *original, const float *mask,
-                  float *out, int nz, int ny, int nx, float air_fill);
-/* local standard deviation in a (2r+1)^3 box -- the "texture" feature (low=flat air,
- * high=structured papyrus). Use for intensity x texture air/papyrus separation. */
-int fy_local_std(const float *in, float *out, int nz, int ny, int nx, int r);
-/* one-call sharpen-without-air-noise: deconv, keep only on papyrus */
-int fy_deconvolve_masked(const float *in, float *out, int nz, int ny, int nx,
-                         const fy_physics *p, double reg,
-                         float intensity_thresh, float var_thresh);
-
-
-/* ---- contrast enhancement: GLCAE (Global+Local Contrast Adaptive Enhancement) ----
- * Grayscale adaptation of Tian & Cohen ICCV-W 2017. Handles non-uniform
- * illumination: an adaptive GLOBAL histogram blend (auto lambda) + LOCAL CLAHE,
- * fused by local-contrast x brightness. Input/output normalized [0,1] per slice. */
-int fy_glcae2d(const float *in, float *out, int ny, int nx,
-               int clahe_tiles, float clahe_clip);
-/* MUSICA multiscale contrast (Vuylsteke-Schoeters): Laplacian-pyramid sublinear
- * detail amplification. Better than CLAHE/GLCAE for faint detail in noisy X-ray --
- * no tile/halo artifacts, doesn't penalize rare faint features. levels=pyramid
- * depth (~4), p=gain exponent (<1 boosts faint detail, ~0.7), core=noise coring
- * (0 disables). Per [0,1] slice. The recommended contrast method. */
-int fy_musica2d(const float *in, float *out, int ny, int nx,
-                int levels, float p, float core);
-int fy_clahe2d(const float *in, float *out, int ny, int nx,
-               int tiles_y, int tiles_x, int nbins, float clip_limit);
-
-
-/* ---- Fourier Shell Correlation (FSC): synchrotron resolution metric ----
- * Proves a processing step actually RECOVERED resolution (not just amplified
- * noise): if FSC extends to higher frequency after processing, resolution
- * improved. fy_fsc correlates two half-volumes shell-by-shell; fy_fsc_self splits
- * one volume (checkerboard) for a reduced-reference estimate. res_frac = resolution
- * as a fraction of Nyquist at the threshold (e.g. 0.143). */
-int fy_fsc(const float *vol1, const float *vol2, int nz, int ny, int nx,
-           int nbins, float *freqs, float *fsc);
-int fy_fsc_self(const float *vol, int nz, int ny, int nx, int nbins,
-                float threshold, float *res_frac, float *freqs, float *fsc);
-
-
 /* ---- z-drift / shading correction (whole-volume, the 13% beam-current drop) ----
  * Removes the slow brightness gradient along z from beam-current drift during the
  * scan. Two-pass streaming (tiny state = one scalar per slice):
@@ -370,98 +212,6 @@ void fy_zdrift_accumulate(const float *chunk, int nz_slab, int ny, int nx,
 void fy_zdrift_finalize(const double *sums, const long *counts, int nz, float *factor);
 void fy_zdrift_apply(float *chunk, int nz_slab, int ny, int nx, int z0, const float *factor);
 int  fy_correct_zdrift(float *vol, int nz, int ny, int nx, float papyrus_thresh);
-
-
-/* ---- sheetness filter (Frangi plate detector) -- for SEGMENTATION/UNWRAPPING ----
- * Responds to plate/sheet-like geometry (papyrus sheets); helps separate adjacent
- * sheets. NOT for ink (emphasizes geometry over faint ink texture). Output 0..1.
- * TUNING: sigma must match sheet thickness in voxels (the key knob, ~2-4 at 2.4um);
- * use multiscale for varying thickness. alpha,beta=0.5 defaults; c<=0 auto. bright=1
- * for bright sheets on dark air. Local op -> streamable with halo ~3*sigma. */
-int fy_sheetness(const float *in, float *out, int nz, int ny, int nx,
-                 double sigma, double alpha, double beta, double c, int bright);
-int fy_sheetness_multiscale(const float *in, float *out, int nz, int ny, int nx,
-                            const double *sigmas, int ns, double alpha, double beta,
-                            double c, int bright);
-
-/* ---- coherence-enhancing anisotropic diffusion (Weickert 1999) -- CLEAN SHEETS --
- * Smooths ALONG papyrus sheet surfaces but NOT across them: noise drops, sheets
- * become smooth/continuous for tracing, and crucially the THIN DARK GAPS between two
- * touching layers are PRESERVED (CED never merges adjacent sheets -- a plain Gaussian
- * blur WOULD fill the gap). Volume-in -> volume-out.
- *
- * Builds the structure tensor J_rho = G_rho*(grad u_sigma (x) grad u_sigma^T), eigen-
- * decomposes it per voxel (sheet -> one large eigenvalue = the normal, two small =
- * in-plane), and diffuses STRONG along the in-plane directions but WEAK along the
- * sheet normal using Weickert's coherence-enhancing eigenvalue map. Evolves the
- * explicit scheme u += tau*div(D grad u) for n_iters steps.
- *   sigma   : noise scale presmoothing for the gradient (~0.5-1 vox; <0 ->0.7)
- *   rho     : integration / sheet-coherence scale (~2-4 vox; <=0 ->3)
- *   tau     : explicit time step, 3D-stable <= ~0.12 (<=0 ->0.10)
- *   n_iters : explicit iterations, 3-15 (<1 ->5)
- *   coherence_alpha : Weickert alpha = base diffusivity across the sheet normal
- *             (0<alpha<1, ~0.001-0.01; smaller = harder gap preservation; <=0 ->0.001)
- * LOCAL op -> streamable/tileable. Per-side halo: ~3*sigma + 3*rho + n_iters + 2 vox
- * (see fy_coherence_diffusion_halo). Returns 0 on success, 1 on alloc failure. */
-int fy_coherence_diffusion(const float *in, float *out, int nz, int ny, int nx,
-                           double sigma, double rho, double tau, int n_iters,
-                           double coherence_alpha);
-/* AUTO-CALIBRATED "clean sheets for tracing" -- no-knobs entry point.
- * Derives sigma from the volume's measured noise (fy_estimate_noise), rho from the
- * measured cross-sheet layer spacing (autocorrelation), tau from the scheme's
- * stability max, and n_iters from `strength` (1=gentle/12, 2=normal/24, 3=strong/40).
- * Validated to denoise sheets while preserving inter-sheet gaps (~92% gap-depth at
- * 'normal' vs a matched Gaussian's ~67%). This is the recommended call for vc3d. */
-int fy_coherence_diffusion_auto(const float *in, float *out, int nz, int ny, int nx,
-                                int strength);
-/* Recommended per-side halo (voxels) to feed a tile so the result is seam-free. */
-int fy_coherence_diffusion_halo(double sigma, double rho, int n_iters);
-
-/* ===== IN-PLANE (surface-tangent) TEXTURE ENHANCER ========================
- * COMPLEMENT of coherence diffusion: where CED SMOOTHS along sheets, this
- * HIGH-PASSES along sheets. It LIFTS the fine in-plane "crackle" surface texture
- * on papyrus (the faint texture ink sits in, per Vesuvius Grand Prize findings)
- * while SUPPRESSING cross-sheet/layering variation and NOT amplifying noise.
- *
- * It is a STEERED, NOISE-GATED unsharp mask built on the SAME orientation field as
- * CED (structure tensor J_rho, eigen-decomposed -> sheet normal + two in-plane
- * tangents): low-pass ONLY within the tangent plane, detail = u - inplane_lowpass,
- * soft-threshold (core) the detail at the noise level, out = u + gain*cored_detail.
- * The in-plane (not isotropic) low-pass is why a cross-sheet STEP (layering) is NOT
- * boosted while in-plane texture IS -- a plain unsharp mask boosts the step too.
- *
- * HONEST SCOPE: NOT an ink detector and not validated as one (no ink labels). It is
- * the right transform IF ink is an in-plane texture signal; the proven, MEASURABLE
- * claims are: in-plane texture-band energy up, texture/noise ratio up (gating),
- * cross-sheet/layering variation NOT amplified.
- *
- * Explicit knobs: sigma (gradient presmooth, ~0.6-1), rho (orientation integration
- * scale, ~2-4), gain (>0, ~0.5-3), inplane_scale (steered low-pass radius in vox,
- * ~1.5-4: the texture band is detail finer than this within the plane), noise_floor
- * (detail magnitude below this is soft-thresholded/cored; in detail-signal units.
- * noise_floor==0 disables gating; noise_floor<0 is a SENTINEL = auto-derive the gate
- * from the detail's own robust scale (1.4826*MAD), the recommended self-calibrating
- * mode -- it measures the detail-band noise directly rather than mapping an absolute
- * intensity-domain noise model that the bright sheets/layering would corrupt).
- * Returns 0 on success, 1 on alloc failure. */
-int fy_texture_enhance(const float *in, float *out, int nz, int ny, int nx,
-                       double sigma, double rho, double gain,
-                       double inplane_scale, double noise_floor);
-/* AUTO-CALIBRATED "enhance in-plane texture over noise and over layering" -- no-knobs
- * entry point. Derives sigma & noise_floor from the volume's measured noise
- * (fy_estimate_noise for sigma; the gate is set from the detail's own MAD), rho from the
- * measured cross-sheet layer spacing (autocorrelation), inplane_scale from the measured
- * in-plane texture scale (in-plane autocorrelation), and gain from `strength`
- * (1=gentle/0.8, 2=normal/1.5, 3=strong/2.5). Recommended call. */
-int fy_texture_enhance_auto(const float *in, float *out, int nz, int ny, int nx,
-                            int strength);
-/* Recommended per-side halo (voxels) to feed a tile so the result is seam-free:
- * 3*sigma (presmooth) + 3*rho (integration box) + ceil(inplane_scale) + margin. */
-int fy_texture_enhance_halo(double sigma, double rho, double inplane_scale);
-
-/* recommended halo (voxels) for tiled/viewer use: the kernel's spatial half-extent.
- * Process a viewed region plus this margin, then keep only the inner region. */
-int fy_kernel_halo(const fy_physics *p);
 
 
 /* ===== LAYER 1: affine resampler + intensity-based registration ============
@@ -608,73 +358,6 @@ int fy_register_full(const float *fixed, const float *moving,
                      float *ux, float *uy, float *uz,
                      int n_iters, double field_sigma, double step);
 
-/* ===== LANDMARK affine fit + MULTI-RESOLUTION FUSION (fuse.c) ==============
- * Intensity NCC/MI is non-discriminative on the self-similar laminar scroll at a
- * common COARSE scale, so the trustworthy registration of two same-scroll scans is
- * LANDMARK/feature based: detect/match distinctive 3D points across the two scans,
- * then fit the global transform from the matched pairs. fy_affine_from_points is
- * that fit (with RANSAC for mismatch robustness). See FUSION.md. */
-
-/* Fit a 3x4 affine map dst<-src from N matched 3D point pairs.
- *   src,dst : n*3 doubles in (z,y,x) order (match the index convention).
- *   model   : 0 = full affine (12 dof, least squares), 1 = SIMILARITY
- *             (rotation + single isotropic scale + translation, 7 dof, closed-form
- *             Umeyama) -- the correct model for two scans of one rigid object
- *             differing only by voxel-size ratio + remount pose.
- *   ransac_iters  : >0 runs RANSAC (random minimal subsets, keep max-inlier model,
- *                   refit on inliers) for robustness to wrong correspondences; 0
- *                   does plain least squares on all points.
- *   inlier_thresh : RANSAC inlier distance in dst voxel units (ignored if no RANSAC).
- *   M_out   : 3x4 row-major result mapping a src point to its dst point
- *             (q = M_out[:, :3] @ p + M_out[:, 3]). To PULL the src volume onto the
- *             dst grid with fy_warp_affine (which wants a dst->src map), fit with
- *             src=fixed/dst=moving, or invert M_out.
- *   inlier_mask   : optional n ints (may be NULL), 1 = inlier.
- *   resid_rms_out : optional RMS residual (dst units) over inliers.
- * Returns 0 on success, 1 on failure (too few/degenerate points). */
-int fy_affine_from_points(const double *src, const double *dst, int n,
-                          int model, int ransac_iters, double inlier_thresh,
-                          double *M_out, int *inlier_mask, double *resid_rms_out);
-
-/* Fuse a FINE and a COARSE scan ALREADY resampled onto the SAME (nz,ny,nx) grid.
- * Frequency-split at split_sigma (gaussian): HIGH band comes from the fine scan
- * only; LOW band is an inverse-variance-weighted average of the two INDEPENDENT
- * measurements (so the shared low/mid band is DENOISED -- the payoff of fusion).
- * The coarse low band is intensity-matched (affine a*x+b least squares) to the fine
- * low band first, so the energy/contrast difference doesn't bias the average.
- *   var_fine,var_coarse : measured per-scan low-band noise variances; weights are
- *     w_fine=var_coarse/(var_fine+var_coarse). If both <=0 -> plain 0.5/0.5 average.
- *   high_gain : scale on the fine high band (1.0 keeps the fine detail as-is).
- *   mask : optional u8 (!=0 = valid overlap); outside it out=fine (no fusion). NULL=all.
- *   out = low_fused + high_gain*high_fine.
- * Returns 0 on success. */
-int fy_fuse_multiscale(const float *fine, const float *coarse,
-                       const unsigned char *mask, int nz, int ny, int nx,
-                       double split_sigma, double var_fine, double var_coarse,
-                       double high_gain, float *out);
-
-/* ---- compaction: downsample OVERSAMPLED volumes (lossless of resolved detail) ----
- * Measured: fine (~1.1um) scroll volumes are ~2x oversampled -- their resolved detail
- * fits a coarser grid, so downsampling ~1.75-2x/axis loses ~nothing (8x fewer voxels,
- * ~18TB saved on one 1.1um volume). Mid/coarse (>=2.4um) volumes are critically sampled
- * -- do NOT compact them. ORDER MATTERS: if deblurring, deblur at FULL resolution FIRST,
- * then downsample (downsampling discards the high-freq band the deblur restores --
- * deblur-then-downsample keeps ~86% of restored contrast vs ~21% for downsample-raw).
- *
- * Anti-aliased downsample by an arbitrary factor (gaussian blur sigma~0.5*factor, then
- * trilinear decimate). out size = ceil(dim/factor); pass back via onz/ony/onx. */
-int fy_downsample(const float *in, float *out, int nz, int ny, int nx,
-                  double factor, int *onz, int *ony, int *onx);
-
-/* Recommend the largest SAFE downsample factor for THIS volume from the data: sweeps
- * factors, measures the round-trip (downsample->upsample) L2 error over TEXTURED
- * regions only (flat/air regions can't lose detail and would mislead), and returns the
- * largest factor whose worst-textured-region error stays <= err_budget (e.g. 0.03).
- * Returns 1.0 if the volume is critically sampled (no safe shrink). Use the WORST-case
- * (not average) so no textured region loses detail. */
-double fy_recommend_downsample(const float *in, int nz, int ny, int nx,
-                               double err_budget);
-
 /* ===== LOCAL zarr v2 raw-u8 I/O (zarr_io.c) ============================= */
 typedef struct {
     char root[1024];
@@ -689,6 +372,43 @@ int  fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0,
                   long dz, long dy, long dx, unsigned char *out);   /* assemble region */
 int  fy_zarr_write_chunk(const fy_zarr *z, long cz, long cy, long cx,
                          const unsigned char *buf, long bz, long by, long bx);
+
+/* ===== detect-then-subtract residual ring removal (dering.c) ============
+ * Rings = angularly-invariant radial features centered on the ROTATION AXIS
+ * (metadata rotation_axis_position; BM18 places it at the slice center).
+ * Streaming 2-pass: accumulate per (z-slab, sector, radius) sums from raw u8
+ * tiles; finalize runs a per-radius SECTOR SIGN-CONSISTENCY VOTE (a spiral
+ * papyrus wrap drifts in radius with angle and fails the vote; a true ring
+ * does not -- verified on PHerc0139 2.4um); apply subtracts only the detected
+ * component. fy_dering_apply is a LOCAL op (tileable, no halo). */
+typedef struct {
+    long Z, Y, X;
+    double cy, cx;       /* rotation axis (voxels); init with <0 -> volume center */
+    int slab_z, nslab;   /* z-slab granularity (rings drift slowly with z) */
+    int ns, nr;          /* angular sectors, radial bins */
+    float *sum;          /* [nslab][ns][nr] intensity sums (u8 units) */
+    unsigned int *cnt;   /* [nslab][ns][nr] sample counts */
+    float *ring;         /* [nslab][nr] detected ring profile (u8), after finalize */
+    int have_rings;
+} fy_dering;
+
+int  fy_dering_init(fy_dering *d, long Z, long Y, long X,
+                    double cy, double cx, int slab_z, int ns);
+void fy_dering_free(fy_dering *d);
+/* per-thread single-slab scratch + merge (caller locks the merge) */
+int  fy_dering_tile_init(fy_dering *t, const fy_dering *d);
+void fy_dering_tile_reset(fy_dering *t);
+void fy_dering_accumulate_u8(fy_dering *t, const unsigned char *buf,
+                             long y0, long x0, long dz, long dy, long dx, int ss);
+void fy_dering_merge_tile(fy_dering *d, int slab, const fy_dering *t);
+/* detection: hp_win ~15 vox, min_cnt ~100, min_amp ~0.5 u8, max_amp ~6 u8.
+ * Returns # detected ring radii (all slabs); sets d->have_rings (>=2). */
+long fy_dering_finalize(fy_dering *d, int hp_win, unsigned int min_cnt,
+                        double min_amp, double max_amp);
+/* subtract detected rings from a float tile at global offset; scale converts
+ * u8 ring units to tile units (1/255 plain, 1/(hi-lo) after normalize). */
+void fy_dering_apply(const fy_dering *d, float *f, long z0, long y0, long x0,
+                     long dz, long dy, long dx, double scale);
 
 /* ===== pipeline orchestration (pipeline.c) ============================== */
 typedef struct {
@@ -707,11 +427,18 @@ typedef struct {
     int    scratch_passes;
     int    do_normalize; int norm_lo, norm_hi;
     int    do_zdrift; float *zdrift_factor;  /* len = Z, or NULL */
+    int    do_dering;                        /* detect+subtract residual rings */
+    double dering_cy, dering_cx;             /* rotation axis; <=0 -> volume center */
     double psf_p5, psf_med;   /* measured PSF sigma map (drives the auto-deconv gate) */
     int    do_musica; double musica_p; int musica_levels; double musica_core;
+    int    guided_subsample;  /* guided-filter coefficient subsample: 0 -> 2 (fast,
+                               * recommended); 1 -> exact full-res path; else s */
+    int    no_dither;         /* 0 -> dithered u8 export quantization (default,
+                               * kills banding in flat papyrus); 1 -> round-to-nearest */
     int    halo;
     /* resolved calibration STATE (set by fy_calibrate; consumed by fy_process_chunk) */
     int    have_norm, have_zdrift, have_dec_range;
+    int    have_dering; fy_dering *dering;   /* detected rings (caller frees, like zdrift_factor) */
     double dec_lo, dec_hi;    /* global deconv-output rescale range */
     long   vol_z;             /* full-volume Z (for zdrift_apply absolute-z indexing) */
 } fy_pipeline_cfg;

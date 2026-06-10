@@ -135,6 +135,93 @@ int fy_guided_denoise_ws(const float *in, float *out, int nz, int ny, int nx,
 /* number of float scratch elements fy_guided_denoise_ws needs for an nz*ny*nx volume. */
 size_t fy_guided_ws_floats(int nz, int ny, int nx) { return (size_t)4 * nz * ny * nx; }
 
+/* ---- FAST guided filter (He & Sun 2015, arXiv:1505.00996) ----
+ * Compute the filter coefficients (a,b) on an s-times-decimated grid with radius
+ * radius/s, then trilinearly upsample mean_a/mean_b and apply out = a*I + b at
+ * full resolution. The box statistics are low-pass at the window scale, so the
+ * coefficient fields are smooth and the subsampling changes the result
+ * negligibly -- while cutting the box-filter work (the pipeline's dominant
+ * cost, ~78% of runtime) by ~s^3. Decimation (not block-mean) is used for the
+ * downsample so the per-sample noise VARIANCE is preserved and the calibrated
+ * eps (fy_guided_eps_for_noise) keeps its meaning. s=2 recommended; s<=1 or a
+ * tile too small to decimate falls back to the exact path. Same ws as exact. */
+int fy_guided_denoise_fast_ws(const float *in, float *out, int nz, int ny, int nx,
+                              int radius, double eps, int s, float *ws) {
+    if (radius < 1) radius = 2;
+    if (s <= 1) return fy_guided_denoise_ws(in, out, nz, ny, nx, radius, eps, ws);
+    int lz = (nz + s - 1) / s, ly = (ny + s - 1) / s, lx = (nx + s - 1) / s;
+    if (lz < 2 || ly < 2 || lx < 2)
+        return fy_guided_denoise_ws(in, out, nz, ny, nx, radius, eps, ws);
+    size_t nl = (size_t)lz * ly * lx;
+    /* low-res buffers carved from ws: 5*nl <= 5n/8 < 4n for s=2 */
+    float *Il = ws, *mean = ws + nl, *corr = ws + 2 * nl, *ab = ws + 3 * nl, *tmp = ws + 4 * nl;
+
+    for (int z = 0; z < lz; z++)
+        for (int y = 0; y < ly; y++) {
+            const float *irow = in + ((size_t)(z * s) * ny + (size_t)(y * s)) * nx;
+            float *orow = Il + ((size_t)z * ly + y) * lx;
+            for (int x = 0; x < lx; x++) orow[x] = irow[(size_t)x * s];
+        }
+
+    int rl = radius / s; if (rl < 1) rl = 1;
+    box_mean(Il, mean, tmp, lz, ly, lx, rl);
+    for (size_t i = 0; i < nl; i++) corr[i] = Il[i] * Il[i];
+    box_mean(corr, ab, tmp, lz, ly, lx, rl);
+    for (size_t i = 0; i < nl; i++) {
+        float var = ab[i] - mean[i] * mean[i];
+        if (var < 0) var = 0;
+        float ai = var / (var + (float)eps);
+        corr[i] = ai;                       /* corr := a */
+        ab[i]   = mean[i] * (1.0f - ai);    /* ab   := b */
+    }
+    box_mean(corr, mean, tmp, lz, ly, lx, rl);   /* mean := mean_a */
+    box_mean(ab,   corr, tmp, lz, ly, lx, rl);   /* corr := mean_b */
+
+    /* trilinear upsample of (mean_a, mean_b); apply at full res. Low sample i
+     * sits at full coordinate i*s (decimation), so u = x/s exactly. */
+    int *xi = (int *)malloc(sizeof(int) * (size_t)nx);
+    float *xf = (float *)malloc(sizeof(float) * (size_t)nx);
+    if (!xi || !xf) { free(xi); free(xf); return 1; }
+    for (int x = 0; x < nx; x++) {
+        float u = (float)x / s;
+        int x0 = (int)u; if (x0 > lx - 2) x0 = lx - 2;
+        float f = u - x0; if (f > 1.0f) f = 1.0f;
+        xi[x] = x0; xf[x] = f;
+    }
+    for (int z = 0; z < nz; z++) {
+        float uz = (float)z / s;
+        int z0 = (int)uz; if (z0 > lz - 2) z0 = lz - 2;
+        float zf = uz - z0; if (zf > 1.0f) zf = 1.0f;
+        for (int y = 0; y < ny; y++) {
+            float uy = (float)y / s;
+            int y0 = (int)uy; if (y0 > ly - 2) y0 = ly - 2;
+            float yfr = uy - y0; if (yfr > 1.0f) yfr = 1.0f;
+            size_t r00 = ((size_t)z0 * ly + y0) * lx;
+            size_t r01 = r00 + lx;                  /* y0+1 */
+            size_t r10 = r00 + (size_t)ly * lx;     /* z0+1 */
+            size_t r11 = r10 + lx;
+            float w00 = (1 - zf) * (1 - yfr), w01 = (1 - zf) * yfr;
+            float w10 = zf * (1 - yfr),       w11 = zf * yfr;
+            const float *irow = in + ((size_t)z * ny + y) * nx;
+            float *orow = out + ((size_t)z * ny + y) * nx;
+            for (int x = 0; x < nx; x++) {
+                int x0 = xi[x]; float fx = xf[x], gx = 1 - fx;
+                float a = gx * (w00 * mean[r00 + x0] + w01 * mean[r01 + x0] +
+                                w10 * mean[r10 + x0] + w11 * mean[r11 + x0]) +
+                          fx * (w00 * mean[r00 + x0 + 1] + w01 * mean[r01 + x0 + 1] +
+                                w10 * mean[r10 + x0 + 1] + w11 * mean[r11 + x0 + 1]);
+                float b = gx * (w00 * corr[r00 + x0] + w01 * corr[r01 + x0] +
+                                w10 * corr[r10 + x0] + w11 * corr[r11 + x0]) +
+                          fx * (w00 * corr[r00 + x0 + 1] + w01 * corr[r01 + x0 + 1] +
+                                w10 * corr[r10 + x0 + 1] + w11 * corr[r11 + x0 + 1]);
+                orow[x] = a * irow[x] + b;
+            }
+        }
+    }
+    free(xi); free(xf);
+    return 0;
+}
+
 int fy_guided_denoise(const float *in, float *out, int nz, int ny, int nx,
                       int radius, double eps) {
     size_t n = (size_t)nz * ny * nx;

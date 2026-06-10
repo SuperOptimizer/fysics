@@ -1,6 +1,7 @@
 /home/forrest/fysics/build_asan/CMakeFiles/fysics.dir
 /home/forrest/fysics/build_asan/CMakeFiles/fysics_shared.dir
 /home/forrest/fysics/build_asan/CMakeFiles/fysics-process.dir
+/home/forrest/fysics/build_asan/CMakeFiles/vca_export.dir
 /home/forrest/fysics/build_asan/CMakeFiles/test_fysics.dir
 /home/forrest/fysics/build_asan/CMakeFiles/bench_fysics.dir
 /home/forrest/fysics/build_asan/CMakeFiles/test.dir

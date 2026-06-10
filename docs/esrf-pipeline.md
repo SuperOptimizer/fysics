@@ -179,7 +179,7 @@ its nominal value to optimize spatial resolution** rather than left at default
 deconvolution* beats standard Paganin or the Beltran 2018 optimization was rejected
 **0-3** [research: refuted; arXiv:2601.07225]. **Do not** treat Tikhonov/Wiener PSF
 deconvolution as established SOTA over simply reducing the Paganin parameter. (fysics
-ships `fy_deconvolve_gureyev` as an *experimental* alternative, not the default path.)
+validated this empirically and does not ship a Tikhonov-PSF path; the matched/partial inversion is the default.)
 
 ### 5c. Parameters that fix the operator
 
@@ -335,7 +335,7 @@ physics transfer is defined on attenuation, not on quantized display levels.
 | 1 | flat/dark-field | projection | no | not-recoverable | nothing |
 | 2 | double-flat-field (CCD) | projection | no | not-recoverable | nothing |
 | 3 | intensity norm. / beam drift | projection (residual: volume) | residual only, generic | safe-complement | axial drift correction, seeded from `machineCurrentStart/Stop` |
-| 4 | ring/stripe removal (wavelet-FFT, FFT) | **sinogram** | no | not-recoverable / residual=heuristic | `fy_remove_rings` (heuristic only, **not** physics) |
+| 4 | ring/stripe removal (wavelet-FFT, FFT) | **sinogram** | no | not-recoverable / residual=heuristic | `fy_dering_*` (detect-then-subtract, gated, **not** physics) |
 | 5 | **Paganin / TIE-Hom phase retrieval** | projection (**commutes w/ FBP**) | **yes (approx., linear low-pass)** | **invert-as-exact-physics** | `fy_deconvolve` (Wiener inverse, metadata params, partial δ/β on fine vols) |
 | — | CTF phase retrieval | projection | n/a (not used on scrolls) | leave-alone | nothing (scrolls use Paganin) |
 | 6 | **unsharp mask** (enabled here) | with Paganin (linear) | **yes (joint with Paganin)** | **invert-as-exact-physics** | folded into net transfer `T·U`, inverted jointly |
@@ -374,9 +374,15 @@ what is a known, linear, metadata-parameterized, post-recon-commuting transfer; 
   Empirically ruled out: noise whitening (leaks structure, hurts RMSE 3×), TV (erodes
   mid-band to ~76 %), full BM4D (~10 % better RMSE, ~150× slower) [README; empirical].
 
-- **`fy_remove_rings`** — *heuristic only.* Residual rings have **no metadata model** and
-  ring removal is sinogram-domain and **not invertible** (§4). This is a generic
-  suppressor, explicitly **not** a physics inverse; documented as such.
+- **`fy_dering_*` (2026-06)** — *measured complement* for residual rings. Streaming
+  detect-then-subtract: per (z-slab, sector, radius) profiles accumulated in pass 1,
+  a per-radius **sector sign-consistency vote** separates true rings (same radius in
+  every sector, centered on the metadata `rotation_axis_position`) from the spiral
+  papyrus winding (drifts in radius with angle, fails the vote); only the detected
+  component is subtracted in pass 2. Verified on PHerc0139 2.399 µm: rings of 2–4 u8
+  amplitude, 0 px sector-to-sector drift, 93 % ring-energy removal in one pass.
+  Still **not** a physics inverse of nabu's sinogram dering (§4) — but it is gated on
+  detection, so volumes without measurable rings are left untouched.
 
 - **Beam-drift / intensity-normalization complement** — the residual axial drift (§3) can
   be corrected and **seeded from `machineCurrentStart/Stop`** (1.5–13.7 %). Complement,
@@ -386,7 +392,7 @@ what is a known, linear, metadata-parameterized, post-recon-commuting transfer; 
   (§1–2) — sinogram/projection-domain, not recoverable from the volume. fysics does not
   pretend to invert these.
 
-- **`fy_glcae*` / `fy_musica2d` / `fy_clahe2d` / `fy_norm_*`** — display-side
+- **`fy_musica2d` / `fy_norm_*`** — display-side
   contrast-enhancement / normalization. Not inverses of any physics operator; generic
   viewing aids, governed by global two-pass streaming stats (README).
 
@@ -418,7 +424,7 @@ the first three:
 4. **Best structure-detection (Frangi sheetness/Hessian) and contrast-enhancement
    (MUSICA/CLAHE/GLCAE) for plate-like papyrus sheets** — *STILL OPEN.* This category
    produced **no surviving verified claims** in the research and needs dedicated follow-up.
-   fysics ships `fy_musica2d` / `fy_clahe2d` / `fy_glcae2d` as available tools, but their
+   fysics ships `fy_musica2d` as the available tool, but its
    optimality for papyrus sheets is unvalidated.
 
 ### Current gaps (operators we are NOT handling that we maybe should)
