@@ -509,9 +509,12 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             free(der); der = NULL;
         }
     }
-    /* (no thread oversubscription: fy_zarr_read batches its S3 chunk GETs via
-     * s3_get_batch -- one thread drives many multiplexed transfers) */
-    #pragma omp parallel
+    /* S3 sweep: 2x ncpu threads (the allowed pool oversubscription cap) -- each
+     * thread alternates batched-fetch / accumulate, so 2x covers the dead air
+     * between batches; fy_zarr_read multiplexes the GETs within each call. */
+    int sweep_threads = strncmp(in_root, "s3://", 5) == 0 ? 2 * omp_get_max_threads()
+                                                          : omp_get_max_threads();
+    #pragma omp parallel num_threads(sweep_threads)
     {
         fy_hist_state lh; fy_hist_init(&lh);
         double *ls = (double *)calloc(Z, sizeof(double));

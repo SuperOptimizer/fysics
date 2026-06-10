@@ -255,7 +255,7 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
                     snprintf(bpaths + i*2048, 2048, "%s/0/%ld/%ld/%ld", z->root, qz, qy, qx);
                     reqs[i].url = bpaths + i*2048; reqs[i].offset = 0; reqs[i].length = 0;
                 }
-                if (s3_get_batch(g_fy_s3, reqs, nb, 16, batch) != S3_OK) {
+                if (s3_get_batch(g_fy_s3, reqs, nb, 32, batch) != S3_OK) {
                     for (long i = 0; i < nb; i++) s3_response_free(&batch[i]);
                     free(batch); batch = NULL;   /* transport failure -> serial fallback (retries) */
                 }
