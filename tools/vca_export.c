@@ -264,6 +264,12 @@ typedef struct {
     long pz,py,px;              /* padded dims (multiples of 2*MCC for L1 alignment) */
     atomic_long next, fail, skipped, l0app, l1app;
     atomic_long io_open, io_miss, io_bytes;
+    /* in-flight fetched-bytes budget: downloaders block before starting a new band
+     * while over budget (bounded RAM regardless of io-thread count; the queue cap
+     * alone does NOT bound the bands being fetched). */
+    atomic_long inflight;
+    long inflight_cap;
+    pthread_mutex_t im; pthread_cond_t icv;
     bandq q;
 } sched;
 
@@ -272,6 +278,10 @@ static void *download_worker(void *arg){
     for(;;){
         long ti=atomic_fetch_add(&sc->next,1);
         if(ti>=sc->nunits) break;
+        pthread_mutex_lock(&sc->im);
+        while(atomic_load(&sc->inflight)>0 && atomic_load(&sc->inflight)>sc->inflight_cap)
+            pthread_cond_wait(&sc->icv,&sc->im);
+        pthread_mutex_unlock(&sc->im);
         long bz=ti%sc->nbz, txy=ti/sc->nbz, ty=txy/sc->ntx, tx=txy%sc->ntx;
         long vx0=tx*sc->SB, vy0=ty*sc->SB, vz0=bz*sc->BAND;
         long vx1=vx0+sc->SB, vy1=vy0+sc->SB, vz1=vz0+sc->BAND;
@@ -299,6 +309,7 @@ static void *download_worker(void *arg){
                     if(!got){ atomic_fetch_add(&sc->io_miss,1); continue; }
                     if(core) any=1;
                     atomic_fetch_add(&sc->io_bytes,(long)gn);
+                    atomic_fetch_add(&sc->inflight,(long)gn);
                     ce=cc_put(qz,qy,qx,got,gn);
                 }
                 if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
@@ -423,7 +434,10 @@ static void *compute_worker(void *arg){
         }
         }
 release:
-        for(int i=0;i<bb.nch;++i) cc_release(bb.chunks[i].ce);
+        { long rel=0;
+          for(int i=0;i<bb.nch;++i){ rel+=(long)bb.chunks[i].len; cc_release(bb.chunks[i].ce); }
+          atomic_fetch_sub(&sc->inflight,rel);
+          pthread_mutex_lock(&sc->im); pthread_cond_broadcast(&sc->icv); pthread_mutex_unlock(&sc->im); }
         free(bb.chunks);
     }
     free(raw);free(proc);free(l1);free(cbuf);free(tin);free(tout);
@@ -473,7 +487,7 @@ int main(int argc, char **argv){
     const char *in=argv[1], *out=argv[2], *profile="conservative";
     float quality=8.0f;
     long SB=1024, BAND=512;
-    int nthreads=0, niothreads=0, qcap=0, process=1; double cache_gb=12.0;
+    int nthreads=0, niothreads=0, qcap=0, process=1; double cache_gb=12.0, mem_gb=24.0;
     char meta_path[PATH_MAX]; meta_path[0]=0;
     for(int i=3;i<argc;i++){
         if      (!strcmp(argv[i],"--profile")&&i+1<argc)   profile=argv[++i];
@@ -486,6 +500,7 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--band")&&i+1<argc)      BAND=atol(argv[++i]);
         else if (!strcmp(argv[i],"--no-process"))          process=0;
         else if (!strcmp(argv[i],"--cache-gb")&&i+1<argc)  cache_gb=atof(argv[++i]);
+        else if (!strcmp(argv[i],"--mem-gb")&&i+1<argc)    mem_gb=atof(argv[++i]);
         else { fprintf(stderr,"unknown arg: %s\n",argv[i]); return 2; }
     }
     if(SB%512||SB<512){fprintf(stderr,"--sb must be a multiple of 512\n");return 2;}
@@ -554,6 +569,8 @@ int main(int argc, char **argv){
     int ni_=niothreads>0?niothreads:(is_s3(in)?nc_*2:(nc_<4?nc_:4));
     int qc_=qcap>0?qcap:nc_+2;
     cc_init((size_t)(cache_gb*1e9));
+    sc.inflight_cap=(long)(mem_gb*1e9); atomic_store(&sc.inflight,0);
+    pthread_mutex_init(&sc.im,NULL); pthread_cond_init(&sc.icv,NULL);
     bq_init(&sc.q,qc_,ni_);
     fprintf(stderr,"units %ld (%ldx%ld tiles x %ld bands), SB=%ld BAND=%ld halo=%ld, "
                    "%d compute + %d io threads, queue %d\n",
