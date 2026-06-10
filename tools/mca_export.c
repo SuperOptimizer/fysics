@@ -196,8 +196,8 @@ static void cc_init(size_t cap){ memset(&g_cc,0,sizeof g_cc); g_cc.cap=cap;
     g_cc.nbk=1<<16; g_cc.bk=calloc(g_cc.nbk,sizeof(centry*));
     pthread_mutex_init(&g_cc.m,NULL); pthread_cond_init(&g_cc.cv,NULL); }
 static long cc_key(long z,long y,long x){ return ((z*1000003L)+y)*1000003L+x; }
-static void cc_evict_locked(void){
-    while(g_cc.bytes>g_cc.cap){
+static void cc_evict_target_locked(size_t target){
+    while(g_cc.bytes>target){
         centry *best=NULL,**bp=NULL;
         /* never evict a referenced OR pending entry (a pending entry is the
          * single-flight rendezvous point; freeing it would strand waiters) */
@@ -207,6 +207,7 @@ static void cc_evict_locked(void){
         *bp=best->next; g_cc.bytes-=best->len; free(best->bytes); free(best);
     }
 }
+static void cc_evict_locked(void){ cc_evict_target_locked(g_cc.cap); }
 static centry *cc_find_locked(long k){
     centry *e;
     for(e=g_cc.bk[(unsigned long)k%g_cc.nbk];e;e=e->next) if(e->key==k) break;
@@ -286,6 +287,14 @@ static int cc_gate_reserve(size_t est, int have_tok){
     pthread_mutex_lock(&g_cc.m);
     if(!have_tok){
         while(g_cc.bytes+est>g_cc.cap){
+            /* EVICT before waiting: unreferenced cached entries are instantly
+             * reclaimable and must never block fetches (observed: cache filled
+             * the cap, 57/64 downloaders gated behind the eviction trickle,
+             * 6 Gbit on a 15 Gbit NIC). Only truly PINNED bytes may make us wait. */
+            size_t before=g_cc.bytes;
+            cc_evict_target_locked(g_cc.cap>est?g_cc.cap-est:0);
+            if(g_cc.bytes+est<=g_cc.cap) break;
+            if(g_cc.bytes<before) continue;       /* progress: re-check */
             if(pthread_mutex_trylock(&g_tok)==0){ have_tok=1; break; }
             pthread_cond_wait(&g_cc.cv,&g_cc.m);
         }
