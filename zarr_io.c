@@ -76,6 +76,39 @@ static int fy_s3_get(const char *path, unsigned char *out, long cn, unsigned cha
 static int fy_s3_read_chunk(const char *path, unsigned char *out, long cn, unsigned char fill){
     return fy_s3_get(path, out, cn, fill, 1);
 }
+/* ownership-stealing variant: hands back the S3 response body itself (libs3's
+ * s3_response_free is a plain free(body), so the buffer is transferable) -- the
+ * fetched chunk is then row-copied ONCE into the region, not body->scratch->region
+ * (the double copy was ~17% of the calibration sweep on aarch64).
+ * Returns 1 handled (*out=NULL,*len=0 => absent/404), 0 not-s3, -1 hard error. */
+static int fy_s3_get_own(const char *path, unsigned char **out, size_t *len){
+#ifdef FYSICS_S3
+    *out=NULL; *len=0;
+    if(strncmp(path,"s3://",5)!=0) return 0;
+    fy_s3_ensure();
+    if(!g_fy_s3){ fprintf(stderr,"zarr: S3 client init failed for %s\n",path); return -1; }
+    const int max_tries = 5;
+    for(int try = 0; try < max_tries; try++){
+        if(try > 0){ struct timespec ts; long ms = 200L << (try - 1);
+            ts.tv_sec = ms / 1000; ts.tv_nsec = (ms % 1000) * 1000000L; nanosleep(&ts, NULL); }
+        s3_response r; memset(&r,0,sizeof r);
+        s3_status st=s3_get(g_fy_s3,path,&r);
+        if(st==S3_OK && r.status==200 && r.body){
+            *out=(unsigned char*)r.body; *len=r.body_len;
+            r.body=NULL; s3_response_free(&r);
+            return 1;
+        }
+        if(r.status==404){ s3_response_free(&r); return 1; }
+        if(try == max_tries-1)
+            fprintf(stderr,"zarr: S3 GET failed after %d tries (status=%d http=%ld): %s\n",
+                    max_tries, (int)st, (long)r.status, path);
+        s3_response_free(&r);
+    }
+    return -1;
+#else
+    (void)path;(void)out;(void)len; return 0;
+#endif
+}
 
 /* tiny field grab from a flat .zarray json: finds "key": <int> (first occurrence). */
 static long json_int(const char *s, const char *key) {
@@ -157,16 +190,24 @@ int fy_zarr_create(fy_zarr *z, const char *root, const long shape[3], const long
  * touches, instead of fread'ing all 2MB into a scratch buffer and copying again).
  * S3 chunks (and the rare mmap failure) land in the caller's scratch buffer.
  * v->p == NULL => chunk absent (sparse: use fill). */
-typedef struct { const unsigned char *p; size_t len; void *map; size_t maplen; } fy_chunk_view;
+typedef struct { const unsigned char *p; size_t len; void *map; size_t maplen;
+                 unsigned char *heap; /* owned S3 body (freed on close) */ } fy_chunk_view;
 
 static int open_chunk(const fy_zarr *z, long cz, long cy, long cx, long cn,
                       unsigned char *scratch, fy_chunk_view *v) {
-    v->p = NULL; v->len = 0; v->map = NULL; v->maplen = 0;
+    v->p = NULL; v->len = 0; v->map = NULL; v->maplen = 0; v->heap = NULL;
     char path[2048];
     snprintf(path, sizeof(path), "%s/0/%ld/%ld/%ld", z->root, cz, cy, cx);
-    int s3 = fy_s3_read_chunk(path, scratch, cn, z->fill);   /* S3 path (if FYSICS_S3 & s3://) */
-    if (s3 == -1) return 1;
-    if (s3 == 1) { v->p = scratch; v->len = (size_t)cn; return 0; }
+    { unsigned char *body=NULL; size_t blen=0;
+      int s3 = fy_s3_get_own(path, &body, &blen);             /* S3 path (zero scratch copy) */
+      if (s3 == -1) return 1;
+      if (s3 == 1) {
+          if (!body) return 0;                                /* 404 = sparse fill */
+          v->heap = body; v->p = body;
+          v->len = blen < (size_t)cn ? blen : (size_t)cn;
+          return 0;
+      } }
+    (void)scratch;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return 0;                                    /* absent = sparse fill */
     struct stat st;
@@ -184,7 +225,7 @@ static int open_chunk(const fy_zarr *z, long cz, long cy, long cx, long cn,
     v->p = scratch; v->len = got < (size_t)cn ? got : (size_t)cn;
     return 0;
 }
-static void close_chunk(fy_chunk_view *v) { if (v->map) munmap(v->map, v->maplen); }
+static void close_chunk(fy_chunk_view *v) { if (v->map) munmap(v->map, v->maplen); free(v->heap); }
 
 /* read an arbitrary region [z0..z0+dz) into `out` (dz*dy*dx, C order), assembling from chunks. */
 int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, long dx,

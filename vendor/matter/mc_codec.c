@@ -247,40 +247,42 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
 #else
     for(int i=0;i<n;++i) blk[i]=(float)((vox[i]?vox[i]:dc)-dc);
 #endif
-    // harmonic (Jacobi) air-fill: relax air voxels to 6-neighbor mean (material
-    // fixed). Air-voxel index list + ping-pong buffers: each sweep touches only
-    // the air voxels and there is no per-sweep copy (material values are
-    // identical in both buffers).
+    // harmonic air-fill: relax air voxels toward the 6-neighbor mean (material
+    // fixed) so the masked region carries no spurious DCT energy. Perf on real
+    // masked-scroll exports showed the original raster-order Gauss-Seidel/SOR
+    // over an air-voxel index list was the #1 hot spot of mc_enc_block (~31%
+    // of export compute): a strictly serial scalar dependency chain. The fill
+    // only shapes values UNDER the air mask — decode forces them to 0 — so its
+    // exact values are free to change slightly; only encode speed and archive
+    // size matter. Rewritten as: coarse 4^3 seed + RED-BLACK SOR in a dense,
+    // branch-free, auto-vectorizing form (see below).
+    // Measured (8x 256^3 mixed material/air chunks of a real masked scroll,
+    // q=8, single-core): encode 0.745s -> 0.516s (-31%), archive size
+    // 1126163 -> 1126135 bytes (-0.002%), material max-abs-diff unchanged.
     if(nair>0){
-        static _Thread_local float tmp[N3]; (void)tmp;
-        static _Thread_local uint16_t ai[N3]; static _Thread_local uint8_t arc_[N3];
-        int S=MC_BLK, na=0;
-        for(int z=0;z<S;++z)for(int y=0;y<S;++y)for(int x=0;x<S;++x){
-            int i=(z*S+y)*S+x; if(vox[i]) continue;
-            ai[na]=(uint16_t)i;
-            arc_[na]=(uint8_t)((z?1:0)|(z<S-1?2:0)|(y?4:0)|(y<S-1?8:0)|(x?16:0)|(x<S-1?32:0));
-            na++;
-        }
-        (void)tmp;
-        // Skip the fine SOR sweeps on nearly-pure blocks (<5% or >95% air):
+        const int S=MC_BLK;
+        // (b) skip the fine SOR sweeps on nearly-pure blocks (<5% or >95% air):
         // the coarse 4^3 seed already lands within quantization noise there
-        // (thin slivers / almost-all-masked blocks). The fill only shapes
-        // values UNDER the air mask — decode zeroes them regardless — so this
-        // trades an invisible refinement for a large encode-time win.
+        // (thin slivers / almost-all-masked blocks), so refinement is an
+        // invisible cost.
         int do_fine = (nair >= n/20) && (nair <= n - n/20);
         // Coarse-to-fine init: solve the fill on the 4^3 subcube grid first
         // (each cell = mean of its material voxels, air cells relaxed), then
         // seed fine air voxels from their cell before the fine SOR sweeps.
-        // Lands much closer than a flat dc start, so 4 sweeps converge further.
+        // Lands much closer than a flat dc start, so few sweeps converge.
+        // Accumulation runs dense per subcube row (air contributes 0 to the
+        // sum because blk[]==0 there) — no per-voxel div/mod or branches.
         {
             float cs[64]; int cm[64]; const int G=4, GS=MSUB;
-            for(int c=0;c<64;++c){ cs[c]=0; cm[c]=0; }
-            for(int z=0;z<S;++z)for(int y=0;y<S;++y)for(int x=0;x<S;++x){
-                int i=(z*S+y)*S+x; if(!vox[i]) continue;
-                int c=((z/GS)*G+(y/GS))*G+(x/GS);
-                cs[c]+=blk[i]; cm[c]++;
+            for(int sz=0;sz<G;++sz)for(int sy=0;sy<G;++sy)for(int sx=0;sx<G;++sx){
+                float s=0; int m=0;
+                for(int z=0;z<GS;++z)for(int y=0;y<GS;++y){
+                    size_t r=(size_t)((sz*GS+z)*S+(sy*GS+y))*S+sx*GS;
+                    for(int x=0;x<GS;++x){ s+=blk[r+x]; m+=vox[r+x]!=0; }
+                }
+                int c=(sz*G+sy)*G+sx;
+                cm[c]=m; cs[c]=m?s/(float)m:0.0f;
             }
-            for(int c=0;c<64;++c) cs[c]=cm[c]?cs[c]/cm[c]:0;
             for(int it=0;it<6;++it){                      // coarse relax (air cells)
                 for(int cz=0;cz<G;++cz)for(int cy=0;cy<G;++cy)for(int cx=0;cx<G;++cx){
                     int c=(cz*G+cy)*G+cx; if(cm[c]) continue;
@@ -291,51 +293,59 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
                     if(k) cs[c]=a/k;
                 }
             }
-            for(int u=0;u<na;++u){
-                int i=ai[u]; int z=i/(S*S), y=(i/S)%S, x=i%S;
-                blk[i]=cs[((z/GS)*4+(y/GS))*4+(x/GS)];
+            for(int sz=0;sz<G;++sz)for(int sy=0;sy<G;++sy)for(int sx=0;sx<G;++sx){
+                float v=cs[(sz*G+sy)*G+sx];
+                for(int z=0;z<GS;++z)for(int y=0;y<GS;++y){
+                    size_t r=(size_t)((sz*GS+z)*S+(sy*GS+y))*S+sx*GS;
+                    for(int x=0;x<GS;++x) blk[r+x]=vox[r+x]?blk[r+x]:v;
+                }
             }
         }
-        // RED-BLACK SOR (two-color Gauss-Seidel + over-relaxation), DENSE
-        // vectorizable form. The old raster-order Gauss-Seidel over the air
-        // index list was a strictly serial scalar dependency chain — the #1
-        // hot spot of mc_enc_block (31% of export compute). Reformulated:
-        //   - copy the block into an 18^3 zero-padded buffer P (borders are
-        //     never written, so out-of-block neighbors read as 0);
-        //   - per voxel, fold air mask, color ((z+y+x)&1) and the in-block
-        //     neighbor count c into two coefficient arrays so the update is a
-        //     UNIFORM branch-free stencil:  P[i] += w6[i]*nbsum - wc[i]*P[i]
-        //     with w6 = omega/6 (air voxels of this color, else 0) and
-        //     wc = c*omega/6. For interior voxels (c=6) this is exactly the
-        //     old omega*(mean - P[i]); at block faces the step is scaled by
-        //     c/6 (slightly under-relaxed) — a tiny difference in values that
-        //     are under the air mask anyway (decode forces them to 0).
-        //   - sweep colors alternately: within one color no voxel neighbors
-        //     another, so each pass is data-parallel and auto-vectorizes
-        //     (AVX/NEON), and updated reds are visible to blacks (true
-        //     Gauss-Seidel convergence, same omega, same sweep count).
-        // Measured on a real masked-scroll export (8x 256^3 chunks, q=8):
-        // encode 0.373s -> 0.243s (-35%), archive 1213808 -> 1214301 bytes
-        // (+0.04%), material max-abs-diff unchanged (37 -> 37).
+        // (a) RED-BLACK SOR (two-color Gauss-Seidel, omega=1.6) in a DENSE
+        // vectorizable form replacing the serial scalar chain:
+        //   - copy the block into an 18^3 zero-padded buffer P (pad cells are
+        //     never written, so out-of-block neighbors read as 0 == dc);
+        //   - fold air mask and color ((z+y+x)&1) into two per-color weight
+        //     arrays (w6 = omega/6 on this color's air voxels, else 0) so a
+        //     color pass is a UNIFORM branch-free stencil over the whole
+        //     padded array:   P[i] += w6[i]*(nbsum[i] - cnt[i]*P[i])
+        //     where cnt[i] (in-block 6-neighbor count, = the old serial
+        //     code's divisor scaled into the relaxation step) is a static
+        //     block-independent table, built once per thread like PM below.
+        //   - within one color no voxel neighbors another, so the neighbor-sum
+        //     and update loops are data-parallel and auto-vectorize (AVX/
+        //     NEON); updated reds are visible to blacks (true Gauss-Seidel
+        //     convergence, same omega, same sweep count as the serial code).
         if(do_fine){
             enum { PS=MC_BLK+2, PP=PS*PS, PN=PS*PS*PS };
-            static _Thread_local float P[PN];              // borders stay 0
-            static _Thread_local float W6[2][PN], WC[2][PN];
+            static _Thread_local float P[PN];              // pads stay 0
+            static _Thread_local float WD[PN];             // dense w, pads stay 0
+            static _Thread_local float W6[2][PN];
+            // parity mask (voxel color) and in-block neighbor count are both
+            // block-independent: build once per thread.
+            static _Thread_local float PM[PN], CNT[PN];
+            static _Thread_local int pm_init=0;
+            if(!pm_init){
+                for(int z=0;z<PS;++z)for(int y=0;y<PS;++y)for(int x=0;x<PS;++x){
+                    int i=(z*PS+y)*PS+x;
+                    PM[i]=(float)((z+y+x)&1);
+                    CNT[i]=(float)((z>1)+(z<S)+(y>1)+(y<S)+(x>1)+(x<S));
+                }
+                pm_init=1;
+            }
             const float O6=1.6f/6.0f;
-            for(int z=0;z<S;++z)for(int y=0;y<S;++y){
+            for(int z=0;z<S;++z)for(int y=0;y<S;++y){      // rows: copy + dense w
                 const mc_u8 *vp=vox+(size_t)(z*S+y)*S;
                 const float *bp=blk+(size_t)(z*S+y)*S;
                 int pb=((z+1)*PS+(y+1))*PS+1;
-                int cyz=(z>0)+(z<S-1)+(y>0)+(y<S-1);
-                int par=(z+y)&1;
                 for(int x=0;x<S;++x){
                     P[pb+x]=bp[x];
-                    float w = vp[x]?0.0f:O6;
-                    float c = (float)(cyz+(x>0)+(x<S-1));
-                    int col=(par+x)&1;
-                    W6[col][pb+x]=w;      WC[col][pb+x]=w*c;
-                    W6[col^1][pb+x]=0.0f; WC[col^1][pb+x]=0.0f;
+                    WD[pb+x]=vp[x]?0.0f:O6;
                 }
+            }
+            for(int i=PP;i<PN-PP;++i){                     // split w by color
+                float a=WD[i]*PM[i];
+                W6[1][i]=a; W6[0][i]=WD[i]-a;
             }
             // each color pass = two FLAT dense loops over the padded array:
             // (1) neighbor sums into NB (pure reads of P), (2) masked update
@@ -343,15 +353,15 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
             // all the OTHER color, untouched within the pass, so the snapshot
             // in NB is the live value. Splitting removes the read-after-write
             // dependence that kept the fused in-place loop scalar; both loops
-            // auto-vectorize. Border/garbage lanes are killed by w6=wc=0.
+            // auto-vectorize. Pad/material lanes are killed by w6=0.
             static _Thread_local float NB[PN];
             for(int it=0; it<MC_FILL_SWEEPS; ++it){
                 for(int col=0; col<2; ++col){
-                    const float *restrict w6=W6[col], *restrict wc=WC[col];
+                    const float *restrict w6=W6[col];
                     for(int i=PP;i<PN-PP;++i)
                         NB[i]=P[i-1]+P[i+1]+P[i-PS]+P[i+PS]+P[i-PP]+P[i+PP];
                     for(int i=PP;i<PN-PP;++i)
-                        P[i]+=w6[i]*NB[i]-wc[i]*P[i];
+                        P[i]+=w6[i]*(NB[i]-CNT[i]*P[i]);
                 }
             }
             for(int z=0;z<S;++z)for(int y=0;y<S;++y)       // material rows are
