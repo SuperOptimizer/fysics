@@ -751,7 +751,9 @@ int main(int argc, char **argv){
      * measured ~1.3 GB/worker at SB=512 incl. encoder TLS), io = 2x ncpu. */
     int nc_=nthreads>0?nthreads:(int)(ncpu<2?2:ncpu);
     int ni_=niothreads>0?niothreads:(is_s3(in)?(int)(ncpu*2):(nc_<4?nc_:4));
-    int qc_=qcap>0?qcap:nc_/2+2;
+    /* queue depth scales with band COUNT not worker count: small SB bands drain
+     * fast, so buffer ~2 bands of lookahead per worker to keep compute fed */
+    int qc_=qcap>0?qcap:nc_*2;
     if(mem_gb==24.0)  mem_gb=ncpu/4.0;   /* resident budget shares RAM with ~1.3GB/worker */     /* defaults only when not user-set */
     if(cache_gb==12.0) cache_gb=ncpu/8.0;
     /* ONE resident-bytes budget covers in-flight bands AND cached reuse */
