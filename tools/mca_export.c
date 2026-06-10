@@ -183,7 +183,10 @@ typedef struct centry { long key; u8 *bytes; size_t len; int refs; long lru;
                         int ready;          /* 0 = fetch in flight (single-flight) */
                         struct centry *next; } centry;
 typedef struct {
-    centry **bk; long nbk; size_t bytes, cap; long tick;
+    centry **bk; long nbk; size_t bytes, cap; long tick;   /* cap = RESIDENT budget:
+        bytes is the truth (maintained under the lock for every fill/evict), so the
+        fetch gate uses it directly -- no parallel counter to fall out of sync with
+        shared/single-flight entries (the previous counters leaked exactly there). */
     long hits, misses;
     pthread_mutex_t m;
     pthread_cond_t cv;                      /* broadcast on every cc_fill */
@@ -257,7 +260,18 @@ static void cc_wait_ready(centry *e){
     pthread_mutex_unlock(&g_cc.m);
 }
 static void cc_release(centry *e){
-    pthread_mutex_lock(&g_cc.m); e->refs--; pthread_mutex_unlock(&g_cc.m);
+    pthread_mutex_lock(&g_cc.m);
+    e->refs--;
+    if(g_cc.bytes>g_cc.cap) cc_evict_locked();
+    pthread_cond_broadcast(&g_cc.cv);   /* wake fetch gates: resident bytes may have dropped */
+    pthread_mutex_unlock(&g_cc.m);
+}
+/* fetch gate: block while resident chunk bytes exceed the budget. band_bytes>0
+ * guarantees progress (a band's first fetch always proceeds). */
+static void cc_gate(long band_bytes){
+    pthread_mutex_lock(&g_cc.m);
+    while(band_bytes>0 && g_cc.bytes>g_cc.cap) pthread_cond_wait(&g_cc.cv,&g_cc.m);
+    pthread_mutex_unlock(&g_cc.m);
 }
 
 /* ------------------------------------------------------------ band queue */
@@ -302,12 +316,6 @@ typedef struct {
     long pz,py,px;              /* padded dims (multiples of 2*MCC for L1 alignment) */
     atomic_long next, fail, skipped, l0app, l1app;
     atomic_long io_open, io_miss, io_bytes;
-    /* in-flight fetched-bytes budget: downloaders block before starting a new band
-     * while over budget (bounded RAM regardless of io-thread count; the queue cap
-     * alone does NOT bound the bands being fetched). */
-    atomic_long inflight;
-    long inflight_cap;
-    pthread_mutex_t im; pthread_cond_t icv;
     bandq q;
 } sched;
 
@@ -355,10 +363,7 @@ static void *download_worker(void *arg){
              * worker (owner) fetches a given chunk, everyone else waits on its fill. */
             for(long g0=0; g0<nneed; g0+=32){
                 long gN=nneed-g0<32?nneed-g0:32;
-                pthread_mutex_lock(&sc->im);
-                while(band_bytes>0 && atomic_load(&sc->inflight)>sc->inflight_cap)
-                    pthread_cond_wait(&sc->icv,&sc->im);
-                pthread_mutex_unlock(&sc->im);
+                cc_gate(band_bytes);
                 char paths[32][1500]; s3_range_req reqs[32]; s3_response rsp[32];
                 centry *ces[32]; int owner[32]; long ownidx[32]; long nown=0;
                 memset(rsp,0,sizeof rsp);
@@ -404,7 +409,6 @@ static void *download_worker(void *arg){
                     }
                     if(core) any=1;
                     atomic_fetch_add(&sc->io_bytes,(long)gn);
-                    atomic_fetch_add(&sc->inflight,(long)gn);
                     band_bytes+=(long)gn;
                     cc_fill(ces[i],got,gn);
                     if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
@@ -412,7 +416,7 @@ static void *download_worker(void *arg){
                     chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ces[i];chunks[nch].fetched=1;nch++;
                 }
                 /* pass 2: NON-OWNERS rendezvous with the concurrent fetch and share
-                 * its bytes (fetched=0: no inflight accounting -- the owner's band
+                 * its bytes (fetched=0: resident bytes are tracked by the cache itself -- the owner's band
                  * carries those bytes). bytes==NULL = owner saw absent/failed; the
                  * owner already counted it, so just drop the ref. */
                 for(long i=0;i<gN;++i){
@@ -548,10 +552,7 @@ static void *compute_worker(void *arg){
         }
         }
 release:
-        { long rel=0;
-          for(int i=0;i<bb.nch;++i){ if(bb.chunks[i].fetched) rel+=(long)bb.chunks[i].len; cc_release(bb.chunks[i].ce); }
-          atomic_fetch_sub(&sc->inflight,rel);
-          pthread_mutex_lock(&sc->im); pthread_cond_broadcast(&sc->icv); pthread_mutex_unlock(&sc->im); }
+        for(int i=0;i<bb.nch;++i) cc_release(bb.chunks[i].ce);
         free(bb.chunks);
     }
     free(raw);free(proc);free(l1);free(cbuf);free(tin);free(tout);
@@ -689,11 +690,10 @@ int main(int argc, char **argv){
     int nc_=nthreads>0?nthreads:(int)(ncpu*3/4<2?2:ncpu*3/4);
     int ni_=niothreads>0?niothreads:(is_s3(in)?(int)(ncpu*2):(nc_<4?nc_:4));
     int qc_=qcap>0?qcap:nc_/2+2;
-    if(mem_gb==24.0)  mem_gb=ncpu/2.0;     /* defaults only when not user-set */
+    if(mem_gb==24.0)  mem_gb=ncpu/3.0;   /* resident budget shares RAM with worker buffers */     /* defaults only when not user-set */
     if(cache_gb==12.0) cache_gb=ncpu/5.0;
-    cc_init((size_t)(cache_gb*1e9));
-    sc.inflight_cap=(long)(mem_gb*1e9); atomic_store(&sc.inflight,0);
-    pthread_mutex_init(&sc.im,NULL); pthread_cond_init(&sc.icv,NULL);
+    /* ONE resident-bytes budget covers in-flight bands AND cached reuse */
+    cc_init((size_t)((mem_gb+cache_gb)*1e9));
     bq_init(&sc.q,qc_,ni_);
     fprintf(stderr,"units %ld (%ldx%ld tiles x %ld bands), SB=%ld BAND=%ld halo=%ld, "
                    "%d compute + %d io threads, queue %d\n",
