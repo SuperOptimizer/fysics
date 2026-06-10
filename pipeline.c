@@ -266,10 +266,31 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
      * safe but orig!=b2). The smoothed scratch lives in b2, read only for the histogram. */
     if (cfg->do_air_zero) {
         int sr = cfg->scratch_passes > 0 ? cfg->scratch_passes : 5;
-        fy_box_smooth(orig, b2, b1, nz, ny, nx, sr);   /* b1 = tmp */
         long hist[256]; memset(hist, 0, sizeof(hist));
-        for (size_t i = 0; i < N; i++) {
-            int b = (int)(b2[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; hist[b]++;
+        /* The scratch is a heavy box smooth whose ONLY jobs are (a) tightening the
+         * histogram modes for the valley decision and (b) a fuzzy threshold field.
+         * Both are low-pass products, so compute it on a 2x DECIMATED copy (~8x less
+         * box work, the former #1 hotspot) and compare through a trilinear upsample. */
+        int lz = (nz + 1) / 2, ly = (ny + 1) / 2, lx = (nx + 1) / 2;
+        size_t nl = (size_t)lz * ly * lx;
+        int lowres = (lz >= 2 && ly >= 2 && lx >= 2);
+        if (lowres) {
+            for (int z = 0; z < lz; z++)
+                for (int y = 0; y < ly; y++) {
+                    const float *irow = orig + ((size_t)(z * 2) * ny + (size_t)(y * 2)) * nx;
+                    float *lrow = b2 + ((size_t)z * ly + y) * lx;
+                    for (int x = 0; x < lx; x++) lrow[x] = irow[(size_t)x * 2];
+                }
+            int rl = (sr + 1) / 2; if (rl < 1) rl = 1;
+            fy_box_smooth(b2, b1, b1 + nl, lz, ly, lx, rl);   /* smooth -> b1[0..nl) */
+            for (size_t i = 0; i < nl; i++) {
+                int b = (int)(b1[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; hist[b]++;
+            }
+        } else {
+            fy_box_smooth(orig, b2, b1, nz, ny, nx, sr);   /* b1 = tmp */
+            for (size_t i = 0; i < N; i++) {
+                int b = (int)(b2[i] * 255.0f + 0.5f); if (b < 0) b = 0; if (b > 255) b = 255; hist[b]++;
+            }
         }
         int dark = 0, light = 0, valley = 0;
         double d = fy_valley_depth(hist, &dark, &light, &valley);
@@ -290,7 +311,36 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
             cut = (int)((cfg->air_thresh > 0 ? cfg->air_thresh : 0.05) * 255);
         }
         float cutf = cut / 255.0f;
-        for (size_t i = 0; i < N; i++) if (b2[i] < cutf) f[i] = 0.0f;
+        if (lowres) {
+            /* compare against the trilinearly upsampled low-res smooth (4 low rows
+             * blended once per output row; b2's decimated copy is dead -> row scratch) */
+            const float *sl = b1;
+            float *rowbuf = b2;
+            for (int z = 0; z < nz; z++) {
+                int z0 = z >> 1; if (z0 > lz - 2) z0 = lz - 2;
+                float zf = 0.5f * z - z0; if (zf > 1.0f) zf = 1.0f;
+                for (int y = 0; y < ny; y++) {
+                    int y0 = y >> 1; if (y0 > ly - 2) y0 = ly - 2;
+                    float yf = 0.5f * y - y0; if (yf > 1.0f) yf = 1.0f;
+                    size_t r00 = ((size_t)z0 * ly + y0) * lx, r01 = r00 + lx;
+                    size_t r10 = r00 + (size_t)ly * lx, r11 = r10 + lx;
+                    float w00 = (1 - zf) * (1 - yf), w01 = (1 - zf) * yf;
+                    float w10 = zf * (1 - yf), w11 = zf * yf;
+                    for (int k = 0; k < lx; k++)
+                        rowbuf[k] = w00 * sl[r00 + k] + w01 * sl[r01 + k] +
+                                    w10 * sl[r10 + k] + w11 * sl[r11 + k];
+                    float *frow = f + ((size_t)z * ny + y) * nx;
+                    for (int x = 0; x < nx; x++) {
+                        int x0 = x >> 1; if (x0 > lx - 2) x0 = lx - 2;
+                        float fx = 0.5f * x - x0; if (fx > 1.0f) fx = 1.0f;
+                        float v = rowbuf[x0] + (rowbuf[x0 + 1] - rowbuf[x0]) * fx;
+                        if (v < cutf) frow[x] = 0.0f;
+                    }
+                }
+            }
+        } else {
+            for (size_t i = 0; i < N; i++) if (b2[i] < cutf) f[i] = 0.0f;
+        }
     }
 
     /* (e) MUSICA viewing enhancement (per-slice, clip-aware via the export rails). */

@@ -12,6 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <errno.h>
 #include <time.h>
 #ifdef FYSICS_S3
@@ -148,24 +151,39 @@ int fy_zarr_create(fy_zarr *z, const char *root, const long shape[3], const long
     return 0;
 }
 
-/* read one chunk (cz,cy,cx) into `out`, laid out with the chunk's TRUE stored extent
- * (ez,ey,ex) -- EDGE chunks are stored smaller than the nominal chunk size (matching how
- * fy_zarr_write_chunk wrote them). Fills with z->fill if the chunk is absent (sparse zarr).
- * Returns 0 on success (incl. fill), 1 on a real I/O error (S3 failure after retries). */
-static int read_chunk(const fy_zarr *z, long cz, long cy, long cx,
-                      long ez, long ey, long ex, unsigned char *out) {
-    long cn = ez * ey * ex;
+/* ---- chunk VIEW: local chunk files are mmap'd (no intermediate copy -- a halo
+ * read that uses a 16-voxel sliver of a neighbor chunk faults only the pages it
+ * touches, instead of fread'ing all 2MB into a scratch buffer and copying again).
+ * S3 chunks (and the rare mmap failure) land in the caller's scratch buffer.
+ * v->p == NULL => chunk absent (sparse: use fill). */
+typedef struct { const unsigned char *p; size_t len; void *map; size_t maplen; } fy_chunk_view;
+
+static int open_chunk(const fy_zarr *z, long cz, long cy, long cx, long cn,
+                      unsigned char *scratch, fy_chunk_view *v) {
+    v->p = NULL; v->len = 0; v->map = NULL; v->maplen = 0;
     char path[2048];
     snprintf(path, sizeof(path), "%s/0/%ld/%ld/%ld", z->root, cz, cy, cx);
-    int s3 = fy_s3_read_chunk(path, out, cn, z->fill);   /* S3 path (if FYSICS_S3 & s3://) */
-    if (s3 == 1) return 0;
+    int s3 = fy_s3_read_chunk(path, scratch, cn, z->fill);   /* S3 path (if FYSICS_S3 & s3://) */
     if (s3 == -1) return 1;
-    FILE *f = fopen(path, "rb");
-    if (!f) { memset(out, z->fill, cn); return 0; }      /* absent = sparse fill */
-    size_t got = fread(out, 1, cn, f); fclose(f);
-    if ((long)got < cn) memset(out + got, z->fill, cn - got);
+    if (s3 == 1) { v->p = scratch; v->len = (size_t)cn; return 0; }
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;                                    /* absent = sparse fill */
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return 0; }
+    void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m != MAP_FAILED) {
+        v->map = m; v->maplen = (size_t)st.st_size;
+        v->p = m; v->len = (size_t)st.st_size < (size_t)cn ? (size_t)st.st_size : (size_t)cn;
+        return 0;
+    }
+    FILE *f = fopen(path, "rb");                             /* mmap-failure fallback */
+    if (!f) return 0;
+    size_t got = fread(scratch, 1, cn, f); fclose(f);
+    v->p = scratch; v->len = got < (size_t)cn ? got : (size_t)cn;
     return 0;
 }
+static void close_chunk(fy_chunk_view *v) { if (v->map) munmap(v->map, v->maplen); }
 
 /* read an arbitrary region [z0..z0+dz) into `out` (dz*dy*dx, C order), assembling from chunks. */
 int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, long dx,
@@ -183,16 +201,24 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
             for (long gx = x0; gx < x0 + dx; ) {
                 long cx = gx / C2, lx = gx - cx * C2, hx = (lx + (x0 + dx - gx) < C2) ? lx + (x0 + dx - gx) : C2;
                 long ex = (z->shape[2] - cx * C2 < C2) ? (z->shape[2] - cx * C2) : C2;
-                if (read_chunk(z, cz, cy, cx, ez, ey, ex, cb) != 0) { free(cb); return 1; }
+                long cn = ez * ey * ex;
+                fy_chunk_view cv;
+                if (open_chunk(z, cz, cy, cx, cn, cb, &cv) != 0) { free(cb); return 1; }
                 /* clamp the copy span to the chunk's true extent (halo reads near the volume edge
                  * must not read past the stored data). */
                 long hzc = hz < ez ? hz : ez, hyc = hy < ey ? hy : ey, hxc = hx < ex ? hx : ex;
-                for (long zz = lz; zz < hzc; zz++)
+                long want = hxc - lx;
+                for (long zz = lz; zz < hzc && want > 0; zz++)
                     for (long yy = ly; yy < hyc; yy++) {
-                        unsigned char *src = cb + (zz * ey + yy) * ex + lx;   /* TRUE strides */
+                        size_t soff = ((size_t)zz * ey + yy) * ex + lx;       /* TRUE strides */
                         unsigned char *dst = out + (((cz*C0+zz - z0) * dy) + (cy*C1+yy - y0)) * dx + (cx*C2+lx - x0);
-                        if (hxc > lx) memcpy(dst, src, hxc - lx);
+                        if (!cv.p || soff >= cv.len) { memset(dst, z->fill, want); continue; }
+                        long avail = (long)(cv.len - soff);
+                        long c = avail < want ? avail : want;
+                        memcpy(dst, cv.p + soff, c);
+                        if (c < want) memset(dst + c, z->fill, want - c);     /* short file tail */
                     }
+                close_chunk(&cv);
                 gx = cx * C2 + hx;
             }
             gy = cy * C1 + hy;

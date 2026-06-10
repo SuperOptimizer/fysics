@@ -174,6 +174,14 @@ shared (`libfysics.so`) library plus the public header.
 | 256×256×256 (batch tile) | ~374 ms | ~45 Mvox/s |
 | 176×176×176 (real halo'd 128-tile) | ~112 ms | ~49 Mvox/s (was 1.69 s: **15×**) |
 
+End-to-end pipeline throughput (640³ synthetic, page-cached local zarr, full
+default chain): **~270 Mvox/s** machine-wide. Hot-path notes: the air-zero
+scratch smooth runs on a 2× decimated copy (it only feeds a histogram + fuzzy
+threshold); dering radius/sector plane-maps are computed once per tile and
+reused across z; local chunk reads are mmap'd (no intermediate copy; halo
+slivers fault only the pages they touch — verified byte-identical to the fread
+path).
+
 Interactive for viewer-sized regions; the FFT is the cost (self-contained, sizes
 2^k and 3·2^k via a radix-3 split, precomputed twiddle tables so the butterflies
 vectorize). Sizes pad to `fy_next_fft_size()` — a 176³ halo'd tile costs a 192³

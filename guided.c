@@ -43,9 +43,13 @@ static void box_mean(const float *restrict in, float *restrict out, float *restr
     /* X+Y FUSED per z-plane: smooth X into a plane-local L2-resident buffer (xp, ~81KB), then
      * slide that buffer in Y into `tmp`. The X intermediate never round-trips to RAM (it was a
      * full 11.9MB write+read of `out` before) -- big bandwidth saving on this RAM-bound kernel. */
-    static __thread float *xp = NULL, *accbuf = NULL; static __thread int xcap = 0;
+    /* NOTE: xp is keyed to the plane size but accbuf to nx -- they MUST be tracked
+     * separately (a call with an equal/smaller plane but larger nx would otherwise
+     * overflow accbuf; varying halo'd edge-tile dims hit exactly that). */
+    static __thread float *xp = NULL, *accbuf = NULL; static __thread int xcap = 0, acap = 0;
     int planesz = nx * ny;
-    if (xcap < planesz) { free(xp); free(accbuf); xp = malloc(sizeof(float)*planesz); accbuf = malloc(sizeof(float)*nx); xcap = planesz; }
+    if (xcap < planesz) { free(xp); xp = malloc(sizeof(float)*planesz); xcap = planesz; }
+    if (acap < nx)      { free(accbuf); accbuf = malloc(sizeof(float)*nx); acap = nx; }
     for (int z = 0; z < nz; z++) {
         const float *iplane = in + (size_t)z * planesz;
         /* X-smooth this plane into xp (cache-resident) */
@@ -178,10 +182,14 @@ int fy_guided_denoise_fast_ws(const float *in, float *out, int nz, int ny, int n
     box_mean(ab,   corr, tmp, lz, ly, lx, rl);   /* corr := mean_b */
 
     /* trilinear upsample of (mean_a, mean_b); apply at full res. Low sample i
-     * sits at full coordinate i*s (decimation), so u = x/s exactly. */
+     * sits at full coordinate i*s (decimation), so u = x/s exactly. The 4 low-res
+     * rows are z/y-blended ONCE per output row (8 mults/low-sample), so the per-
+     * voxel inner loop is just two x-lerps -- ~3x less work than blending per voxel. */
     int *xi = (int *)malloc(sizeof(int) * (size_t)nx);
     float *xf = (float *)malloc(sizeof(float) * (size_t)nx);
-    if (!xi || !xf) { free(xi); free(xf); return 1; }
+    float *arow = (float *)malloc(sizeof(float) * (size_t)lx);
+    float *brow = (float *)malloc(sizeof(float) * (size_t)lx);
+    if (!xi || !xf || !arow || !brow) { free(xi); free(xf); free(arow); free(brow); return 1; }
     for (int x = 0; x < nx; x++) {
         float u = (float)x / s;
         int x0 = (int)u; if (x0 > lx - 2) x0 = lx - 2;
@@ -202,23 +210,23 @@ int fy_guided_denoise_fast_ws(const float *in, float *out, int nz, int ny, int n
             size_t r11 = r10 + lx;
             float w00 = (1 - zf) * (1 - yfr), w01 = (1 - zf) * yfr;
             float w10 = zf * (1 - yfr),       w11 = zf * yfr;
+            for (int k = 0; k < lx; k++) {
+                arow[k] = w00 * mean[r00 + k] + w01 * mean[r01 + k] +
+                          w10 * mean[r10 + k] + w11 * mean[r11 + k];
+                brow[k] = w00 * corr[r00 + k] + w01 * corr[r01 + k] +
+                          w10 * corr[r10 + k] + w11 * corr[r11 + k];
+            }
             const float *irow = in + ((size_t)z * ny + y) * nx;
             float *orow = out + ((size_t)z * ny + y) * nx;
             for (int x = 0; x < nx; x++) {
                 int x0 = xi[x]; float fx = xf[x], gx = 1 - fx;
-                float a = gx * (w00 * mean[r00 + x0] + w01 * mean[r01 + x0] +
-                                w10 * mean[r10 + x0] + w11 * mean[r11 + x0]) +
-                          fx * (w00 * mean[r00 + x0 + 1] + w01 * mean[r01 + x0 + 1] +
-                                w10 * mean[r10 + x0 + 1] + w11 * mean[r11 + x0 + 1]);
-                float b = gx * (w00 * corr[r00 + x0] + w01 * corr[r01 + x0] +
-                                w10 * corr[r10 + x0] + w11 * corr[r11 + x0]) +
-                          fx * (w00 * corr[r00 + x0 + 1] + w01 * corr[r01 + x0 + 1] +
-                                w10 * corr[r10 + x0 + 1] + w11 * corr[r11 + x0 + 1]);
+                float a = gx * arow[x0] + fx * arow[x0 + 1];
+                float b = gx * brow[x0] + fx * brow[x0 + 1];
                 orow[x] = a * irow[x] + b;
             }
         }
     }
-    free(xi); free(xf);
+    free(xi); free(xf); free(arow); free(brow);
     return 0;
 }
 

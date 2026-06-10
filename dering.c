@@ -80,24 +80,39 @@ void fy_dering_accumulate_u8(fy_dering *t, const unsigned char *buf,
     if (ss < 1) ss = 1;
     int ns = t->ns, nr = t->nr;
     double inv_sect = ns / (2.0 * M_PI);
+    /* radius+sector depend only on (y,x): build the (sector*nr + rbin) plane map ONCE
+     * and reuse it across all dz slices (the per-voxel sqrt+atan2 were a profiled
+     * pass-1b hotspot). -1 = out of range. */
+    long sy = (dy + ss - 1) / ss, sx = (dx + ss - 1) / ss;
+    int *map = (int *)malloc(sizeof(int) * (size_t)sy * sx);
+    if (!map) return;   /* accumulation is statistical; the min_cnt gates handle a miss */
+    for (long yi = 0; yi < sy; yi++) {
+        double gy = (double)(y0 + yi * ss) - t->cy, gy2 = gy * gy;
+        int *mrow = map + yi * sx;
+        for (long xi = 0; xi < sx; xi++) {
+            double gx = (double)(x0 + xi * ss) - t->cx;
+            int ri = (int)(sqrt(gy2 + gx * gx) + 0.5);
+            if (ri >= nr) { mrow[xi] = -1; continue; }
+            int q = (int)((atan2(gy, gx) + M_PI) * inv_sect); if (q >= ns) q = ns - 1;
+            mrow[xi] = q * nr + ri;
+        }
+    }
     for (long z = 0; z < dz; z++) {
         const unsigned char *sl = buf + (size_t)z * dy * dx;
-        for (long y = 0; y < dy; y += ss) {
-            double gy = (double)(y0 + y) - t->cy, gy2 = gy * gy;
-            const unsigned char *row = sl + (size_t)y * dx;
-            for (long x = 0; x < dx; x += ss) {
-                unsigned char v = row[x];
+        for (long yi = 0; yi < sy; yi++) {
+            const unsigned char *row = sl + (size_t)(yi * ss) * dx;
+            const int *mrow = map + yi * sx;
+            for (long xi = 0; xi < sx; xi++) {
+                unsigned char v = row[(size_t)xi * ss];
                 if (!v) continue;
-                double gx = (double)(x0 + x) - t->cx;
-                int ri = (int)(sqrt(gy2 + gx * gx) + 0.5);
-                if (ri >= nr) continue;
-                int q = (int)((atan2(gy, gx) + M_PI) * inv_sect); if (q >= ns) q = ns - 1;
-                size_t b = (size_t)q * nr + ri;
+                int b = mrow[xi];
+                if (b < 0) continue;
                 t->sum[b] += v;
                 t->cnt[b]++;
             }
         }
     }
+    free(map);
 }
 
 /* merge a single-slab scratch into global slab `slab` */
@@ -186,23 +201,48 @@ void fy_dering_apply(const fy_dering *d, float *f, long z0, long y0, long x0,
                      long dz, long dy, long dx, double scale) {
     if (!d->have_rings) return;
     int nr = d->nr;
+    /* per-(y,x) radius-bin map computed once, reused across all dz slices */
+    int *map = (int *)malloc(sizeof(int) * (size_t)dy * dx);
+    if (map) {
+        for (long y = 0; y < dy; y++) {
+            double gy = (double)(y0 + y) - d->cy, gy2 = gy * gy;
+            int *mrow = map + y * dx;
+            for (long x = 0; x < dx; x++) {
+                double gx = (double)(x0 + x) - d->cx;
+                int ri = (int)(sqrt(gy2 + gx * gx) + 0.5);
+                mrow[x] = ri < nr ? ri : -1;
+            }
+        }
+    }
     for (long z = 0; z < dz; z++) {
         int slab = (int)((z0 + z) / d->slab_z);
         if (slab < 0) slab = 0;
         if (slab >= d->nslab) slab = d->nslab - 1;
         const float *ring = d->ring + (size_t)slab * nr;
+        float sc = (float)scale;
         float *sl = f + (size_t)z * dy * dx;
         for (long y = 0; y < dy; y++) {
-            float gy = (float)((double)(y0 + y) - d->cy), gy2 = gy * gy;
             float *row = sl + (size_t)y * dx;
-            for (long x = 0; x < dx; x++) {
-                if (row[x] <= 0.0f) continue;
-                float gx = (float)((double)(x0 + x) - d->cx);
-                int ri = (int)(sqrtf(gy2 + gx * gx) + 0.5f);
-                if (ri >= nr) continue;
-                float v = row[x] - (float)scale * ring[ri];
-                row[x] = v > 0.0f ? v : 0.0f;
+            if (map) {
+                const int *mrow = map + y * dx;
+                for (long x = 0; x < dx; x++) {
+                    int ri = mrow[x];
+                    if (ri < 0 || row[x] <= 0.0f) continue;
+                    float v = row[x] - sc * ring[ri];
+                    row[x] = v > 0.0f ? v : 0.0f;
+                }
+            } else {  /* alloc-failure fallback: per-voxel radius */
+                double gy = (double)(y0 + y) - d->cy, gy2 = gy * gy;
+                for (long x = 0; x < dx; x++) {
+                    if (row[x] <= 0.0f) continue;
+                    double gx = (double)(x0 + x) - d->cx;
+                    int ri = (int)(sqrt(gy2 + gx * gx) + 0.5);
+                    if (ri >= nr) continue;
+                    float v = row[x] - sc * ring[ri];
+                    row[x] = v > 0.0f ? v : 0.0f;
+                }
             }
         }
     }
+    free(map);
 }
