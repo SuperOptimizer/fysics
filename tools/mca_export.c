@@ -278,16 +278,27 @@ static void cc_release(centry *e){
  * downloader claims the token and runs cap-EXEMPT until its band is queued --
  * compute then consumes it, releases bytes, and wakes the rest. */
 static pthread_mutex_t g_tok = PTHREAD_MUTEX_INITIALIZER;
-static int cc_gate(long band_bytes, int have_tok){
-    if(have_tok) return 1;
-    (void)band_bytes;
+/* gate AND pre-reserve: the group's expected bytes are added to the budget BEFORE
+ * the transfers start (the in-progress curl bodies were the last unaccounted
+ * consumer: 64 threads x ~64MB in-flight responses OOM'd on top of a full budget).
+ * Caller settles the reservation after the fetch via cc_settle(). */
+static int cc_gate_reserve(size_t est, int have_tok){
     pthread_mutex_lock(&g_cc.m);
-    while(g_cc.bytes>g_cc.cap){
-        if(pthread_mutex_trylock(&g_tok)==0){ have_tok=1; break; }
-        pthread_cond_wait(&g_cc.cv,&g_cc.m);
+    if(!have_tok){
+        while(g_cc.bytes+est>g_cc.cap){
+            if(pthread_mutex_trylock(&g_tok)==0){ have_tok=1; break; }
+            pthread_cond_wait(&g_cc.cv,&g_cc.m);
+        }
     }
+    g_cc.bytes+=est;
     pthread_mutex_unlock(&g_cc.m);
     return have_tok;
+}
+static void cc_settle(size_t est){   /* remove the reservation (actuals were added by cc_fill) */
+    pthread_mutex_lock(&g_cc.m);
+    g_cc.bytes-=est;
+    pthread_cond_broadcast(&g_cc.cv);
+    pthread_mutex_unlock(&g_cc.m);
 }
 static void cc_tok_release(void){
     pthread_mutex_unlock(&g_tok);
@@ -386,7 +397,8 @@ static void *download_worker(void *arg){
              * worker (owner) fetches a given chunk, everyone else waits on its fill. */
             for(long g0=0; g0<nneed; g0+=32){
                 long gN=nneed-g0<32?nneed-g0:32;
-                have_tok=cc_gate(band_bytes,have_tok);
+                size_t gest=(size_t)gN*(size_t)z0->cz*z0->cy*z0->cx;
+                have_tok=cc_gate_reserve(gest,have_tok);
                 char paths[32][1500]; s3_range_req reqs[32]; s3_response rsp[32];
                 centry *ces[32]; int owner[32]; long ownidx[32]; long nown=0;
                 memset(rsp,0,sizeof rsp);
@@ -438,6 +450,7 @@ static void *download_worker(void *arg){
                     chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
                     chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ces[i];chunks[nch].fetched=1;nch++;
                 }
+                cc_settle(gest);
                 /* pass 2: NON-OWNERS rendezvous with the concurrent fetch and share
                  * its bytes (fetched=0: resident bytes are tracked by the cache itself -- the owner's band
                  * carries those bytes). bytes==NULL = owner saw absent/failed; the
