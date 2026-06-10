@@ -69,7 +69,7 @@ static u8 *src_get(const char *path, size_t *len, int *err){
         if(st==S3_OK && r.status==200 && r.body){
             out=malloc(r.body_len);
             if(out){ memcpy(out,r.body,r.body_len); if(len)*len=r.body_len; }
-        } else if(!(st==S3_OK && r.status==404)) { if(err)*err=1; }
+        } else if(r.status!=404) { if(err)*err=1; }   /* 404 = absent chunk, not an error */
         s3_response_free(&r);
         return out;
     }

@@ -703,12 +703,25 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             #pragma omp for schedule(dynamic)
             for (long t = 0; t < pntiles; t++) {
                 long iz = t / (pny * pnx), r = t % (pny * pnx), iy = r / pnx, ix = r % pnx;
-                /* SUBSAMPLE: read EVERY z-slab (the z-drift trend needs full z-coverage) but only
-                 * a strided subset of (y,x) tiles when the grid is large enough to keep stats
-                 * robust -- the norm histogram and per-z papyrus mean converge on a fraction of
-                 * the xy tiles. Cuts pass-1b I/O ~4x on big volumes (a full redundant read else). */
-                if (pny >= 4 && (iy & 1)) continue;
-                if (pnx >= 4 && (ix & 1)) continue;
+                /* SAMPLE: read EVERY z-slab (the z-drift trend needs full z-coverage) but only
+                 * a hash-selected fraction of (y,x) tiles, sized by a CALIBRATION I/O BUDGET
+                 * (default 200 GB, cfg->calib_budget_gb) -- on a 27 TB volume the old strided
+                 * 25% sweep was ~7 TB of reads before processing could start. The stats
+                 * (norm histogram, per-z papyrus mean, ring profiles) converge on samples;
+                 * a floor keeps >=~32 tiles expected per z-slab for the z-drift profile. */
+                if (pny >= 4 || pnx >= 4) {
+                    double total_gb = (double)Z * Y * X / 1e9;
+                    double budget = cfg->calib_budget_gb > 0 ? cfg->calib_budget_gb : 200.0;
+                    double frac = total_gb > budget ? budget / total_gb : 1.0;
+                    double floorf_ = 32.0 / ((double)pny * pnx);
+                    if (frac < floorf_) frac = floorf_;
+                    if (frac < 1.0) {
+                        unsigned int hsh = (unsigned int)(iz * 73856093L) ^ (unsigned int)(iy * 19349663L)
+                                         ^ (unsigned int)(ix * 83492791L);
+                        hsh ^= hsh >> 16; hsh *= 0x7feb352dU; hsh ^= hsh >> 15; hsh *= 0x846ca68bU; hsh ^= hsh >> 16;
+                        if (hsh > (unsigned int)(frac * 4294967295.0)) continue;
+                    }
+                }
                 long z0 = iz * ptile, y0 = iy * ptile, x0 = ix * ptile;
                 long dz = lmin(ptile, Z - z0), dy = lmin(ptile, Y - y0), dx = lmin(ptile, X - x0);
                 size_t n = (size_t)dz * dy * dx;

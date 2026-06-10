@@ -60,7 +60,8 @@ static int fy_s3_get(const char *path, unsigned char *out, long cn, unsigned cha
             s3_response_free(&r);
             return 1;
         }
-        if(st==S3_OK && r.status==404){ memset(out,fill,cn); s3_response_free(&r); return 1; }
+        if(r.status==404){ memset(out,fill,cn); s3_response_free(&r); return 1; }  /* absent = sparse,
+            regardless of the libs3 status code (it reports 404 as an error status) */
         if(try == max_tries-1)
             fprintf(stderr,"zarr: S3 GET failed after %d tries (status=%d http=%ld): %s\n",
                     max_tries, (int)st, (long)r.status, path);

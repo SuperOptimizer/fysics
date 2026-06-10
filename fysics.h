@@ -441,6 +441,8 @@ typedef struct {
     int    do_normalize; int norm_lo, norm_hi;
     int    do_zdrift; float *zdrift_factor;  /* len = Z, or NULL */
     int    do_dering;                        /* detect+subtract residual rings */
+    double calib_budget_gb;                  /* pass-1b sampling I/O budget (0 -> 200 GB).
+                                              * Ring-detection sensitivity scales with it. */
     double dering_cy, dering_cx;             /* rotation axis; <=0 -> volume center */
     double psf_p5, psf_med;   /* measured PSF sigma map (drives the auto-deconv gate) */
     int    do_musica; double musica_p; int musica_levels; double musica_core;
