@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <libgen.h>
+#include <malloc.h>
 #include <limits.h>
 
 typedef uint8_t u8;
@@ -653,6 +654,9 @@ static void *stats_worker(void *arg){
         size_t res=g_cc.bytes, cap=g_cc.cap; long hits=g_cc.hits, miss=g_cc.misses;
         pthread_mutex_unlock(&g_cc.m);
         pthread_mutex_lock(&sc->q.m); int qn=sc->q.count, qc=sc->q.cap; pthread_mutex_unlock(&sc->q.m);
+        malloc_trim(0);   /* return freed heap to the OS: glibc retention crept
+                           * +10GB over hours of band churn (observed 47->58GB at
+                           * a fixed working set) */
         fprintf(stderr,"[t] units %ld/%ld (skip %ld) | q %d/%d | res %.1f/%.1fGB | dl fetch %ld gate %ld | wk busy %ld | cache %ld/%ld\n",
             done, sc->nunits, atomic_load(&sc->skipped), qn, qc, res/1e9, cap/1e9,
             atomic_load(&sc->dl_fetch), atomic_load(&sc->dl_gate), atomic_load(&sc->wk_busy), hits, hits+miss);
