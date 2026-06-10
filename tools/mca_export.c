@@ -254,10 +254,15 @@ static void cc_fill(centry *e,u8 *bytes,size_t len){
 }
 /* non-owner: wait for the owner's cc_fill. After return, e->bytes==NULL means
  * the owner's fetch failed/was absent (owner already did the accounting). */
-static void cc_wait_ready(centry *e){
+/* bounded: returns 1 when ready; 0 on timeout (the owner may itself be gated --
+ * the caller then fetches a private copy rather than wait forever). */
+static int cc_wait_ready(centry *e){
+    struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); ts.tv_sec+=2;
     pthread_mutex_lock(&g_cc.m);
-    while(!e->ready) pthread_cond_wait(&g_cc.cv,&g_cc.m);
+    while(!e->ready)
+        if(pthread_cond_timedwait(&g_cc.cv,&g_cc.m,&ts)!=0){ pthread_mutex_unlock(&g_cc.m); return 0; }
     pthread_mutex_unlock(&g_cc.m);
+    return 1;
 }
 static void cc_release(centry *e){
     pthread_mutex_lock(&g_cc.m);
@@ -266,11 +271,28 @@ static void cc_release(centry *e){
     pthread_cond_broadcast(&g_cc.cv);   /* wake fetch gates: resident bytes may have dropped */
     pthread_mutex_unlock(&g_cc.m);
 }
-/* fetch gate: block while resident chunk bytes exceed the budget. band_bytes>0
- * guarantees progress (a band's first fetch always proceeds). */
-static void cc_gate(long band_bytes){
+/* fetch gate with a PROGRESS TOKEN. The per-band "first fetch free" rule is not
+ * enough: with every downloader mid-band, their partial bands can collectively
+ * pin resident bytes at the cap and ALL of them gate -> deadlock (observed live:
+ * 88 sleeping threads, rx 0, RSS at the plateau). When over budget, exactly one
+ * downloader claims the token and runs cap-EXEMPT until its band is queued --
+ * compute then consumes it, releases bytes, and wakes the rest. */
+static pthread_mutex_t g_tok = PTHREAD_MUTEX_INITIALIZER;
+static int cc_gate(long band_bytes, int have_tok){
+    if(have_tok) return 1;
+    (void)band_bytes;
     pthread_mutex_lock(&g_cc.m);
-    while(band_bytes>0 && g_cc.bytes>g_cc.cap) pthread_cond_wait(&g_cc.cv,&g_cc.m);
+    while(g_cc.bytes>g_cc.cap){
+        if(pthread_mutex_trylock(&g_tok)==0){ have_tok=1; break; }
+        pthread_cond_wait(&g_cc.cv,&g_cc.m);
+    }
+    pthread_mutex_unlock(&g_cc.m);
+    return have_tok;
+}
+static void cc_tok_release(void){
+    pthread_mutex_unlock(&g_tok);
+    pthread_mutex_lock(&g_cc.m);
+    pthread_cond_broadcast(&g_cc.cv);
     pthread_mutex_unlock(&g_cc.m);
 }
 
@@ -324,6 +346,7 @@ static void *download_worker(void *arg){
     for(;;){
         long ti=atomic_fetch_add(&sc->next,1);
         if(ti>=sc->nunits) break;
+        int have_tok=0;
         long band_bytes=0;   /* gate per CHUNK below (per-band gating lets N
                               * downloaders overshoot the cap N-fold before any
                               * accounting); band_bytes>0 guarantees progress */
@@ -363,7 +386,7 @@ static void *download_worker(void *arg){
              * worker (owner) fetches a given chunk, everyone else waits on its fill. */
             for(long g0=0; g0<nneed; g0+=32){
                 long gN=nneed-g0<32?nneed-g0:32;
-                cc_gate(band_bytes);
+                have_tok=cc_gate(band_bytes,have_tok);
                 char paths[32][1500]; s3_range_req reqs[32]; s3_response rsp[32];
                 centry *ces[32]; int owner[32]; long ownidx[32]; long nown=0;
                 memset(rsp,0,sizeof rsp);
@@ -421,11 +444,27 @@ static void *download_worker(void *arg){
                  * owner already counted it, so just drop the ref. */
                 for(long i=0;i<gN;++i){
                     if(owner[i]) continue;
-                    cc_wait_ready(ces[i]);
-                    if(!ces[i]->bytes){ cc_release(ces[i]); continue; }
                     long qz=needq[(g0+i)*3],qy=needq[(g0+i)*3+1],qx=needq[(g0+i)*3+2];
                     int core = (qz>=vz0/z0->cz && qz*z0->cz<vz1 && qy>=vy0/z0->cy && qy*z0->cy<vy1
                                 && qx>=vx0/z0->cx && qx*z0->cx<vx1);
+                    if(!cc_wait_ready(ces[i])){
+                        /* owner stuck (likely gated): fetch a PRIVATE copy so this band
+                         * can finish -- rare duplicate GET beats a wedged pipeline */
+                        cc_release(ces[i]);
+                        char p[1500]; snprintf(p,sizeof p,"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
+                        atomic_fetch_add(&sc->io_open,1);
+                        size_t gn=0; int err=0; u8 *got=src_get(p,&gn,&err);
+                        if(err) atomic_fetch_add(&sc->fail,1);
+                        if(!got){ atomic_fetch_add(&sc->io_miss,1); continue; }
+                        if(core) any=1;
+                        atomic_fetch_add(&sc->io_bytes,(long)gn);
+                        if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
+                        chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
+                        chunks[nch].bytes=got;chunks[nch].len=gn;
+                        chunks[nch].ce=NULL;chunks[nch].fetched=2;nch++;   /* private: freed on release */
+                        continue;
+                    }
+                    if(!ces[i]->bytes){ cc_release(ces[i]); continue; }
                     if(core) any=1;
                     if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
                     chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
@@ -437,6 +476,7 @@ static void *download_worker(void *arg){
         }
         bandbuf b={ti,chunks,nch,any?0:1};
         bq_push(&sc->q,b);
+        if(have_tok){ cc_tok_release(); have_tok=0; }
     }
     bq_prod_done(&sc->q);
     return NULL;
@@ -552,7 +592,10 @@ static void *compute_worker(void *arg){
         }
         }
 release:
-        for(int i=0;i<bb.nch;++i) cc_release(bb.chunks[i].ce);
+        for(int i=0;i<bb.nch;++i){
+            if(bb.chunks[i].ce) cc_release(bb.chunks[i].ce);
+            else free(bb.chunks[i].bytes);          /* private timeout copy */
+        }
         free(bb.chunks);
     }
     free(raw);free(proc);free(l1);free(cbuf);free(tin);free(tout);
