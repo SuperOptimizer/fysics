@@ -238,6 +238,22 @@ static void test_deconv_rfft_equivalence(void) {
     free(in); free(a); free(b);
 }
 
+static void test_downscale_cbox(void) {
+    /* a thin bright sheet (1 voxel of 200 in a 40-background cell) must survive
+     * cbox visibly better than box; zero cells stay zero; box = exact mean */
+    unsigned char in[2*2*2*8]; int ox,oy,oz;
+    unsigned char out_box[8], out_cbox[8];
+    /* volume 4x2x2: first 2x2x2 cell = sheet, second = all zero */
+    unsigned char v[16]={40,40,40,40, 40,40,40,200,  0,0,0,0, 0,0,0,0};
+    (void)in;
+    fy_downscale2x(v,4,2,2,out_box,&ox,&oy,&oz,FY_DS_BOX,0.5f);
+    fy_downscale2x(v,4,2,2,out_cbox,&ox,&oy,&oz,FY_DS_CBOX,0.5f);
+    CHECK(ox==2&&oy==1&&oz==1,"downscale dims");
+    CHECK(out_box[0]==60,"box = exact mean (60)");
+    CHECK(out_cbox[0]==130,"cbox pushes toward the sheet (mean+0.5*(200-60)=130)");
+    CHECK(out_box[1]==0&&out_cbox[1]==0,"zero cells stay zero (occupancy-safe)");
+}
+
 static void test_noise_aniso(void) {
     /* white noise blurred 3-tap along z -> rho_z >> rho_xy; ratio detects it */
     int nz = 64, ny = 64, nx = 64; size_t n = (size_t)nz*ny*nx;
@@ -942,6 +958,7 @@ int main(void) {
     test_fft_radix3();
     test_guided_fast();
     test_dering();
+    test_downscale_cbox();
     test_noise_aniso();
     test_matched_aniso();
     test_deconv_rfft_equivalence();

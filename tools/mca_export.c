@@ -514,16 +514,14 @@ static void *download_worker(void *arg){
     return NULL;
 }
 
-/* 2x2x2 box downscale (zero-preserving rounding like the zarr pyramid) */
+/* 2x downscale via the volume-compressor kernels: DS_BOX (plain mean) or DS_CBOX
+ * (contrast-maintaining: mean pushed toward the cell's max-deviation voxel so thin
+ * sheets/gaps survive coarse zoom). Strictly within-cell -> no halo, zero-preserving. */
+static fy_ds_method g_ds = FY_DS_CBOX; static float g_alpha = 0.5f;
 static void down2x(const u8 *in,long dz,long dy,long dx,u8 *out,long oz,long oy,long ox){
-    for(long z=0;z<oz;++z)for(long y=0;y<oy;++y)for(long x=0;x<ox;++x){
-        int s=0,c=0;
-        for(int a=0;a<2;a++)for(int b=0;b<2;b++)for(int d=0;d<2;d++){
-            long zz=2*z+a,yy=2*y+b,xx=2*x+d;
-            if(zz<dz&&yy<dy&&xx<dx){s+=in[((size_t)zz*dy+yy)*dx+xx];c++;}
-        }
-        out[((size_t)z*oy+y)*ox+x]=(u8)(c?(s+c/2)/c:0);
-    }
+    int ox_,oy_,oz_;
+    fy_downscale2x(in,(int)dx,(int)dy,(int)dz,out,&ox_,&oy_,&oz_,g_ds,g_alpha);
+    (void)oz;(void)oy;(void)ox;
 }
 
 static void *compute_worker(void *arg){
@@ -701,7 +699,8 @@ int main(int argc, char **argv){
     if(argc<3){
         fprintf(stderr,"usage: %s <in_zarr|s3://...> <out.mc> [--profile P] [--quality Q]"
                        " [--meta PATH] [--threads N] [--io-threads M] [--queue C]"
-                       " [--sb SB] [--band B] [--no-process]\n",argv[0]);
+                       " [--sb SB] [--band B] [--no-process]\n"
+                       "       [--downscale box|cbox] [--alpha A]   (LOD kernel; default cbox 0.5)\n",argv[0]);
         return 2;
     }
     const char *in=argv[1], *out=argv[2], *profile="conservative";
@@ -722,6 +721,8 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--sb")&&i+1<argc)        SB=atol(argv[++i]);
         else if (!strcmp(argv[i],"--band")&&i+1<argc)      BAND=atol(argv[++i]);
         else if (!strcmp(argv[i],"--no-process"))          process=0;
+        else if (!strcmp(argv[i],"--downscale")&&i+1<argc) g_ds=strcmp(argv[++i],"box")?FY_DS_CBOX:FY_DS_BOX;
+        else if (!strcmp(argv[i],"--alpha")&&i+1<argc)     g_alpha=(float)atof(argv[++i]);
         else if (!strcmp(argv[i],"--cache-gb")&&i+1<argc)  cache_gb=atof(argv[++i]);
         else if (!strcmp(argv[i],"--mem-gb")&&i+1<argc)    mem_gb=atof(argv[++i]);
         else { fprintf(stderr,"unknown arg: %s\n",argv[i]); return 2; }

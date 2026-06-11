@@ -386,6 +386,14 @@ int  fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0,
 int  fy_zarr_write_chunk(const fy_zarr *z, long cz, long cy, long cx,
                          const unsigned char *buf, long bz, long by, long bx);
 
+/* ===== 2x LOD downscale kernels (downscale.c, from volume-compressor) ====
+ * Strictly within-cell (no halo; tiles independent), zero-preserving.
+ * FY_DS_CBOX keeps thin sheets/gaps visible at coarse zoom (alpha ~0.5). */
+typedef enum { FY_DS_BOX = 0, FY_DS_CBOX } fy_ds_method;
+void fy_downscale2x(const unsigned char *in, int nx, int ny, int nz,
+                    unsigned char *out, int *ox, int *oy, int *oz,
+                    fy_ds_method method, float alpha);
+
 /* ===== detect-then-subtract residual ring removal (dering.c) ============
  * Rings = angularly-invariant radial features centered on the ROTATION AXIS
  * (metadata rotation_axis_position; BM18 places it at the slice center).
