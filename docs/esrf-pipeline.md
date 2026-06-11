@@ -524,3 +524,12 @@ them reproduces a specific observed failure:
    full-width compute. Winning config on a 32-thread/64 GB box: 32 compute +
    64 io (blocked threads are free), queue from invariant 4, ~12 GB budget ->
    ~11 Gbit/s sustained S3 input, NIC-bound (the correct end state).
+
+### First production export (2026-06-11): PHerc Paris4 2.4 µm, complete
+27 TB masked input -> 320 GB 8-LOD .mca (s3://philodemos/forrest/), processed
+through the full calibrated chain, sustained ~15 Gbit/s S3 input on a
+c8gd.8xlarge (NIC-bound; c8gn-class recommended for compute-bound exports).
+Decode spot-check: interior regions 97-100% material at plausible intensities,
+air clean, pyramid populated. Late additions proven in production: resume
+journal (restart cost ~10 min, 148k units skipped), malloc_trim in the
+telemetry thread (glibc heap retention was the last unaccounted RAM consumer).
