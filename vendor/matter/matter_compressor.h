@@ -33,8 +33,16 @@ typedef int32_t  mc_i32;
 #define MC_HF_EXP      0.65f   // HF quant power-law: step = quality*(1+L1freq)^MC_HF_EXP
 #define MC_FILL_SWEEPS 3       // SOR air-fill sweeps before the DCT (omega=1.6)
 
-void  mc_set_quality(float quality);   // the main runtime parameter
-float mc_get_quality(void);
+// Per-thread codec context (replaces the former _Thread_local global state). One
+// ctx holds quality, the derived quant/prior tables, and all encode/decode
+// scratch. Each thread that encodes or decodes owns its own ctx; the codec
+// functions take it by pointer so there is no implicit thread-local lookup on the
+// hot path. The struct is large (heap-allocated by mc_codec_ctx_new).
+typedef struct mc_codec_ctx mc_codec_ctx;
+mc_codec_ctx *mc_codec_ctx_new(void);          // heap-allocate (default q=8)
+void          mc_codec_ctx_free(mc_codec_ctx *ctx);
+void  mc_codec_ctx_set_quality(mc_codec_ctx *ctx, float quality);  // rebuilds tables
+float mc_codec_ctx_get_quality(mc_codec_ctx *ctx);
 // Optional guaranteed max-error bound (near-lossless mode): after transform
 // coding, the encoder codes sparse corrections for every voxel whose error
 // exceeds tau, so |orig - decoded| <= tau for all material voxels. 0 = off
@@ -47,8 +55,8 @@ float mc_get_quality(void);
 // true lossless (zstd-19) — there is deliberately no lossless mode; the DCT
 // path is not bit-reversible and the entropy ceiling makes one pointless.
 // tau 2 -> 4.0x, tau 3 (q 1) -> 5.3x, all with p99 == max == tau.
-void  mc_set_max_error(int tau);
-int   mc_get_max_error(void);
+void  mc_codec_ctx_set_max_error(mc_codec_ctx *ctx, int tau);
+int   mc_codec_ctx_get_max_error(mc_codec_ctx *ctx);
 
 // Calibrated preset ladder: level L guarantees |err| <= 2^L on every material
 // voxel (air is always bit-exact) with the quality that maximizes ratio under
@@ -75,9 +83,9 @@ typedef enum {
     MC_PRESET_PREVIEW   = 7,   // tau 128
     MC_PRESET_COUNT     = 8,
 } mc_preset;
-// Sets mc_set_quality + mc_set_max_error; returns the level's quality (pass
-// it to the mc_archive_append_* calls, which take q explicitly).
-float       mc_apply_preset(mc_preset level);
+// Sets quality + max_error on the ctx; returns the level's quality (pass it to
+// the mc_archive_append_* calls, which take q explicitly).
+float       mc_apply_preset(mc_codec_ctx *ctx, mc_preset level);
 float       mc_preset_quality(mc_preset level);
 int         mc_preset_tau(mc_preset level);      // == 1 << level
 const char *mc_preset_name(mc_preset level);
@@ -97,12 +105,13 @@ void  mc_buf_put(mc_buf *b, const void *s, size_t n);
 // never touched. Call AFTER assembling decoded blocks into a contiguous region.
 void  mc_deblock(mc_u8 *vol, int nz, int ny, int nx, float quality);
 
-// encode one 16^3 block (z,y,x raster; air = value 0). Appends payload to out,
-// sets *len_out. Returns 1 if coded (nonzero), 0 if all-zero (no payload).
-int   mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out);
-// decode one block payload of `plen` bytes into dst (16^3). Self-contained
-// (mask in payload); plen comes from the chunk's block-length table.
-void  mc_dec_block(const mc_u8 *payload, uint32_t plen, mc_u8 *dst);
+// encode one 16^3 block (z,y,x raster; air = value 0) using ctx (its quality /
+// max_error / scratch). Appends payload to out, sets *len_out. Returns 1 if
+// coded (nonzero), 0 if all-zero (no payload).
+int   mc_enc_block(mc_codec_ctx *ctx, const mc_u8 *vox, mc_buf *out, uint32_t *len_out);
+// decode one block payload of `plen` bytes into dst (16^3) using ctx. Self-
+// contained (mask in payload); plen comes from the chunk's block-length table.
+void  mc_dec_block(mc_codec_ctx *ctx, const mc_u8 *payload, uint32_t plen, mc_u8 *dst);
 
 // per-chunk material-fraction map (4096 nibbles 0..15), context-coded.
 uint32_t mc_enc_fracmap(const mc_u8 *frac, mc_u8 *out, size_t cap);
@@ -181,6 +190,13 @@ int mc_archive_append_chunk_raw(mc_archive *a, int lod, int cz,int cy,int cx,
 // (format v6), so decode needs nothing extra.
 int mc_archive_append_chunk_raw_q(mc_archive *a, int lod, int cz,int cy,int cx,
                                   const mc_u8 vox[256*256*256], float q);
+// Caller-context variant: encode with C's quality AND max_error (the raw/raw_q
+// paths build a throwaway default ctx, so tau is off there). Also the
+// efficient path for tight append loops -- one ctx per worker thread, no
+// per-chunk table rebuilds.
+int mc_archive_append_chunk_ctx(mc_archive *a, mc_codec_ctx *C,
+                                int lod, int cz,int cy,int cx,
+                                const mc_u8 vox[256*256*256]);
 // Rate-controlled variant: pick this chunk's q to hit ~target_ratio (raw bytes
 // / compressed bytes) for THIS chunk. One 1/16-block sample encode at the
 // archive's base q plus a single power-law correction (~6% encode overhead,

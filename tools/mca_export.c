@@ -353,7 +353,7 @@ static void bq_prod_done(bandq *q){
 typedef struct {
     const zlvl *z0; const chunkmap *cm;
     const fy_pipeline_cfg *cfg; int process;
-    mc_archive *arc;
+    mc_archive *arc; float quality;
     long SB,BAND,halo;
     long ntx,nty,nbz,nunits;
     long pz,py,px;              /* padded dims (multiples of 2*MCC for L1 alignment) */
@@ -535,6 +535,9 @@ static void *compute_worker(void *arg){
     u8 *tin=malloc((size_t)(128+2*h)*(128+2*h)*(128+2*h));    /* fysics tile in    */
     u8 *tout=malloc((size_t)128*128*128);                     /* fysics tile out   */
     if(!raw||!proc||!l1||!cbuf||!tin||!tout){ fprintf(stderr,"compute alloc failed\n"); exit(1); }
+    mc_codec_ctx *mctx=mc_codec_ctx_new();                    /* one encoder ctx per worker */
+    if(!mctx){ fprintf(stderr,"compute ctx alloc failed\n"); exit(1); }
+    mc_codec_ctx_set_quality(mctx,sc->quality);
     bandbuf bb;
     while(bq_pop(&sc->q,&bb)){
         long ti=bb.ti;
@@ -609,7 +612,7 @@ static void *compute_worker(void *arg){
             for(long z=0;z<MCC;++z)for(long y=0;y<MCC;++y)
                 memcpy(cbuf+((size_t)z*MCC+y)*MCC,
                        proc+((size_t)(az*MCC+z)*SB+(ay*MCC+y))*SB+ax*MCC, MCC);
-            if(mc_archive_append_chunk_raw(sc->arc,0,vz0/MCC+az,vy0/MCC+ay,vx0/MCC+ax,cbuf)!=0)
+            if(mc_archive_append_chunk_ctx(sc->arc,mctx,0,vz0/MCC+az,vy0/MCC+ay,vx0/MCC+ax,cbuf)!=0)
                 atomic_fetch_add(&sc->fail,1);
             else atomic_fetch_add(&sc->l0app,1);
         }
@@ -619,7 +622,7 @@ static void *compute_worker(void *arg){
             for(long z=0;z<MCC;++z)for(long y=0;y<MCC;++y)
                 memcpy(cbuf+((size_t)z*MCC+y)*MCC,
                        l1+((size_t)z*(SB/2)+(ay*MCC+y))*(SB/2)+ax*MCC, MCC);
-            if(mc_archive_append_chunk_raw(sc->arc,1,vz0/2/MCC,vy0/2/MCC+ay,vx0/2/MCC+ax,cbuf)!=0)
+            if(mc_archive_append_chunk_ctx(sc->arc,mctx,1,vz0/2/MCC,vy0/2/MCC+ay,vx0/2/MCC+ax,cbuf)!=0)
                 atomic_fetch_add(&sc->fail,1);
             else atomic_fetch_add(&sc->l1app,1);
         }
@@ -638,6 +641,7 @@ release:
         free(bb.chunks);
     }
     free(raw);free(proc);free(l1);free(cbuf);free(tin);free(tout);
+    mc_codec_ctx_free(mctx);
     return NULL;
 }
 
@@ -663,10 +667,13 @@ static void *stats_worker(void *arg){
 }
 
 /* coarse tail: level L from level L-1 via the archive itself */
-typedef struct { mc_archive *arc; int L; long ncz,ncy,ncx; atomic_long next, fail; } tailctx;
+typedef struct { mc_archive *arc; float quality; int L; long ncz,ncy,ncx; atomic_long next, fail; } tailctx;
 static void *tail_worker(void *arg){
     tailctx *t=arg;
     u8 *src=malloc((size_t)2*MCC*2*MCC*2*MCC), *dst=malloc((size_t)MCC*MCC*MCC);
+    mc_codec_ctx *mctx=mc_codec_ctx_new();
+    if(!mctx){ fprintf(stderr,"tail ctx alloc failed\n"); exit(1); }
+    mc_codec_ctx_set_quality(mctx,t->quality);
     long n=t->ncz*t->ncy*t->ncx;
     for(;;){
         long i=atomic_fetch_add(&t->next,1);
@@ -675,10 +682,11 @@ static void *tail_worker(void *arg){
         mc_archive_read_region(t->arc,t->L-1,cz*2L*MCC,cy*2L*MCC,cx*2L*MCC,
                                2*MCC,2*MCC,2*MCC,src,(size_t)2*MCC*2*MCC,(size_t)2*MCC,1);
         down2x(src,2*MCC,2*MCC,2*MCC,dst,MCC,MCC,MCC);
-        if(mc_archive_append_chunk_raw(t->arc,t->L,cz,cy,cx,dst)!=0)
+        if(mc_archive_append_chunk_ctx(t->arc,mctx,t->L,cz,cy,cx,dst)!=0)
             atomic_fetch_add(&t->fail,1);
     }
     free(src);free(dst);
+    mc_codec_ctx_free(mctx);
     return NULL;
 }
 
@@ -782,7 +790,7 @@ int main(int argc, char **argv){
     if(!arc){fprintf(stderr,"cannot open %s\n",out);return 1;}
     sched sc; memset(&sc,0,sizeof sc);
     sc.prog_fd=-1;
-    sc.z0=&z0; sc.cm=&cm; sc.cfg=&cfg; sc.process=process; sc.arc=arc;
+    sc.z0=&z0; sc.cm=&cm; sc.cfg=&cfg; sc.process=process; sc.arc=arc; sc.quality=quality;
     sc.SB=SB; sc.BAND=BAND; sc.halo=cfg.halo>0?cfg.halo:8;
     sc.px=((z0.sx+2*MCC-1)/(2*MCC))*(2*MCC);
     sc.py=((z0.sy+2*MCC-1)/(2*MCC))*(2*MCC);
@@ -875,7 +883,7 @@ int main(int argc, char **argv){
     for(int L=2;L<8;L++){
         long dz=(z0.sz>>L), dy=(z0.sy>>L), dx=(z0.sx>>L);
         if(dz<1&&dy<1&&dx<1) break;
-        tailctx t={arc,L,(dz+MCC-1)/MCC?:(long)1,(dy+MCC-1)/MCC?:(long)1,(dx+MCC-1)/MCC?:(long)1,0,0};
+        tailctx t={arc,quality,L,(dz+MCC-1)/MCC?:(long)1,(dy+MCC-1)/MCC?:(long)1,(dx+MCC-1)/MCC?:(long)1,0,0};
         long n=t.ncz*t.ncy*t.ncx;
         int tw=(int)(n<nc_?(n>0?n:1):nc_);
         pthread_t *tt=malloc(tw*sizeof *tt);
