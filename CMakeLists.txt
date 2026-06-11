@@ -79,14 +79,17 @@ add_custom_command(TARGET fysics-process POST_BUILD
 # Links the S3-enabled fysics lib + the vendored matter-compressor codec (callback-driven build).
 add_executable(mca_export
   tools/mca_export.c
-  vendor/matter/matter_compressor.c)
+  vendor/matter/matter_compressor.c
+  vendor/matter/c3d.c)
 target_include_directories(mca_export PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/vendor/matter)
 target_compile_options(mca_export PRIVATE ${FYSICS_OPT_FLAGS})
 set_source_files_properties(vendor/matter/matter_compressor.c
+                            vendor/matter/c3d.c
   PROPERTIES COMPILE_FLAGS "-std=c23")
 find_package(Threads REQUIRED)
-target_link_libraries(mca_export PRIVATE fysics CURL::libcurl m Threads::Threads)
+# zstd: mc_volume's zarr reader (inside the unified matter_compressor.c) decompresses zstd chunks
+target_link_libraries(mca_export PRIVATE fysics CURL::libcurl m Threads::Threads zstd)
 if(OpenMP_C_FOUND)
   target_link_libraries(mca_export PRIVATE OpenMP::OpenMP_C)
 endif()

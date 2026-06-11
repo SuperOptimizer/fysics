@@ -40,8 +40,47 @@ float mc_get_quality(void);
 // exceeds tau, so |orig - decoded| <= tau for all material voxels. 0 = off
 // (default). Corrections are self-contained in the block payload (the decoder
 // does not need to know tau). Encode-side cost: one extra inverse DCT per block.
+//
+// ARCHIVAL PRESET: quality 0.5 + tau 1 — every material voxel within +/-1
+// greylevel (below micro-CT reconstruction noise), air bit-exact. Measured on
+// real 2.4um scroll data: 2.9x ratio / 51.9 dB / SSIM 0.9996, vs 1.96x for
+// true lossless (zstd-19) — there is deliberately no lossless mode; the DCT
+// path is not bit-reversible and the entropy ceiling makes one pointless.
+// tau 2 -> 4.0x, tau 3 (q 1) -> 5.3x, all with p99 == max == tau.
 void  mc_set_max_error(int tau);
 int   mc_get_max_error(void);
+
+// Calibrated preset ladder: level L guarantees |err| <= 2^L on every material
+// voxel (air is always bit-exact) with the quality that maximizes ratio under
+// that bound — measured on real 2.4um scroll data (PHerc Paris 4, masked
+// 512^3; 18-point calibration in bench/RESULTS.md). Ratio ~doubles per level:
+//   level  tau  q     ratio  PSNR   SSIM    dec MB/s (1T)
+//   0 archival   1  0.5    2.9x  51.9  0.9996   33
+//   1 master     2  0.5    4.0x  48.6  0.9991   38
+//   2 high       4  1      6.6x  44.3  0.9975   56
+//   3 balanced   8  2.5   12.6x  39.5  0.9925  100
+//   4 streaming 16  6     28.5x  35.9  0.9823  165
+//   5 fast      32  16    57.5x  32.5  0.9609  241
+//   6 ultrafast 64  32    78.1x  30.4  0.9341  276
+//   7 preview  128  64    93.4x  28.2  0.8915  673
+// No tau 256 level: 256 exceeds the u8 range, the bound could never bind.
+typedef enum {
+    MC_PRESET_ARCHIVAL  = 0,   // tau   1
+    MC_PRESET_MASTER    = 1,   // tau   2
+    MC_PRESET_HIGH      = 2,   // tau   4
+    MC_PRESET_BALANCED  = 3,   // tau   8
+    MC_PRESET_STREAMING = 4,   // tau  16
+    MC_PRESET_FAST      = 5,   // tau  32
+    MC_PRESET_ULTRAFAST = 6,   // tau  64
+    MC_PRESET_PREVIEW   = 7,   // tau 128
+    MC_PRESET_COUNT     = 8,
+} mc_preset;
+// Sets mc_set_quality + mc_set_max_error; returns the level's quality (pass
+// it to the mc_archive_append_* calls, which take q explicitly).
+float       mc_apply_preset(mc_preset level);
+float       mc_preset_quality(mc_preset level);
+int         mc_preset_tau(mc_preset level);      // == 1 << level
+const char *mc_preset_name(mc_preset level);
 void  mc_codec_init(void);             // one-time: build the DCT tables
 // Override the trained context priors (q=1 / q=12 endpoint tables, u16[8][32]
 // each) — used by per-volume prior blobs. NULL,NULL restores the baked tables.
@@ -118,7 +157,10 @@ int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const
 typedef struct mc_archive mc_archive;
 
 // Per-chunk coverage (queried without decoding).
-typedef enum { MC_ABSENT = 0, MC_PRESENT = 1 } mc_cover;
+// Chunk coverage: ABSENT = never fetched (slot 0, must fetch from source);
+// PRESENT = has DCT data; ZERO = fetched and decodes to all-zero (air). The
+// ZERO state lets a re-run / prefetch skip air chunks instead of re-fetching.
+typedef enum { MC_ABSENT = 0, MC_PRESENT = 1, MC_ZERO = 2 } mc_cover;
 
 // Open (or create) an archive at `path` for a volume of edge `dim` (multiple of
 // MC_CHUNK_ALIGN=256) at the given `quality`. If the file exists and is a valid mc
@@ -421,6 +463,15 @@ void mc_cache_clear(mc_cache *c);
 typedef struct { uint64_t hits, misses, evictions; size_t slots, used; } mc_cache_stats;
 void mc_cache_get_stats(mc_cache *c, mc_cache_stats *out);
 
+// ---- runtime budget control ----
+// Resize the decoded-block cache budget live. DISCARDS resident blocks (a cache
+// loses nothing; they re-decode on demand). Returns the installed byte budget
+// (rounded to whole slots over the shards), or 0 on alloc failure (unchanged).
+size_t mc_cache_resize(mc_cache *c, size_t new_bytes);
+size_t mc_cache_capacity_bytes(const mc_cache *c);   // installed budget
+size_t mc_cache_used_bytes(mc_cache *c);             // resident decoded bytes
+double mc_cache_usage_fraction(mc_cache *c);         // used/cap in [0,1]
+
 // ---- ready-made source bindings ----
 struct mc_archive; struct mc_reader;
 // Bind to a local archive handle (lock-free concurrent decode).
@@ -432,5 +483,463 @@ mc_cache *mc_cache_new_archive(size_t bytes, struct mc_archive *a);
 mc_cache *mc_cache_new_reader(size_t bytes, struct mc_reader *r);
 
 
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ---------------------------------------------------------------------------
+// source: anything that can produce 16^3 blocks
+// ---------------------------------------------------------------------------
+// block() returns a pointer to the 4096-byte block at block coords
+// (bz,by,bx), in z-major (z*256 + y*16 + x) layout:
+//   - a stable pointer of its own (e.g. mc_cache arena), or
+//   - `tmp` after filling it (sources that must copy/decode), or
+//   - NULL for "no data here" (absent / pure air) — sampled as 0.
+// `tmp` is 4096 bytes of sampler-owned scratch, valid until the next
+// block() call on the same sampler. block() is called outside any lock the
+// sampler holds; it must tolerate out-of-range block coords (return NULL).
+typedef struct mc_sample_src mc_sample_src;
+struct mc_sample_src {
+    void *ud;                             // binding-private
+    int aux, aux2;                        // binding-private (lod, flags, ...)
+    const uint8_t *(*block)(const mc_sample_src *src,
+                            int bz, int by, int bx, uint8_t *tmp);
+    int nz, ny, nx;                       // voxel dims of the sampled level
+    // Optional direct path: when set, samplers address voxels straight off
+    // this base pointer (voxel (z,y,x) at dense[z*dsy + y*dsx + x]) and
+    // never call block(). mc_sample_src_dense sets it; blocked sources
+    // leave it NULL.
+    const uint8_t *dense;
+    size_t dsy, dsx;
+};
+
+// Ready-made sources:
+struct mc_cache;
+// mc_cache-backed (zero-copy arena pointers; decodes misses synchronously).
+// `lod` selects the level; pass that level's voxel dims.
+mc_sample_src mc_sample_src_cache(struct mc_cache *c, int lod,
+                                  int nz, int ny, int nx);
+// Dense C-order u8 array (no copies; blocks are synthesized in `tmp`).
+mc_sample_src mc_sample_src_dense(const uint8_t *vox, int nz, int ny, int nx);
+
+// ---------------------------------------------------------------------------
+// sampler
+// ---------------------------------------------------------------------------
+typedef struct mc_sampler mc_sampler;
+typedef enum { MC_FILTER_NEAREST = 0, MC_FILTER_TRILINEAR = 1 } mc_filter;
+
+mc_sampler *mc_sampler_new(const mc_sample_src *src);
+void        mc_sampler_free(mc_sampler *s);
+// Drop memoized block pointers (call when the source was invalidated, e.g.
+// after mc_cache_thaw/update cycles replaced chunks).
+void        mc_sampler_reset(mc_sampler *s);
+
+// One sample at (z,y,x). Out-of-bounds / NaN -> 0.
+float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f);
+
+// Batch: n points, zyx[i*3+{0,1,2}] = (z,y,x). Points with any coordinate
+// < 0 (volume-cartographer's invalid marker) or NaN write 0.
+void mc_sample_points(mc_sampler *s, const float *zyx, size_t n,
+                      mc_filter f, float *out);
+void mc_sample_points_u8(mc_sampler *s, const float *zyx, size_t n,
+                         mc_filter f, uint8_t *out);
+
+typedef enum {
+    MC_COMP_NONE   = 0,
+    MC_COMP_MIN    = 1,
+    MC_COMP_MEAN   = 2,
+    MC_COMP_MAX    = 3,
+    MC_COMP_ALPHA  = 4,
+    MC_COMP_STDDEV = 5,     // stddev of the samples along the ray: texture-
+                            // energy projection. Crackle/roughness reads
+                            // bright regardless of absolute density.
+    MC_COMP_SHADED = 6,     // emission-absorption ray march with gradient
+                            // lighting (see the shaded params below)
+} mc_comp;
+
+typedef struct {
+    mc_filter filter;       // MC_FILTER_NEAREST / MC_FILTER_TRILINEAR
+    mc_comp   comp;         // reduction along the normal
+    float t0, t1;           // composite range along the normal, in voxels
+    float dt;               // step (<= 0 -> 1.0)
+    float alpha_min;        // ALPHA/SHADED: value threshold in [0,1)
+    float alpha_opacity;    // ALPHA/SHADED: per-sample opacity scale (0,1]
+
+    // -- MC_COMP_SHADED only (ignored by the other modes) --------------------
+    // Front-to-back emission-absorption: per step, density d = clamped
+    // (v/255 - alpha_min)/(1 - alpha_min) * alpha_opacity gives extinction
+    // sigma = absorption * d, opacity a = 1 - exp(-sigma * dt) (Beer-Lambert).
+    // Contributing samples are lit from the local gradient normal (central
+    // differences): two-sided Lambertian diffuse + Blinn-Phong specular,
+    // blended by surface-ness w = |g|^2 / (|g|^2 + grad_g0^2) so smooth
+    // interior emits unshaded instead of sparkling. When shadow or sss is
+    // set, a coarse secondary march toward the light accumulates optical
+    // depth tau: shadow scales the direct light by exp(-tau), sss adds
+    // back-lit translucency exp(-0.3*tau) ("glow through thin material").
+    // All zero-value fields take the defaults noted below; a zero-initialized
+    // struct renders a sane headlight relief view.
+    float light[3];         // direction TOWARD the light, (z,y,x) volume
+                            // coords; (0,0,0) -> headlight (along -normal).
+                            // Tilt it for raking light: relief pops hardest.
+    float ambient;          // ambient weight             (0 -> 0.25)
+    float diffuse;          // diffuse weight             (0 -> 0.75)
+    float specular;         // Blinn-Phong weight         (0 -> 0.20)
+    float shininess;        // specular exponent          (0 -> 24)
+    float absorption;       // extinction per unit density per voxel (0 -> 1.0)
+    float shadow;           // shadow strength [0,1]      (0 = no shadow rays)
+    float sss;              // translucency weight        (0 = off)
+    float grad_g0;          // gradient magnitude (u8/voxel) at half
+                            // surface-ness               (0 -> 8)
+} mc_render_params;
+
+// ---------------------------------------------------------------------------
+// core: dense point grid -> image
+// ---------------------------------------------------------------------------
+// pts: W*H*3 floats, (z,y,x) per pixel. normals: W*H*3 unit (z,y,x) or NULL
+// (required when comp != MC_COMP_NONE). A point with any coordinate < 0 or
+// NaN renders 0 (volume-cartographer's invalid marker). out: W*H bytes.
+void mc_render_points(mc_sampler *s,
+                      const float *pts, const float *normals,
+                      int w, int h, const mc_render_params *p, uint8_t *out);
+
+// Parallel variant: same image, row bands across `nthreads` workers
+// (0 -> one per core, capped at 16). Creates one sampler per worker over
+// `src` (mc_sampler is single-threaded); src->block must be thread-safe
+// (mc_cache is; a dense array trivially is).
+void mc_render_points_par(const mc_sample_src *src,
+                          const float *pts, const float *normals,
+                          int w, int h, const mc_render_params *p,
+                          uint8_t *out, int nthreads);
+
+// ---------------------------------------------------------------------------
+// plane surface (volume-cartographer PlaneSurface)
+// ---------------------------------------------------------------------------
+// A plane through `origin` with unit `normal`; `u` and `v` are the in-plane
+// pixel axes. mc_plane_basis() builds an arbitrary stable (u,v) orthonormal
+// pair from `normal` when you have no preferred orientation.
+typedef struct {
+    float origin[3];        // (z,y,x)
+    float normal[3];        // unit (z,y,x)
+    float u[3], v[3];       // unit in-plane axes: image x steps u, y steps v
+} mc_plane;
+
+void mc_plane_basis(mc_plane *pl);
+
+// Generate the W*H point grid (and constant normals, if non-NULL) for the
+// image whose pixel (i,j) sits at origin + (j - w/2)*scale*u +
+// (i - h/2)*scale*v. `scale` = voxels per pixel (1 = native).
+void mc_plane_gen(const mc_plane *pl, int w, int h, float scale,
+                  float *pts, float *normals);
+
+// ---------------------------------------------------------------------------
+// quad surface (volume-cartographer QuadSurface)
+// ---------------------------------------------------------------------------
+// A control grid of gw*gh 3D points (z,y,x), row-major, VC's invalid marker
+// (-1,-1,-1) honored. Rendering bilinearly interpolates the control grid to
+// the output resolution and derives per-pixel normals from the grid
+// tangents (du x dv, normalized) — VC's gen() contract.
+typedef struct {
+    const float *grid;      // gw*gh*3 (z,y,x)
+    int gw, gh;
+} mc_quad;
+
+// Generate a W*H point grid (+ normals, if non-NULL) sampling the control
+// grid over the rect [x0, x0+w*step) x [y0, y0+h*step) in grid units
+// (step = grid cells per pixel; 1 renders the grid at native density;
+// VC's render scale = 1/step). Pixels mapping outside the grid or onto
+// invalid control points emit invalid (-1,-1,-1) points.
+void mc_quad_gen(const mc_quad *q, float x0, float y0, float step,
+                 int w, int h, float *pts, float *normals);
+
+// ---------------------------------------------------------------------------
+// one-call conveniences (gen + parallel render, scratch managed internally)
+// ---------------------------------------------------------------------------
+int mc_render_plane(const mc_sample_src *src, const mc_plane *pl,
+                    int w, int h, float scale,
+                    const mc_render_params *p, uint8_t *out, int nthreads);
+int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
+                   float x0, float y0, float step, int w, int h,
+                   const mc_render_params *p, uint8_t *out, int nthreads);
+
+// ---------------------------------------------------------------------------
+// LOD-matched rendering
+// ---------------------------------------------------------------------------
+// Zoomed-out views shouldn't sample the finest level: at `vox_per_pixel`
+// voxels per output pixel, level floor(log2(vox_per_pixel)) carries all the
+// information the image can show, with 8x fewer voxels per level. Geometry
+// stays in LOD-0 voxel space; the renderer picks the level, remaps
+// coordinates (half-voxel-center correct: c_L = (c_0 + 0.5)/2^L - 0.5) and
+// scales the composite range so the slab covers the same physical depth,
+// stepped at the sampled level's voxel pitch.
+typedef struct {
+    mc_sample_src lods[8];      // [0] = finest; dims halve per level
+    int nlods;
+} mc_sample_lods;
+
+// ---------------------------------------------------------------------------
+// 3D resampling (surface-aligned volumes)
+// ---------------------------------------------------------------------------
+// Composite rendering's ray walk without the reduction: keep every sample.
+//
+// mc_sample_quad_volume samples a w*h*nlayers u8 volume over the quad's
+// parameterization — pixel (i,j) of layer k samples P(i,j) + (t0 + k*dt) *
+// N(i,j), i.e. the "flattened surface volume" ink-detection models consume.
+// out is layer-major: out[k*w*h + i*w + j]. Invalid surface points write 0
+// through all layers.
+int mc_sample_quad_volume(const mc_sample_src *src, const mc_quad *q,
+                          float x0, float y0, float step, int w, int h,
+                          float t0, float dt, int nlayers,
+                          mc_filter f, uint8_t *out, int nthreads);
+
+// Oriented-box resample: out voxel (k,i,j) samples origin + j*du + i*dv +
+// k*dw (axes in voxels; need not be unit or orthogonal). out[k*w*h + i*w + j].
+// The surface-normal-aligned ML crop primitive; with unit axes and integer
+// origin it degenerates to a plain copy.
+int mc_sample_box(const mc_sample_src *src,
+                  const float origin[3], const float du[3],
+                  const float dv[3], const float dw[3],
+                  int w, int h, int d,
+                  mc_filter f, uint8_t *out, int nthreads);
+
+// floor(log2(vox_per_pixel)) clamped to [0, nlods-1]; <2 vox/px -> 0.
+int mc_render_pick_lod(const mc_sample_lods *ls, float vox_per_pixel);
+
+// Mean LOD-0 voxel spacing of one rendered pixel step across the quad's
+// control grid (sparse probe; multiply by your render step).
+float mc_quad_spacing(const mc_quad *q);
+
+// As mc_render_plane / mc_render_quad, but sampling the LOD matched to
+// the render scale (plane: vox/px = scale; quad: step * mc_quad_spacing).
+int mc_render_plane_lod(const mc_sample_lods *ls, const mc_plane *pl,
+                        int w, int h, float scale,
+                        const mc_render_params *p, uint8_t *out, int nthreads);
+int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
+                       float x0, float y0, float step, int w, int h,
+                       const mc_render_params *p, uint8_t *out, int nthreads);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ===========================================================================
+// mc_zarr — standalone zarr reader (v3-sharded-c3d + v2-flat)
+// ===========================================================================
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct mc_zarr mc_zarr;
+
+// Byte source. `key` is an object key relative to the level root (e.g. "c/3/0/1"
+// for a shard, or "zarr.json"). [off,off+len) is the requested byte range; len 0
+// means the whole object. On success store a malloc'd buffer in *out (caller-owned,
+// freed with free()) and its length in *out_len, return 0. Return <0 on transport
+// error, and set *out_len to 0 with *out NULL for a 404 / absent object.
+typedef int (*mc_zarr_read_fn)(void *ud, const char *key,
+                               uint64_t off, uint64_t len,
+                               uint8_t **out, size_t *out_len);
+
+// Open a level. `read`/`ud` is the byte source; the level's "zarr.json" is fetched
+// through it. Returns NULL on parse/transport failure.
+mc_zarr *mc_zarr_open(mc_zarr_read_fn read, void *ud);
+void     mc_zarr_free(mc_zarr *z);
+
+// Geometry (voxels / edges).
+void mc_zarr_shape(const mc_zarr *z, int *nz, int *ny, int *nx);
+int  mc_zarr_inner_edge(const mc_zarr *z);          // e.g. 256
+int  mc_zarr_shard_edge(const mc_zarr *z);          // e.g. 4096
+// inner codec the caller must apply to bytes from mc_zarr_read_*: "c3d" means
+// RAW c3d (caller decodes); "blosc"/"raw" mean already-dense u8 (mc_zarr decoded).
+const char *mc_zarr_inner_codec(const mc_zarr *z);
+// inner chunks per axis across the whole level (ceil(shape/inner_edge)).
+void mc_zarr_inner_grid(const mc_zarr *z, int *nz, int *ny, int *nx);
+
+// Is the shard containing global inner chunk (cz,cy,cx) entirely air? Reads only
+// the shard's index footer (one small ranged read). 1 yes, 0 no, -1 unknown/error.
+int mc_zarr_shard_all_air(mc_zarr *z, int cz, int cy, int cx);
+
+// Fetch one shard (one GET of the whole object) and hand each PRESENT inner chunk
+// to `sink` as its RAW (still-compressed) bytes. (cz,cy,cx) is any global inner
+// chunk in the target shard. Absent inner chunks are skipped. 0 ok, <0 error.
+typedef void (*mc_zarr_chunk_fn)(void *ud, int cz, int cy, int cx,
+                                 const uint8_t *raw, size_t raw_len);
+int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
+                       mc_zarr_chunk_fn sink, void *sink_ud);
+
+// Fetch a single inner chunk's RAW bytes (interactive cold path). Two ranged
+// reads: the shard index footer, then the chunk payload. On success store a
+// malloc'd buffer in *raw (caller frees) and length in *len, return 0. Returns
+// 1 if the chunk is absent (air) with *raw NULL. <0 on error.
+int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx,
+                       uint8_t **raw, size_t *len);
+
+// Locate one inner chunk WITHOUT fetching: fills its object key + byte range
+// (off/nb) from the cached shard footer, so a caller can batch many chunks'
+// ranged GETs into one request. 0 found, 1 absent/air, <0 error. v2 -> off=nb=0.
+int mc_zarr_chunk_locate(mc_zarr *z, int cz, int cy, int cx,
+                         char key_out[64], uint64_t *off, uint64_t *nb);
+
+// One present inner chunk of a shard: global coords + its byte range in the
+// shard object. (v2: off/len describe the standalone chunk object, range from 0.)
+typedef struct {
+    int cz, cy, cx;       // global inner-chunk coords
+    uint64_t off, len;    // payload byte range within the shard object's key
+} mc_zarr_range;
+
+// Read a shard's index footer (ONE ranged read) and return the byte ranges of
+// every PRESENT inner chunk, plus the shard object key (for batched GETs). The
+// caller fetches the payloads however it likes (e.g. a parallel s3 batch), then
+// decodes. `key` is filled with the shard object key (relative to the level).
+// On success *out is a malloc'd array of *n entries (caller frees), return 0.
+// All-air / absent shard -> *n = 0, *out NULL, return 0. <0 on error.
+// (v2: returns the single chunk's key + {off=0,len=0-means-whole-object}.)
+int mc_zarr_shard_index(mc_zarr *z, int cz, int cy, int cx,
+                        char key_out[64], mc_zarr_range **out, int *n);
+
+#ifdef __cplusplus
+}
+#endif
+
+// ===========================================================================
+// mc_s3 — s3://-backed mc_reader glue (libs3)
+// ===========================================================================
+typedef struct mc_s3 mc_s3;
+
+// Open an archive at `url` (s3://bucket/key or https://...). Returns NULL on
+// any failure (unreachable, not an mc archive). The handle owns the HTTP
+// client and the mc_reader.
+mc_s3 *mc_s3_open(const char *url);
+// The reader for all decode calls (mc_chunk_offset / mc_decode_block / ...).
+mc_reader *mc_s3_reader(mc_s3 *s);
+void mc_s3_close(mc_s3 *s);
+
+// ===========================================================================
+// mc_volume — remote volume as a local .mca: stream/transcode/cache/prefetch
+// ===========================================================================
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct mc_volume mc_volume;
+
+// Open a remote (s3/https) OR local (filesystem path) NGFF multiscales zarr
+// rooted at `url`/path; levels are its "0","1",... arrays. `cache_dir` holds the
+// local <name>.mca; `cache_bytes` is the resident mc_cache budget; `quality` is
+// the local re-encode q. Returns NULL on failure. Uses default tuning (see
+// mc_volume_config); call mc_volume_open_ex to tune.
+mc_volume *mc_volume_open(const char *url, const char *cache_dir,
+                          size_t cache_bytes, float quality);
+
+// Streaming-pipeline tuning. Any field left 0 takes the built-in default. These
+// size open-time resources (thread pools + queues), so they apply at open only.
+//   decoders      : decode-pool threads. Default nproc/2 (decode is memory-
+//                   bandwidth-bound; more thrashes the bus, see commit history).
+//   dl_threads    : download threads (each drains a batch -> one s3_get_batch).
+//                   Default 8.
+//   staging_bytes : RAM budget (bytes) for the staging queue of downloaded-but-
+//                   not-yet-decoded compressed chunks. Download blocks only when
+//                   this is exceeded, so the network saturates ahead of the
+//                   CPU-bound decode pool. Default 2 GB. Runtime-settable via
+//                   mc_volume_set_staging_bytes.
+//   request_stack : depth of the LIFO download-request stack (8-byte region
+//                   keys). Default 65536.
+typedef struct {
+    int    decoders;
+    int    dl_threads;
+    size_t staging_bytes;
+    int    request_stack;
+} mc_volume_config;
+
+// As mc_volume_open, with explicit pipeline tuning. `cfg` may be NULL (all
+// defaults). Fields set to 0 also take their default.
+mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
+                             size_t cache_bytes, float quality,
+                             const mc_volume_config *cfg);
+void       mc_volume_free(mc_volume *v);
+
+int  mc_volume_nlods(const mc_volume *v);
+void mc_volume_shape(const mc_volume *v, int lod, int *nz, int *ny, int *nx);
+// block (16^3) grid extent of a level.
+void mc_volume_block_grid(const mc_volume *v, int lod, int *nz, int *ny, int *nx);
+
+// Per-level source metadata for a client that wants to describe the volume
+// without re-reading the zarr (shape in voxels z,y,x; inner_edge = the source
+// inner-chunk edge / render chunk size, e.g. 256 for c3d; shard_edge = the
+// storage chunk edge, e.g. 4096). dtype is always u8 and fill is 0 on the .mca
+// path. Returns 0 on success, <0 if lod is out of range.
+typedef struct {
+    int shape[3];        // voxels (z,y,x)
+    int inner_edge;      // source inner-chunk edge (render chunk), e.g. 256
+    int shard_edge;      // storage chunk edge, e.g. 4096
+    char codec[16];      // "c3d" | "blosc" | "raw"
+} mc_volume_level_meta;
+int mc_volume_get_level_meta(const mc_volume *v, int lod, mc_volume_level_meta *out);
+
+// Serve one 16^3 block (block coords) of `lod` into `dst` (4096 bytes).
+//   present -> decode from mc_cache (sync), return 1.
+//   absent  -> kick one deduped background region transcode, zero `dst`,
+//              return 0 (caller falls back to a coarser LOD).
+int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst4096);
+
+// Blocking variant (batch/CLI): transcode the enclosing region if absent, then
+// decode. Returns 1 on data, 0 on air, <0 on error.
+int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst4096);
+
+// Prefetch: download a whole source shard (one GET) and transcode every present
+// inner chunk into the .mca. Air shards skipped via the index probe.
+void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx);
+// Walk a level shard-by-shard with `nthreads` workers; *cancel (if non-NULL) is
+// polled to abort early.
+void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel);
+
+// Register a callback fired (from a worker thread) each time a background
+// transcode completes a region — lets an interactive client schedule a repaint.
+// `cb` must be cheap and thread-safe (e.g. set a flag / post to the UI loop).
+typedef void (*mc_volume_ready_fn)(void *ud);
+void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud);
+
+// Sampling source over one level (see mc_sample.h / mc_render.h).
+// blocking=0: try_block semantics — absent regions sample as 0 and kick one
+//             deduped background transcode (interactive render path).
+// blocking=1: absent regions are transcoded synchronously first (batch path).
+mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking);
+// All levels at once, for LOD-matched rendering (mc_render_plane_lod /
+// mc_render_quad_lod pick the level from the render scale).
+mc_sample_lods mc_volume_sample_lods(mc_volume *v, int blocking);
+
+typedef struct {
+    uint64_t cache_hits, cache_misses;   // mc_cache residency
+    uint64_t cache_used_blocks;          // decoded 16^3 blocks resident now
+    uint64_t cache_cap_blocks;           // decoded-block capacity (budget/4096)
+    uint64_t disk_bytes;                 // .mca append cursor
+    uint64_t net_bytes;                  // bytes pulled from the source
+    uint64_t regions_inflight;           // single-flight depth right now
+} mc_volume_stats;
+void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
+
+// Live-resize the decoded-block RAM cache (bytes). Discards resident blocks;
+// they re-decode on demand. Returns the installed budget, or 0 on failure.
+size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes);
+
+// Live-set the staging-queue RAM budget (bytes): how far downloaded-but-not-yet-
+// decoded compressed chunks may run ahead of the decode pool before download
+// threads block. Bigger = network saturates further ahead of CPU-bound decode.
+// Default 2 GB. Returns the installed budget.
+size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes);
+
+#ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // MATTER_COMPRESSOR_H

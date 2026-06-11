@@ -1,3 +1,6 @@
+#define _GNU_SOURCE                  // pthread_setname_np (linux)
+#include <pthread.h>
+#include <stdatomic.h>
 // ============================================================================
 // matter_compressor.c — single-file implementation: codec + archive + cache.
 // Unified from mc_dct.h / mc_rangecoder.h / mc_xxhash.h / mc_codec.c /
@@ -530,7 +533,10 @@ static rc_u32 dec_magnitude(rc_dec*d,atom_ctx*ac){
 }
 
 // per-size ascending-L1-frequency scan tables, built lazily (indexed by log2 S).
-static uint16_t *g_scanS[6]; static int g_scanS_ready[6];
+// Build is serialized: concurrent encode workers used to race the ready flag,
+// double-build, and leak the losing table (caught by LeakSanitizer).
+static uint16_t *g_scanS[6]; static _Atomic int g_scanS_ready[6];
+static pthread_mutex_t g_scanS_mu = PTHREAD_MUTEX_INITIALIZER;
 static int scanS_cmp_S;
 static int scanS_cmp(const void*pa,const void*pb){
     rc_u32 a=*(const rc_u32*)pa,b=*(const rc_u32*)pb; int S=scanS_cmp_S;
@@ -539,11 +545,18 @@ static int scanS_cmp(const void*pa,const void*pb){
 }
 static void scanS_build(int S){
     int l=0,t=S; while(t>1){t>>=1;l++;}
-    if(g_scanS_ready[l]) return;
-    int n=S*S*S; rc_u32 *ord=malloc(n*sizeof(rc_u32)); for(int i=0;i<n;++i)ord[i]=i;
-    scanS_cmp_S=S; qsort(ord,n,sizeof(rc_u32),scanS_cmp);
-    g_scanS[l]=malloc(n*sizeof(uint16_t)); for(int i=0;i<n;++i)g_scanS[l][i]=(uint16_t)ord[i];
-    free(ord); g_scanS_ready[l]=1;
+    if(atomic_load_explicit(&g_scanS_ready[l],memory_order_acquire)) return;
+    pthread_mutex_lock(&g_scanS_mu);
+    if(!atomic_load_explicit(&g_scanS_ready[l],memory_order_relaxed)){
+        int n=S*S*S; rc_u32 *ord=malloc(n*sizeof(rc_u32)); for(int i=0;i<n;++i)ord[i]=i;
+        scanS_cmp_S=S; qsort(ord,n,sizeof(rc_u32),scanS_cmp);
+        uint16_t *tab=malloc(n*sizeof(uint16_t));
+        for(int i=0;i<n;++i)tab[i]=(uint16_t)ord[i];
+        free(ord);
+        g_scanS[l]=tab;
+        atomic_store_explicit(&g_scanS_ready[l],1,memory_order_release);
+    }
+    pthread_mutex_unlock(&g_scanS_mu);
 }
 static inline int band_of_S(rc_u32 idx,int S){
     rc_u32 cz=idx/(S*S),cy=(idx/S)%S,cx=idx%S, freq=cz+cy+cx;
@@ -705,6 +718,36 @@ static void step_tab_build(void);
 void  mc_set_quality(float q){ g_quality = q; step_tab_build(); }
 float mc_get_quality(void){ return g_quality; }
 void  mc_set_max_error(int tau){ g_max_err = tau<0?0:tau; }
+
+// ---- calibrated preset ladder (see header; bench/RESULTS.md for the data) --
+static const struct { float q; int tau; const char *name; } g_presets[8] = {
+    { 0.5f,   1, "archival"  },
+    { 0.5f,   2, "master"    },
+    { 1.0f,   4, "high"      },
+    { 2.5f,   8, "balanced"  },
+    { 6.0f,  16, "streaming" },
+    {16.0f,  32, "fast"      },
+    {32.0f,  64, "ultrafast" },
+    {64.0f, 128, "preview"   },
+};
+float mc_preset_quality(mc_preset p){
+    if((unsigned)p>=MC_PRESET_COUNT) p=MC_PRESET_STREAMING;
+    return g_presets[p].q;
+}
+int mc_preset_tau(mc_preset p){
+    if((unsigned)p>=MC_PRESET_COUNT) p=MC_PRESET_STREAMING;
+    return g_presets[p].tau;
+}
+const char *mc_preset_name(mc_preset p){
+    if((unsigned)p>=MC_PRESET_COUNT) return "?";
+    return g_presets[p].name;
+}
+float mc_apply_preset(mc_preset p){
+    if((unsigned)p>=MC_PRESET_COUNT) p=MC_PRESET_STREAMING;
+    mc_set_quality(g_presets[p].q);
+    mc_set_max_error(g_presets[p].tau);
+    return g_presets[p].q;
+}
 int   mc_get_max_error(void){ return g_max_err; }
 void  mc_codec_init(void){ mc_dct_init(); }
 void  mc_codec_set_priors(const uint16_t *plo, const uint16_t *phi){ rc_set_priors(plo,phi); }
@@ -950,6 +993,14 @@ int mc_enc_block(const mc_u8 *vox, mc_buf *out, uint32_t *len_out){
     // 1126163 -> 1126019 bytes (-0.013%), material max-abs-diff unchanged
     // (41), air voxels still decode to exactly 0.
     if(nair>0){
+        // CROSS-ISA DETERMINISM: the floats computed here feed the DCT, so
+        // they must round identically on every target. The build is strict
+        // IEEE (no -ffast-math — see CMakeLists); under fast-math the
+        // per-target reassociation/reciprocal choices in these loops broke
+        // bitstream identity (caught by CI), for zero measured speedup.
+#if defined(__clang__)
+#pragma clang fp reassociate(off) contract(off)
+#endif
         const int S=MC_BLK;
         // (b) skip the fine SOR sweeps on nearly-pure blocks (<5% or >95% air):
         // the coarse 4^3 seed already lands within quantization noise there
@@ -1333,6 +1384,10 @@ static uint64_t mc_resolve_chunk(const uint8_t*arc, uint64_t root_off,int cz,int
 // fmap+bitmap+lens+payloads; fmap = rc-coded per-block material fractions
 // (4096 nibbles, 0..15 ~= 0..100%) for rejection-free ML sampling.
 #define MC_BLOB_HDR 14
+// Slot sentinel: a chunk that was VISITED and decodes to all-zero (air). Real
+// blob offsets are always >= MC_HDR (blobs append after the header), so 1 is a
+// safe sentinel. Distinguishes "air, fetched" from "never fetched" (slot 0).
+#define MC_SLOT_ZERO 1ull
 static inline float mc_chunk_q(const uint8_t*arc, uint64_t chunk_off){
     float q; memcpy(&q,arc+chunk_off,4); return q;
 }
@@ -1727,6 +1782,15 @@ static uint64_t w_ensure_shard_slot(mc_archive *w, int lod, int cz,int cy,int cx
 }
 
 // append a finished compressed blob at EOF + publish it in the shard slot (commit word).
+// Mark a chunk's slot as VISITED-but-all-zero (air). Lets a re-run / prefetch
+// tell "fetched, it was air" from "never fetched" — no blob is written.
+static int w_mark_zero(mc_archive *w,int lod,int cz,int cy,int cx){
+    uint64_t slot = w_ensure_shard_slot(w,lod,cz,cy,cx);
+    if(slot==~0ull) return -1;
+    w_write_u64(w, slot, MC_SLOT_ZERO);
+    return 0;
+}
+
 static int w_install_blob(mc_archive *w,int lod,int cz,int cy,int cx,const u8 *blob,size_t len){
     uint64_t slot = w_ensure_shard_slot(w,lod,cz,cy,cx);
     if(slot==~0ull) return -1;
@@ -1831,7 +1895,7 @@ int mc_archive_append_chunk_raw_q(mc_archive *a, int lod, int cz,int cy,int cx,
     size_t blen = encode_chunk_blob(vox, stage_put, &st);
     int rc = 0;
     if(blen) rc = w_install_blob(a,lod,cz,cy,cx,st.p,st.len);
-    // all-air chunk (blen==0): no blob, slot stays absent (decodes to zero). rc stays 0.
+    else     rc = w_mark_zero(a,lod,cz,cy,cx);   // air, but record it as VISITED
     free(st.p);
     return rc;
 }
@@ -1900,7 +1964,10 @@ uint64_t mc_archive_data_len(mc_archive *a){
 mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx){
     if(!a||lod<0||lod>7) return MC_ABSENT;
     uint64_t root = w_read_u64(a, MCH_ROOTOFF+(uint64_t)lod*8);
-    return mc_resolve_chunk(a->base, root, cz,cy,cx) ? MC_PRESENT : MC_ABSENT;
+    uint64_t off = mc_resolve_chunk(a->base, root, cz,cy,cx);
+    if(off==0) return MC_ABSENT;
+    if(off==MC_SLOT_ZERO) return MC_ZERO;
+    return MC_PRESENT;
 }
 
 uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
@@ -1917,7 +1984,7 @@ uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
 // publish via a release fence so a resolved chunk_off always points at fully-written
 // bytes.
 void mc_archive_decode_block(mc_archive *a, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
-    if(!a||!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    if(!a||chunk_off<=MC_SLOT_ZERO){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     mc_set_quality(mc_chunk_q(a->base,chunk_off));   // thread-local; per-chunk q
     uint64_t boff; uint32_t bl;
     if(!mc_block_range(a->base,chunk_off,bz,by,bx,&boff,&bl)){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
@@ -1957,7 +2024,7 @@ static int auto_threads(int nthreads){
 }
 void mc_archive_decode_chunk(mc_archive *a, uint64_t chunk_off, mc_u8 *out, int nthreads){
     if(!a||!out) return;
-    if(!chunk_off){ memset(out,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK); return; }
+    if(chunk_off<=MC_SLOT_ZERO){ memset(out,0,(size_t)MC_CHUNK*MC_CHUNK*MC_CHUNK); return; }
     dchunk_ctx c={.a=a,.chunk_off=chunk_off,.out=out,.q=mc_chunk_q(a->base,chunk_off)};
     atomic_store(&c.next,0);
     int nt=auto_threads(nthreads);
@@ -2049,7 +2116,7 @@ int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
 int mc_archive_block_present(mc_archive *a, int lod, int bz, int by, int bx){
     if(!a||lod<0||lod>7||bz<0||by<0||bx<0) return 0;
     uint64_t co=mc_archive_chunk_offset(a,lod,bz>>4,by>>4,bx>>4);
-    if(!co) return 0;
+    if(co<=MC_SLOT_ZERO) return 0;
     const u8 *bm=a->base+co+MC_BLOB_HDR+mc_chunk_fmaplen(a->base,co);
     return mc_bit_get(bm,((bz&15)*16+(by&15))*16+(bx&15));
 }
@@ -2057,7 +2124,7 @@ int mc_archive_block_present(mc_archive *a, int lod, int bz, int by, int bx){
 float mc_archive_block_fraction(mc_archive *a, int lod, int bz, int by, int bx){
     if(!a||lod<0||lod>7||bz<0||by<0||bx<0) return 0.0f;
     uint64_t co=mc_archive_chunk_offset(a,lod,bz>>4,by>>4,bx>>4);
-    if(!co) return 0.0f;
+    if(co<=MC_SLOT_ZERO) return 0.0f;
     static _Thread_local uint8_t fr[MC_GRID3];
     static _Thread_local uint64_t fr_key=~0ull;
     if(fr_key!=co){
@@ -2231,7 +2298,7 @@ long mc_verify_archive(const uint8_t *arc, size_t len, int verbose){
                 if(!shard) continue;
                 for(int n0=0;n0<MC_GRID3;++n0){
                     uint64_t co; memcpy(&co,arc+shard+(size_t)n0*8,8);
-                    if(!co) continue;
+                    if(co<=MC_SLOT_ZERO) continue;
                     total++;
                     uint64_t blen=mc_chunk_blob_len(arc,co);
                     uint64_t want=mc_chunk_stored_hash(arc,co);
@@ -2462,7 +2529,7 @@ static int spartial_decode(mc_reader *r, uint64_t chunk_off, int bi, mc_u8 *dst)
 }
 
 void mc_decode_block(mc_reader *r, uint64_t chunk_off, int bz,int by,int bx, mc_u8 *dst){
-    if(!chunk_off){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
+    if(chunk_off<=MC_SLOT_ZERO){ memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return; }
     if(!r->arc && r->partial){
         if(spartial_decode(r,chunk_off,(bz*16+by)*16+bx,dst)==0) return;
         memset(dst,0,MC_BLK*MC_BLK*MC_BLK); return;
@@ -2605,14 +2672,39 @@ mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
 }
 void mc_cache_set_policy(mc_cache *c, mc_cache_policy p){ if(c) c->policy=(int)p; }
 
+// free a shard's lookup/eviction tables (NOT its mutex, NOT the shared arena).
+static void shard_free_tables(shard_t *sh){
+    free(sh->map_key); free(sh->map_slot); free(sh->slot_key); free(sh->slot_ref);
+    free(sh->fs); free(sh->fm); free(sh->gfp); free(sh->gset); free(sh->slot_inmain);
+    free(sh->slot_epoch);
+}
+
+// (re)allocate a shard's tables for `per` slots pointing at `arena_slice`.
+// Resets the shard to empty. Mutex assumed already init'd + held during resize.
+static void shard_init_tables(shard_t *sh, mc_u8 *arena_slice, uint32_t per){
+    sh->nslot=per; sh->hand=0; sh->used=0;
+    sh->arena=arena_slice;
+    sh->map_cap=pow2_at_least(per*2);
+    sh->map_key=calloc(sh->map_cap,8);
+    sh->map_slot=calloc(sh->map_cap,4);
+    sh->slot_key=calloc(per,8);
+    sh->slot_ref=calloc(per,1);
+    sh->fs_cap=per+1; sh->fm_cap=per+1;
+    sh->fs=malloc(4u*sh->fs_cap); sh->fm=malloc(4u*sh->fm_cap);
+    sh->fs_head=sh->fs_tail=sh->fm_head=sh->fm_tail=0;
+    sh->g_cap=per; sh->gfp=calloc(sh->g_cap,4);
+    sh->gset_cap=pow2_at_least(per*2); sh->gset=malloc(4u*sh->gset_cap);
+    memset(sh->gset,0xFF,4u*sh->gset_cap);
+    sh->slot_inmain=calloc(per,1);
+    sh->slot_epoch=calloc(per,4);
+}
+
 void mc_cache_free(mc_cache *c){
     if(!c) return;
     for(int s=0;s<NSHARD;++s){
         shard_t *sh=&c->sh[s];
         pthread_mutex_destroy(&sh->mu);
-        free(sh->map_key); free(sh->map_slot); free(sh->slot_key); free(sh->slot_ref);
-        free(sh->fs); free(sh->fm); free(sh->gfp); free(sh->gset); free(sh->slot_inmain);
-        free(sh->slot_epoch);
+        shard_free_tables(sh);
     }
 #if MC_CACHE_MMAP
     munmap(c->arena_base,c->arena_bytes);
@@ -2621,6 +2713,59 @@ void mc_cache_free(mc_cache *c){
 #endif
     pthread_mutex_destroy(&c->rd_mu);
     free(c);
+}
+
+// ---- runtime budget control -------------------------------------------------
+// Live-resize the decoded-block cache to `new_bytes`. The cache is just a cache,
+// so resizing DISCARDS resident blocks (re-decode on demand) rather than
+// migrating them. Locks every shard for the swap. Returns the byte budget
+// actually installed (rounded to whole slots over NSHARD), or 0 on failure.
+size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
+    if(!c) return 0;
+    size_t nslot_total = new_bytes/BLK_BYTES; if(nslot_total<NSHARD) nslot_total=NSHARD;
+    uint32_t per = (uint32_t)(nslot_total/NSHARD); if(per<1)per=1;
+    size_t new_arena = (size_t)per*NSHARD*BLK_BYTES;
+#if MC_CACHE_MMAP
+    void *na = mmap(NULL,new_arena,PROT_READ|PROT_WRITE,
+                    MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+    if(na==MAP_FAILED) return 0;
+#else
+    void *na = malloc(new_arena);
+    if(!na) return 0;
+#endif
+    for(int s=0;s<NSHARD;++s) pthread_mutex_lock(&c->sh[s].mu);
+    for(int s=0;s<NSHARD;++s){
+        shard_free_tables(&c->sh[s]);
+        shard_init_tables(&c->sh[s], (mc_u8*)na + (size_t)s*per*BLK_BYTES, per);
+    }
+    void *old = c->arena_base; size_t old_bytes = c->arena_bytes;
+    c->arena_base = na; c->arena_bytes = new_arena;
+    atomic_fetch_add(&c->epoch,1);   // invalidate outstanding pins
+    for(int s=0;s<NSHARD;++s) pthread_mutex_unlock(&c->sh[s].mu);
+#if MC_CACHE_MMAP
+    munmap(old,old_bytes);
+#else
+    free(old);
+#endif
+    return new_arena;
+}
+
+size_t mc_cache_capacity_bytes(const mc_cache *c){ return c ? c->arena_bytes : 0; }
+
+size_t mc_cache_used_bytes(mc_cache *c){
+    if(!c) return 0;
+    size_t used=0;
+    for(int s=0;s<NSHARD;++s){
+        pthread_mutex_lock(&c->sh[s].mu);
+        used += (size_t)c->sh[s].used;
+        pthread_mutex_unlock(&c->sh[s].mu);
+    }
+    return used*BLK_BYTES;
+}
+
+double mc_cache_usage_fraction(mc_cache *c){
+    if(!c||c->arena_bytes==0) return 0.0;
+    return (double)mc_cache_used_bytes(c)/(double)c->arena_bytes;
 }
 
 // ---- shard map ops (shard lock held) ----
@@ -3157,4 +3302,2816 @@ mc_cache *mc_cache_new_reader(size_t bytes, struct mc_reader *r){
     if(!c) return NULL;
     c->rd=r; c->src=src_reader; c->src_ud=c;
     return c;
+}
+
+// ============================================================================
+// mc_sample — point sampling over blocked u8 volumes (see header)
+// ============================================================================
+#include <unistd.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__SSE4_1__)
+#include <immintrin.h>
+#endif
+
+#define MC_S_MEMO 256   // covers an oblique 1024-px row's block working set
+
+typedef struct {
+    int bz, by, bx;             // -1 = empty
+    const uint8_t *ptr;         // NULL = known-absent (sampled as 0)
+    uint8_t buf[4096];
+} mc_s_memo;
+
+struct mc_sampler {
+    mc_sample_src src;
+    int nbz, nby, nbx;
+    int lbz, lby, lbx;          // last block touched (ray-coherence cache)
+    const uint8_t *lptr;
+    mc_s_memo m[MC_S_MEMO];
+};
+
+static inline const uint8_t *mc_s_block(mc_sampler *s, int bz, int by, int bx) {
+    if (bz == s->lbz && by == s->lby && bx == s->lbx) return s->lptr;
+    unsigned h = ((unsigned)bz * 73856093u) ^ ((unsigned)by * 19349663u) ^
+                 ((unsigned)bx * 83492791u);
+    mc_s_memo *e = &s->m[h & (MC_S_MEMO - 1)];
+    if (!(e->bz == bz && e->by == by && e->bx == bx)) {
+        e->bz = bz; e->by = by; e->bx = bx;
+        e->ptr = s->src.block(&s->src, bz, by, bx, e->buf);
+    }
+    s->lbz = bz; s->lby = by; s->lbx = bx; s->lptr = e->ptr;
+    return e->ptr;
+}
+
+static inline float mc_s_voxel(mc_sampler *s, int z, int y, int x) {
+    if ((unsigned)z >= (unsigned)s->src.nz ||
+        (unsigned)y >= (unsigned)s->src.ny ||
+        (unsigned)x >= (unsigned)s->src.nx) return 0.0f;
+    if (s->src.dense)
+        return (float)s->src.dense[(size_t)z * s->src.dsy +
+                                   (size_t)y * s->src.dsx + (size_t)x];
+    const uint8_t *b = mc_s_block(s, z >> 4, y >> 4, x >> 4);
+    return b ? (float)b[((z & 15) << 8) | ((y & 15) << 4) | (x & 15)] : 0.0f;
+}
+
+static inline float mc_s_nearest(mc_sampler *s, float z, float y, float x) {
+    return mc_s_voxel(s, (int)floorf(z + 0.5f), (int)floorf(y + 0.5f),
+                      (int)floorf(x + 0.5f));
+}
+
+static inline float mc_s_trilinear(mc_sampler *s, float z, float y, float x) {
+    float zf = floorf(z), yf = floorf(y), xf = floorf(x);
+    int z0 = (int)zf, y0 = (int)yf, x0 = (int)xf;
+    float dz = z - zf, dy = y - yf, dx = x - xf;
+    // dense fast path: direct strided gather, only a bounds check
+    if (s->src.dense &&
+        (unsigned)z0 < (unsigned)(s->src.nz - 1) &&
+        (unsigned)y0 < (unsigned)(s->src.ny - 1) &&
+        (unsigned)x0 < (unsigned)(s->src.nx - 1)) {
+        const size_t sy = s->src.dsy, sx = s->src.dsx;
+        const uint8_t *p = s->src.dense + (size_t)z0 * sy + (size_t)y0 * sx + x0;
+        float c00 = (float)p[0]      + ((float)p[1]        - (float)p[0])      * dx;
+        float c01 = (float)p[sx]     + ((float)p[sx + 1]   - (float)p[sx])     * dx;
+        float c10 = (float)p[sy]     + ((float)p[sy + 1]   - (float)p[sy])     * dx;
+        float c11 = (float)p[sy + sx] + ((float)p[sy + sx + 1] - (float)p[sy + sx]) * dx;
+        float c0 = c00 + (c01 - c00) * dy;
+        float c1 = c10 + (c11 - c10) * dy;
+        return c0 + (c1 - c0) * dz;
+    }
+    // blocked fast path: all 8 corners inside one block and in bounds (~82%
+    // of uniformly distributed samples; far more for coherent rays)
+    if (!s->src.dense &&
+        (unsigned)z0 < (unsigned)(s->src.nz - 1) &&
+        (unsigned)y0 < (unsigned)(s->src.ny - 1) &&
+        (unsigned)x0 < (unsigned)(s->src.nx - 1) &&
+        (z0 & 15) != 15 && (y0 & 15) != 15 && (x0 & 15) != 15) {
+        const uint8_t *b = mc_s_block(s, z0 >> 4, y0 >> 4, x0 >> 4);
+        if (!b) return 0.0f;
+        const uint8_t *p = b + (((z0 & 15) << 8) | ((y0 & 15) << 4) | (x0 & 15));
+        float c00 = (float)p[0]   + ((float)p[1]   - (float)p[0])   * dx;
+        float c01 = (float)p[16]  + ((float)p[17]  - (float)p[16])  * dx;
+        float c10 = (float)p[256] + ((float)p[257] - (float)p[256]) * dx;
+        float c11 = (float)p[272] + ((float)p[273] - (float)p[272]) * dx;
+        float c0 = c00 + (c01 - c00) * dy;
+        float c1 = c10 + (c11 - c10) * dy;
+        return c0 + (c1 - c0) * dz;
+    }
+    // slow path: block/bounds handled per corner (edges mix with 0)
+    float c000 = mc_s_voxel(s, z0, y0, x0);
+    float c001 = mc_s_voxel(s, z0, y0, x0 + 1);
+    float c010 = mc_s_voxel(s, z0, y0 + 1, x0);
+    float c011 = mc_s_voxel(s, z0, y0 + 1, x0 + 1);
+    float c100 = mc_s_voxel(s, z0 + 1, y0, x0);
+    float c101 = mc_s_voxel(s, z0 + 1, y0, x0 + 1);
+    float c110 = mc_s_voxel(s, z0 + 1, y0 + 1, x0);
+    float c111 = mc_s_voxel(s, z0 + 1, y0 + 1, x0 + 1);
+    float c00 = c000 + (c001 - c000) * dx;
+    float c01 = c010 + (c011 - c010) * dx;
+    float c10 = c100 + (c101 - c100) * dx;
+    float c11 = c110 + (c111 - c110) * dx;
+    float c0 = c00 + (c01 - c00) * dy;
+    float c1 = c10 + (c11 - c10) * dy;
+    return c0 + (c1 - c0) * dz;
+}
+
+static inline float mc_s_sample(mc_sampler *s, float z, float y, float x,
+                                mc_filter f) {
+    if (!(z == z) || !(y == y) || !(x == x)) return 0.0f;   // NaN
+    return f == MC_FILTER_NEAREST ? mc_s_nearest(s, z, y, x)
+                                  : mc_s_trilinear(s, z, y, x);
+}
+
+// ---------------------------------------------------------------------------
+// 4-wide trilinear (ray-step batching for the compositors)
+// ---------------------------------------------------------------------------
+// Sample 4 positions at once. Lanes that qualify for a fast path are
+// gathered and lerped with NEON; anything else (edges, absent blocks,
+// non-aarch64) falls back to the scalar sampler per lane. Uses separate
+// mul+add (no fma), so every lane is bit-identical to mc_s_trilinear.
+#if defined(__aarch64__)
+static inline float32x4_t mc_s_lerp8x4(const uint8_t *p0, const uint8_t *p1,
+                                       const uint8_t *p2, const uint8_t *p3,
+                                       size_t sy, size_t sx,
+                                       float32x4_t dz, float32x4_t dy,
+                                       float32x4_t dx) {
+    uint16x4_t g00 = vdup_n_u16(0), g01 = vdup_n_u16(0);
+    uint16x4_t g10 = vdup_n_u16(0), g11 = vdup_n_u16(0);
+    g00 = vld1_lane_u16((const uint16_t *)(const void *)p0, g00, 0);
+    g00 = vld1_lane_u16((const uint16_t *)(const void *)p1, g00, 1);
+    g00 = vld1_lane_u16((const uint16_t *)(const void *)p2, g00, 2);
+    g00 = vld1_lane_u16((const uint16_t *)(const void *)p3, g00, 3);
+    g01 = vld1_lane_u16((const uint16_t *)(const void *)(p0 + sx), g01, 0);
+    g01 = vld1_lane_u16((const uint16_t *)(const void *)(p1 + sx), g01, 1);
+    g01 = vld1_lane_u16((const uint16_t *)(const void *)(p2 + sx), g01, 2);
+    g01 = vld1_lane_u16((const uint16_t *)(const void *)(p3 + sx), g01, 3);
+    g10 = vld1_lane_u16((const uint16_t *)(const void *)(p0 + sy), g10, 0);
+    g10 = vld1_lane_u16((const uint16_t *)(const void *)(p1 + sy), g10, 1);
+    g10 = vld1_lane_u16((const uint16_t *)(const void *)(p2 + sy), g10, 2);
+    g10 = vld1_lane_u16((const uint16_t *)(const void *)(p3 + sy), g10, 3);
+    g11 = vld1_lane_u16((const uint16_t *)(const void *)(p0 + sy + sx), g11, 0);
+    g11 = vld1_lane_u16((const uint16_t *)(const void *)(p1 + sy + sx), g11, 1);
+    g11 = vld1_lane_u16((const uint16_t *)(const void *)(p2 + sy + sx), g11, 2);
+    g11 = vld1_lane_u16((const uint16_t *)(const void *)(p3 + sy + sx), g11, 3);
+    uint16x8_t w00 = vmovl_u8(vreinterpret_u8_u16(g00));
+    uint16x8_t w01 = vmovl_u8(vreinterpret_u8_u16(g01));
+    uint16x8_t w10 = vmovl_u8(vreinterpret_u8_u16(g10));
+    uint16x8_t w11 = vmovl_u8(vreinterpret_u8_u16(g11));
+#define MC_S_F32E(w) vcvtq_f32_u32(vmovl_u16(vuzp1_u16(vget_low_u16(w), vget_high_u16(w))))
+#define MC_S_F32O(w) vcvtq_f32_u32(vmovl_u16(vuzp2_u16(vget_low_u16(w), vget_high_u16(w))))
+    float32x4_t f000 = MC_S_F32E(w00), f001 = MC_S_F32O(w00);
+    float32x4_t f010 = MC_S_F32E(w01), f011 = MC_S_F32O(w01);
+    float32x4_t f100 = MC_S_F32E(w10), f101 = MC_S_F32O(w10);
+    float32x4_t f110 = MC_S_F32E(w11), f111 = MC_S_F32O(w11);
+#undef MC_S_F32E
+#undef MC_S_F32O
+    float32x4_t c00 = vaddq_f32(f000, vmulq_f32(vsubq_f32(f001, f000), dx));
+    float32x4_t c01 = vaddq_f32(f010, vmulq_f32(vsubq_f32(f011, f010), dx));
+    float32x4_t c10 = vaddq_f32(f100, vmulq_f32(vsubq_f32(f101, f100), dx));
+    float32x4_t c11 = vaddq_f32(f110, vmulq_f32(vsubq_f32(f111, f110), dx));
+    float32x4_t c0 = vaddq_f32(c00, vmulq_f32(vsubq_f32(c01, c00), dy));
+    float32x4_t c1 = vaddq_f32(c10, vmulq_f32(vsubq_f32(c11, c10), dy));
+    return vaddq_f32(c0, vmulq_f32(vsubq_f32(c1, c0), dz));
+}
+#elif defined(__SSE4_1__)
+static inline uint16_t mc_s_ld16(const uint8_t *p) {
+    uint16_t v; __builtin_memcpy(&v, p, 2); return v;
+}
+static inline __m128 mc_s_lerp8x4(const uint8_t *p0, const uint8_t *p1,
+                                  const uint8_t *p2, const uint8_t *p3,
+                                  size_t sy, size_t sx,
+                                  __m128 dz, __m128 dy, __m128 dx) {
+    // per corner-row: 4 samples' (c0,c1) byte pairs in u16 lanes 0..3
+    __m128i z = _mm_setzero_si128();
+    __m128i g00 = _mm_insert_epi16(z, mc_s_ld16(p0), 0);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p1), 1);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p2), 2);
+    g00 = _mm_insert_epi16(g00, mc_s_ld16(p3), 3);
+    __m128i g01 = _mm_insert_epi16(z, mc_s_ld16(p0 + sx), 0);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p1 + sx), 1);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p2 + sx), 2);
+    g01 = _mm_insert_epi16(g01, mc_s_ld16(p3 + sx), 3);
+    __m128i g10 = _mm_insert_epi16(z, mc_s_ld16(p0 + sy), 0);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p1 + sy), 1);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p2 + sy), 2);
+    g10 = _mm_insert_epi16(g10, mc_s_ld16(p3 + sy), 3);
+    __m128i g11 = _mm_insert_epi16(z, mc_s_ld16(p0 + sy + sx), 0);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p1 + sy + sx), 1);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p2 + sy + sx), 2);
+    g11 = _mm_insert_epi16(g11, mc_s_ld16(p3 + sy + sx), 3);
+    // split even bytes (x0 corner) / odd bytes (x1 corner) -> u32 -> f32
+    const __m128i me = _mm_set_epi8(-1, -1, -1, 6, -1, -1, -1, 4,
+                                    -1, -1, -1, 2, -1, -1, -1, 0);
+    const __m128i mo = _mm_set_epi8(-1, -1, -1, 7, -1, -1, -1, 5,
+                                    -1, -1, -1, 3, -1, -1, -1, 1);
+#define MC_S_F32E(g) _mm_cvtepi32_ps(_mm_shuffle_epi8(g, me))
+#define MC_S_F32O(g) _mm_cvtepi32_ps(_mm_shuffle_epi8(g, mo))
+    __m128 f000 = MC_S_F32E(g00), f001 = MC_S_F32O(g00);
+    __m128 f010 = MC_S_F32E(g01), f011 = MC_S_F32O(g01);
+    __m128 f100 = MC_S_F32E(g10), f101 = MC_S_F32O(g10);
+    __m128 f110 = MC_S_F32E(g11), f111 = MC_S_F32O(g11);
+#undef MC_S_F32E
+#undef MC_S_F32O
+    __m128 c00 = _mm_add_ps(f000, _mm_mul_ps(_mm_sub_ps(f001, f000), dx));
+    __m128 c01 = _mm_add_ps(f010, _mm_mul_ps(_mm_sub_ps(f011, f010), dx));
+    __m128 c10 = _mm_add_ps(f100, _mm_mul_ps(_mm_sub_ps(f101, f100), dx));
+    __m128 c11 = _mm_add_ps(f110, _mm_mul_ps(_mm_sub_ps(f111, f110), dx));
+    __m128 c0 = _mm_add_ps(c00, _mm_mul_ps(_mm_sub_ps(c01, c00), dy));
+    __m128 c1 = _mm_add_ps(c10, _mm_mul_ps(_mm_sub_ps(c11, c10), dy));
+    return _mm_add_ps(c0, _mm_mul_ps(_mm_sub_ps(c1, c0), dz));
+}
+
+#if defined(__AVX2__) && !defined(MC_S_NO_TRI8)
+// 8-wide variant for the x86-64-v3 fleet (Zen 3/4/5, 12th-gen+ Intel).
+#define MC_S_HAVE_TRI8 1
+static inline __m256i mc_s_g8(const uint8_t *const p[8], size_t off) {
+    __m128i lo = _mm_setzero_si128(), hi = lo;
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[0] + off), 0);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[1] + off), 1);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[2] + off), 2);
+    lo = _mm_insert_epi16(lo, mc_s_ld16(p[3] + off), 3);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[4] + off), 0);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[5] + off), 1);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[6] + off), 2);
+    hi = _mm_insert_epi16(hi, mc_s_ld16(p[7] + off), 3);
+    return _mm256_set_m128i(hi, lo);
+}
+static inline __m256 mc_s_lerp8x8(const uint8_t *const p[8],
+                                  size_t sy, size_t sx,
+                                  __m256 dz, __m256 dy, __m256 dx) {
+    __m256i g00 = mc_s_g8(p, 0),  g01 = mc_s_g8(p, sx);
+    __m256i g10 = mc_s_g8(p, sy), g11 = mc_s_g8(p, sy + sx);
+    // even byte of each u16 pair = x0 corner, odd = x1 (per 128-bit half)
+    const __m256i me = _mm256_broadcastsi128_si256(
+        _mm_set_epi8(-1, -1, -1, 6, -1, -1, -1, 4,
+                     -1, -1, -1, 2, -1, -1, -1, 0));
+    const __m256i mo = _mm256_broadcastsi128_si256(
+        _mm_set_epi8(-1, -1, -1, 7, -1, -1, -1, 5,
+                     -1, -1, -1, 3, -1, -1, -1, 1));
+#define MC_S_F32E(g) _mm256_cvtepi32_ps(_mm256_shuffle_epi8(g, me))
+#define MC_S_F32O(g) _mm256_cvtepi32_ps(_mm256_shuffle_epi8(g, mo))
+    __m256 f000 = MC_S_F32E(g00), f001 = MC_S_F32O(g00);
+    __m256 f010 = MC_S_F32E(g01), f011 = MC_S_F32O(g01);
+    __m256 f100 = MC_S_F32E(g10), f101 = MC_S_F32O(g10);
+    __m256 f110 = MC_S_F32E(g11), f111 = MC_S_F32O(g11);
+#undef MC_S_F32E
+#undef MC_S_F32O
+    __m256 c00 = _mm256_add_ps(f000, _mm256_mul_ps(_mm256_sub_ps(f001, f000), dx));
+    __m256 c01 = _mm256_add_ps(f010, _mm256_mul_ps(_mm256_sub_ps(f011, f010), dx));
+    __m256 c10 = _mm256_add_ps(f100, _mm256_mul_ps(_mm256_sub_ps(f101, f100), dx));
+    __m256 c11 = _mm256_add_ps(f110, _mm256_mul_ps(_mm256_sub_ps(f111, f110), dx));
+    __m256 c0 = _mm256_add_ps(c00, _mm256_mul_ps(_mm256_sub_ps(c01, c00), dy));
+    __m256 c1 = _mm256_add_ps(c10, _mm256_mul_ps(_mm256_sub_ps(c11, c10), dy));
+    return _mm256_add_ps(c0, _mm256_mul_ps(_mm256_sub_ps(c1, c0), dz));
+}
+#endif  /* __AVX2__ */
+#endif
+
+static inline void mc_s_tri4(mc_sampler *s, const float *pz, const float *py,
+                             const float *px, float *out) {
+#if defined(__aarch64__)
+    float32x4_t zv = vld1q_f32(pz), yv = vld1q_f32(py), xv = vld1q_f32(px);
+    float32x4_t zf = vrndmq_f32(zv), yf = vrndmq_f32(yv), xf = vrndmq_f32(xv);
+    int32x4_t zi = vcvtq_s32_f32(zf), yi = vcvtq_s32_f32(yf),
+              xi = vcvtq_s32_f32(xf);
+    // all-lanes in-bounds check: 0 <= c < n-1 per axis
+    uint32x4_t ok = vcltq_u32(vreinterpretq_u32_s32(zi),
+                              vdupq_n_u32((unsigned)(s->src.nz - 1)));
+    ok = vandq_u32(ok, vcltq_u32(vreinterpretq_u32_s32(yi),
+                                 vdupq_n_u32((unsigned)(s->src.ny - 1))));
+    ok = vandq_u32(ok, vcltq_u32(vreinterpretq_u32_s32(xi),
+                                 vdupq_n_u32((unsigned)(s->src.nx - 1))));
+    if (vminvq_u32(ok) != 0) {
+        float32x4_t dz = vsubq_f32(zv, zf), dy = vsubq_f32(yv, yf),
+                    dx = vsubq_f32(xv, xf);
+        if (s->src.dense) {
+            int32_t z0[4], y0[4], x0[4];
+            vst1q_s32(z0, zi); vst1q_s32(y0, yi); vst1q_s32(x0, xi);
+            const size_t sy = s->src.dsy, sx = s->src.dsx;
+            const uint8_t *base = s->src.dense;
+            vst1q_f32(out, mc_s_lerp8x4(
+                base + (size_t)z0[0] * sy + (size_t)y0[0] * sx + x0[0],
+                base + (size_t)z0[1] * sy + (size_t)y0[1] * sx + x0[1],
+                base + (size_t)z0[2] * sy + (size_t)y0[2] * sx + x0[2],
+                base + (size_t)z0[3] * sy + (size_t)y0[3] * sx + x0[3],
+                sy, sx, dz, dy, dx));
+            return;
+        }
+        // blocked: every lane's 8 corners must sit inside one block
+        uint32x4_t in15 = vmvnq_u32(vorrq_u32(vorrq_u32(
+            vceqq_s32(vandq_s32(zi, vdupq_n_s32(15)), vdupq_n_s32(15)),
+            vceqq_s32(vandq_s32(yi, vdupq_n_s32(15)), vdupq_n_s32(15))),
+            vceqq_s32(vandq_s32(xi, vdupq_n_s32(15)), vdupq_n_s32(15))));
+        if (vminvq_u32(in15) != 0) {
+            int32_t z0[4], y0[4], x0[4];
+            vst1q_s32(z0, zi); vst1q_s32(y0, yi); vst1q_s32(x0, xi);
+            const uint8_t *b[4];
+            int allb = 1;
+            for (int k = 0; k < 4; k++) {
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                if (!bk) { allb = 0; break; }
+                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                             (x0[k] & 15));
+            }
+            if (allb) {
+                vst1q_f32(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
+                                            256, 16, dz, dy, dx));
+                return;
+            }
+        }
+    }
+#endif
+#if defined(__SSE4_1__) && !defined(__aarch64__)
+    __m128 zv = _mm_loadu_ps(pz), yv = _mm_loadu_ps(py), xv = _mm_loadu_ps(px);
+    __m128 zf = _mm_floor_ps(zv), yf = _mm_floor_ps(yv), xf = _mm_floor_ps(xv);
+    __m128i zi = _mm_cvttps_epi32(zf), yi = _mm_cvttps_epi32(yf),
+            xi = _mm_cvttps_epi32(xf);
+    // all-lanes 0 <= c < n-1 (signed compares; negatives fail the >= 0 side)
+    __m128i ok = _mm_and_si128(
+        _mm_cmpgt_epi32(zi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.nz - 1), zi));
+    ok = _mm_and_si128(ok, _mm_and_si128(
+        _mm_cmpgt_epi32(yi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.ny - 1), yi)));
+    ok = _mm_and_si128(ok, _mm_and_si128(
+        _mm_cmpgt_epi32(xi, _mm_set1_epi32(-1)),
+        _mm_cmpgt_epi32(_mm_set1_epi32(s->src.nx - 1), xi)));
+    if (_mm_movemask_ps(_mm_castsi128_ps(ok)) == 0xF) {
+        __m128 dz = _mm_sub_ps(zv, zf), dy = _mm_sub_ps(yv, yf),
+               dx = _mm_sub_ps(xv, xf);
+        int32_t z0[4], y0[4], x0[4];
+        _mm_storeu_si128((__m128i *)z0, zi);
+        _mm_storeu_si128((__m128i *)y0, yi);
+        _mm_storeu_si128((__m128i *)x0, xi);
+        if (s->src.dense) {
+            const size_t sy = s->src.dsy, sx = s->src.dsx;
+            const uint8_t *base = s->src.dense;
+            _mm_storeu_ps(out, mc_s_lerp8x4(
+                base + (size_t)z0[0] * sy + (size_t)y0[0] * sx + x0[0],
+                base + (size_t)z0[1] * sy + (size_t)y0[1] * sx + x0[1],
+                base + (size_t)z0[2] * sy + (size_t)y0[2] * sx + x0[2],
+                base + (size_t)z0[3] * sy + (size_t)y0[3] * sx + x0[3],
+                sy, sx, dz, dy, dx));
+            return;
+        }
+        int in15 = 1;
+        for (int k = 0; k < 4; k++)
+            in15 &= (z0[k] & 15) != 15 && (y0[k] & 15) != 15 &&
+                    (x0[k] & 15) != 15;
+        if (in15) {
+            const uint8_t *b[4];
+            int allb = 1;
+            for (int k = 0; k < 4; k++) {
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                if (!bk) { allb = 0; break; }
+                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                             (x0[k] & 15));
+            }
+            if (allb) {
+                _mm_storeu_ps(out, mc_s_lerp8x4(b[0], b[1], b[2], b[3],
+                                                256, 16, dz, dy, dx));
+                return;
+            }
+        }
+    }
+#endif
+    out[0] = mc_s_trilinear(s, pz[0], py[0], px[0]);
+    out[1] = mc_s_trilinear(s, pz[1], py[1], px[1]);
+    out[2] = mc_s_trilinear(s, pz[2], py[2], px[2]);
+    out[3] = mc_s_trilinear(s, pz[3], py[3], px[3]);
+}
+
+#ifdef MC_S_HAVE_TRI8
+// 8 positions at once (AVX2). Same fallback discipline as mc_s_tri4.
+static inline void mc_s_tri8(mc_sampler *s, const float *pz, const float *py,
+                             const float *px, float *out) {
+    __m256 zv = _mm256_loadu_ps(pz), yv = _mm256_loadu_ps(py),
+           xv = _mm256_loadu_ps(px);
+    __m256 zf = _mm256_floor_ps(zv), yf = _mm256_floor_ps(yv),
+           xf = _mm256_floor_ps(xv);
+    __m256i zi = _mm256_cvttps_epi32(zf), yi = _mm256_cvttps_epi32(yf),
+            xi = _mm256_cvttps_epi32(xf);
+    __m256i ok = _mm256_and_si256(
+        _mm256_cmpgt_epi32(zi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.nz - 1), zi));
+    ok = _mm256_and_si256(ok, _mm256_and_si256(
+        _mm256_cmpgt_epi32(yi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.ny - 1), yi)));
+    ok = _mm256_and_si256(ok, _mm256_and_si256(
+        _mm256_cmpgt_epi32(xi, _mm256_set1_epi32(-1)),
+        _mm256_cmpgt_epi32(_mm256_set1_epi32(s->src.nx - 1), xi)));
+    if (_mm256_movemask_ps(_mm256_castsi256_ps(ok)) == 0xFF) {
+        __m256 dz = _mm256_sub_ps(zv, zf), dy = _mm256_sub_ps(yv, yf),
+               dx = _mm256_sub_ps(xv, xf);
+        int32_t z0[8], y0[8], x0[8];
+        _mm256_storeu_si256((__m256i *)z0, zi);
+        _mm256_storeu_si256((__m256i *)y0, yi);
+        _mm256_storeu_si256((__m256i *)x0, xi);
+        const uint8_t *b[8];
+        if (s->src.dense) {
+            const size_t sy = s->src.dsy, sx = s->src.dsx;
+            for (int k = 0; k < 8; k++)
+                b[k] = s->src.dense + (size_t)z0[k] * sy +
+                       (size_t)y0[k] * sx + x0[k];
+            _mm256_storeu_ps(out, mc_s_lerp8x8(b, sy, sx, dz, dy, dx));
+            return;
+        }
+        int fast = 1;
+        for (int k = 0; k < 8 && fast; k++)
+            fast = (z0[k] & 15) != 15 && (y0[k] & 15) != 15 &&
+                   (x0[k] & 15) != 15;
+        if (fast) {
+            for (int k = 0; k < 8 && fast; k++) {
+                const uint8_t *bk =
+                    mc_s_block(s, z0[k] >> 4, y0[k] >> 4, x0[k] >> 4);
+                if (!bk) { fast = 0; break; }
+                b[k] = bk + (((z0[k] & 15) << 8) | ((y0[k] & 15) << 4) |
+                             (x0[k] & 15));
+            }
+            if (fast) {
+                _mm256_storeu_ps(out, mc_s_lerp8x8(b, 256, 16, dz, dy, dx));
+                return;
+            }
+        }
+    }
+    mc_s_tri4(s, pz, py, px, out);
+    mc_s_tri4(s, pz + 4, py + 4, px + 4, out + 4);
+}
+#endif
+
+
+#define BLK 16
+#define BLKB 4096
+
+// ---------------------------------------------------------------------------
+// sources
+// ---------------------------------------------------------------------------
+static const uint8_t *cache_block(const mc_sample_src *src,
+                                  int bz, int by, int bx, uint8_t *tmp) {
+    (void)tmp;
+    // mc_cache_get decodes misses synchronously and returns an arena pointer
+    // (non-owning; same stability contract as VC's BlockCache). In frozen
+    // tick-phase a miss returns NULL — sampled as 0, recorded as feedback.
+    return mc_cache_get((mc_cache *)src->ud, src->aux, bz, by, bx);
+}
+
+mc_sample_src mc_sample_src_cache(struct mc_cache *c, int lod,
+                                  int nz, int ny, int nx) {
+    mc_sample_src s = {0};
+    s.ud = c; s.aux = lod; s.block = cache_block;
+    s.nz = nz; s.ny = ny; s.nx = nx;
+    return s;
+}
+
+static const uint8_t *dense_block(const mc_sample_src *src,
+                                  int bz, int by, int bx, uint8_t *tmp) {
+    const uint8_t *vox = src->ud;
+    int z0 = bz * BLK, y0 = by * BLK, x0 = bx * BLK;
+    if (z0 >= src->nz || y0 >= src->ny || x0 >= src->nx) return NULL;
+    int dz = src->nz - z0 < BLK ? src->nz - z0 : BLK;
+    int dy = src->ny - y0 < BLK ? src->ny - y0 : BLK;
+    int dx = src->nx - x0 < BLK ? src->nx - x0 : BLK;
+    if (dz < BLK || dy < BLK || dx < BLK) memset(tmp, 0, BLKB);
+    for (int z = 0; z < dz; z++)
+        for (int y = 0; y < dy; y++)
+            memcpy(tmp + ((z << 8) | (y << 4)),
+                   vox + ((size_t)(z0 + z) * src->ny + (y0 + y)) * src->nx + x0,
+                   (size_t)dx);
+    return tmp;
+}
+
+mc_sample_src mc_sample_src_dense(const uint8_t *vox, int nz, int ny, int nx) {
+    mc_sample_src s = {0};
+    s.ud = (void *)(uintptr_t)vox;
+    s.block = dense_block;                // kept for completeness; the direct
+    s.dense = vox;                        // path below short-circuits it
+    s.dsy = (size_t)ny * nx; s.dsx = (size_t)nx;
+    s.nz = nz; s.ny = ny; s.nx = nx;
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// sampler
+// ---------------------------------------------------------------------------
+mc_sampler *mc_sampler_new(const mc_sample_src *src) {
+    if (!src || !src->block) return NULL;
+    mc_sampler *s = malloc(sizeof *s);
+    if (!s) return NULL;
+    s->src = *src;
+    s->nbz = (src->nz + BLK - 1) / BLK;
+    s->nby = (src->ny + BLK - 1) / BLK;
+    s->nbx = (src->nx + BLK - 1) / BLK;
+    mc_sampler_reset(s);
+    return s;
+}
+
+void mc_sampler_free(mc_sampler *s) { free(s); }
+
+void mc_sampler_reset(mc_sampler *s) {
+    if (!s) return;
+    for (int i = 0; i < MC_S_MEMO; i++) s->m[i].bz = -1;
+    s->lbz = s->lby = s->lbx = -1;
+    s->lptr = NULL;
+}
+
+float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f) {
+    return mc_s_sample(s, z, y, x, f);
+}
+
+static inline int pt_valid(const float *p) {
+    if (p[0] != p[0] || p[1] != p[1] || p[2] != p[2]) return 0;   // NaN
+    return p[0] >= 0.0f && p[1] >= 0.0f && p[2] >= 0.0f;
+}
+
+void mc_sample_points(mc_sampler *s, const float *zyx, size_t n,
+                      mc_filter f, float *out) {
+    if (f == MC_FILTER_NEAREST) {
+        for (size_t i = 0; i < n; i++) {
+            const float *p = zyx + i * 3;
+            out[i] = pt_valid(p) ? mc_s_nearest(s, p[0], p[1], p[2]) : 0.0f;
+        }
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            const float *p = zyx + i * 3;
+            out[i] = pt_valid(p) ? mc_s_trilinear(s, p[0], p[1], p[2]) : 0.0f;
+        }
+    }
+}
+
+void mc_sample_points_u8(mc_sampler *s, const float *zyx, size_t n,
+                         mc_filter f, uint8_t *out) {
+    if (f == MC_FILTER_NEAREST) {
+        for (size_t i = 0; i < n; i++) {
+            const float *p = zyx + i * 3;
+            float v = pt_valid(p) ? mc_s_nearest(s, p[0], p[1], p[2]) : 0.0f;
+            out[i] = (uint8_t)(v < 0.0f ? 0 : v > 255.0f ? 255 : (int)(v + 0.5f));
+        }
+    } else {
+        for (size_t i = 0; i < n; i++) {
+            const float *p = zyx + i * 3;
+            float v = pt_valid(p) ? mc_s_trilinear(s, p[0], p[1], p[2]) : 0.0f;
+            out[i] = (uint8_t)(v < 0.0f ? 0 : v > 255.0f ? 255 : (int)(v + 0.5f));
+        }
+    }
+}
+
+// ============================================================================
+// mc_render — surface rendering, compositing, LOD, 3D resampling
+// ============================================================================
+// ---------------------------------------------------------------------------
+// core
+// ---------------------------------------------------------------------------
+static inline uint8_t to_u8(float v) {
+    return (uint8_t)(v < 0.0f ? 0 : v > 255.0f ? 255 : (int)(v + 0.5f));
+}
+
+// Per-image constants hoisted out of the pixel loop.
+typedef struct {
+    mc_filter filter;
+    mc_comp comp;
+    float t0, dt;
+    int nsteps;                 // iterations of the [t0, t1] dt walk
+    float a_min, a_op;          // alpha params, clamped
+    // MC_COMP_SHADED (defaults resolved here; see mc_render_params docs)
+    float Lz, Ly, Lx;           // unit light dir, toward the light
+    int headlight;              // light[] was zero: use -ray dir per pixel
+    float ka, kd, ks, shin;     // ambient / diffuse / specular / exponent
+    float sigma;                // extinction per unit density per voxel
+    float shadow, sss;          // shadow strength, translucency weight
+    float g0sq;                 // grad_g0^2 (surface-ness knee)
+    int sh_steps;               // secondary-march steps toward the light
+    float sh_dt;                // secondary-march step, voxels
+} rcfg_t;
+
+static rcfg_t make_cfg(const mc_render_params *p) {
+    rcfg_t c;
+    c.filter = p->filter;
+    c.comp = p->comp;
+    c.dt = p->dt > 0.0f ? p->dt : 1.0f;
+    float t0 = p->t0, t1 = p->t1;
+    if (t1 < t0) { float tmp = t0; t0 = t1; t1 = tmp; }
+    c.t0 = t0;
+    c.nsteps = 0;
+    for (float t = t0; t <= t1 + 1e-4f; t += c.dt) c.nsteps++;
+    c.a_min = p->alpha_min < 0.0f ? 0.0f :
+              p->alpha_min > 0.99f ? 0.99f : p->alpha_min;
+    c.a_op  = p->alpha_opacity <= 0.0f ? 1.0f :
+              p->alpha_opacity > 1.0f ? 1.0f : p->alpha_opacity;
+    float ll = p->light[0] * p->light[0] + p->light[1] * p->light[1] +
+               p->light[2] * p->light[2];
+    c.headlight = ll < 1e-12f;
+    if (c.headlight) { c.Lz = c.Ly = 0.0f; c.Lx = 1.0f; }
+    else {
+        float inv = 1.0f / sqrtf(ll);
+        c.Lz = p->light[0] * inv; c.Ly = p->light[1] * inv;
+        c.Lx = p->light[2] * inv;
+    }
+    c.ka   = p->ambient   > 0.0f ? p->ambient   : 0.25f;
+    c.kd   = p->diffuse   > 0.0f ? p->diffuse   : 0.75f;
+    c.ks   = p->specular  > 0.0f ? p->specular  : 0.20f;
+    c.shin = p->shininess > 0.0f ? p->shininess : 24.0f;
+    c.sigma = p->absorption > 0.0f ? p->absorption : 1.0f;
+    c.shadow = p->shadow < 0.0f ? 0.0f : p->shadow > 1.0f ? 1.0f : p->shadow;
+    c.sss = p->sss < 0.0f ? 0.0f : p->sss;
+    float g0 = p->grad_g0 > 0.0f ? p->grad_g0 : 8.0f;
+    c.g0sq = g0 * g0;
+    c.sh_steps = 12;            // 24 voxels of reach at sh_dt = 2: enough to
+    c.sh_dt = 2.0f;             // self-shadow a sheet, cheap enough per ray
+    return c;
+}
+
+// MC_COMP_SHADED: front-to-back emission-absorption along P + t*N with
+// gradient-normal lighting. Headlight default lights from the camera side
+// (-N); an explicit light dir enables raking. Per contributing sample:
+// 6-tap central-difference gradient -> two-sided diffuse + Blinn-Phong
+// specular, weighted by surface-ness so smooth interiors emit unshaded;
+// optional coarse march toward the light for shadows / translucency.
+static uint8_t shade_ray(mc_sampler *s, const float *P, float nz, float ny,
+                         float nx, const rcfg_t *cfg) {
+    const mc_filter f = cfg->filter;
+    const float a_th = cfg->a_min, a_sc = cfg->a_op / (1.0f - cfg->a_min);
+    float Lz = cfg->Lz, Ly = cfg->Ly, Lx = cfg->Lx;
+    if (cfg->headlight) { Lz = -nz; Ly = -ny; Lx = -nx; }
+    // view = toward the camera = -ray dir; half vector for Blinn-Phong
+    float hz = Lz - nz, hy = Ly - ny, hx = Lx - nx;
+    float hl = hz * hz + hy * hy + hx * hx;
+    if (hl > 1e-12f) {
+        hl = 1.0f / sqrtf(hl);
+        hz *= hl; hy *= hl; hx *= hl;
+    }
+    const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
+    float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
+          px = P[2] + cfg->t0 * nx;
+    float acc = 0.0f, T = 1.0f;
+    const int want_tau = cfg->shadow > 0.0f || cfg->sss > 0.0f;
+    for (int it = 0; it < cfg->nsteps; it++, pz += sz_, py += sy_, px += sx_) {
+        float v = mc_s_sample(s, pz, py, px, f);
+        float d = (v * (1.0f / 255.0f) - a_th) * a_sc;
+        if (d <= 0.0f) continue;                    // air: free skip
+        if (d > 1.0f) d = 1.0f;
+        float a = 1.0f - expf(-cfg->sigma * d * cfg->dt);
+        // gradient (u8 units / voxel), central differences at 1 voxel
+        float gz = mc_s_sample(s, pz + 1, py, px, f) -
+                   mc_s_sample(s, pz - 1, py, px, f);
+        float gy = mc_s_sample(s, pz, py + 1, px, f) -
+                   mc_s_sample(s, pz, py - 1, px, f);
+        float gx = mc_s_sample(s, pz, py, px + 1, f) -
+                   mc_s_sample(s, pz, py, px - 1, f);
+        float g2 = 0.25f * (gz * gz + gy * gy + gx * gx);
+        float w = g2 / (g2 + cfg->g0sq);            // surface-ness
+        float diff = 0.0f, spec = 0.0f;
+        if (g2 > 1e-8f) {
+            float gi = 1.0f / sqrtf(gz * gz + gy * gy + gx * gx);
+            float uz = gz * gi, uy = gy * gi, ux = gx * gi;
+            diff = fabsf(uz * Lz + uy * Ly + ux * Lx);   // two-sided
+            float ndh = fabsf(uz * hz + uy * hy + ux * hx);
+            spec = powf(ndh, cfg->shin);
+        }
+        float lit = cfg->ka + (1.0f - w) * cfg->kd;     // interior: emissive
+        float Tl = 1.0f;
+        if (want_tau && w > 0.05f) {
+            float tau = 0.0f;
+            float qz = pz + cfg->sh_dt * Lz, qy = py + cfg->sh_dt * Ly,
+                  qx = px + cfg->sh_dt * Lx;
+            for (int j = 0; j < cfg->sh_steps && tau < 6.0f; j++) {
+                float sv = mc_s_sample(s, qz, qy, qx, f);
+                float sd = (sv * (1.0f / 255.0f) - a_th) * a_sc;
+                if (sd > 0.0f) {
+                    if (sd > 1.0f) sd = 1.0f;
+                    tau += cfg->sigma * sd * cfg->sh_dt;
+                }
+                qz += cfg->sh_dt * Lz; qy += cfg->sh_dt * Ly;
+                qx += cfg->sh_dt * Lx;
+            }
+            Tl = expf(-tau);
+            lit += cfg->sss * w * expf(-0.3f * tau);    // translucent glow
+        }
+        float shfac = 1.0f - cfg->shadow + cfg->shadow * Tl;
+        lit += w * cfg->kd * diff * shfac;
+        float shade = v * lit + 255.0f * cfg->ks * spec * shfac * w;
+        acc += T * a * shade;
+        T *= 1.0f - a;
+        if (T < 0.02f) break;
+    }
+    return to_u8(acc);
+}
+
+// Composite one ray. Trilinear rays are consumed in chunks of 4 steps via
+// mc_s_tri4 (NEON gather+lerp on aarch64, ~1.4x the scalar core); the
+// accumulation itself stays sequential per chunk, which keeps ALPHA\'s
+// front-to-back order and early-out exact. Positions are P + t*N with t
+// advanced additively, as before.
+static uint8_t render_pixel(mc_sampler *s, const float *P, const float *N,
+                            const rcfg_t *cfg) {
+    if (!pt_valid(P)) return 0;
+    if (cfg->comp == MC_COMP_NONE || !N)
+        return to_u8(mc_s_sample(s, P[0], P[1], P[2], cfg->filter));
+    float nz = N[0], ny = N[1], nx = N[2];
+    float n2 = nz * nz + ny * ny + nx * nx;
+    if (n2 < 1e-12f)
+        return to_u8(mc_s_sample(s, P[0], P[1], P[2], cfg->filter));
+    if (n2 < 0.9998f || n2 > 1.0002f) {     // gen paths emit unit normals
+        float nl = 1.0f / sqrtf(n2);
+        nz *= nl; ny *= nl; nx *= nl;
+    }
+    if (cfg->comp == MC_COMP_SHADED)
+        return shade_ray(s, P, nz, ny, nx, cfg);
+
+    const float sz_ = cfg->dt * nz, sy_ = cfg->dt * ny, sx_ = cfg->dt * nx;
+    float pz = P[0] + cfg->t0 * nz, py = P[1] + cfg->t0 * ny,
+          px = P[2] + cfg->t0 * nx;
+    const float a_th = cfg->a_min, a_sc = cfg->a_op / (1.0f - cfg->a_min);
+    float acc = 0.0f, A = 0.0f, mn = 255.0f, mx = 0.0f, sum = 0.0f,
+          sum2 = 0.0f;
+    int it = 0, done = 0;
+
+    if (cfg->filter == MC_FILTER_TRILINEAR) {
+// NOTE: composites deliberately stay 4-wide. Measured on Zen 3 (EPYC
+        // 7763): 8-wide ray chunks ran 1.6x SLOWER than two independent 4-wide
+        // chunks (the 8-long insert-gather dependency chain over z-strided
+        // addresses serializes); 8-wide only wins for adjacent-pixel loads
+        // (the slice path below).
+        for (; it + 4 <= cfg->nsteps && !done; it += 4) {
+            float bz[4], by[4], bx[4], v4[4];
+            for (int k = 0; k < 4; k++) {
+                bz[k] = pz; by[k] = py; bx[k] = px;
+                pz += sz_; py += sy_; px += sx_;
+            }
+            mc_s_tri4(s, bz, by, bx, v4);
+            switch (cfg->comp) {
+            case MC_COMP_MIN:
+                for (int k = 0; k < 4; k++) if (v4[k] < mn) mn = v4[k];
+                break;
+            case MC_COMP_MAX:
+                for (int k = 0; k < 4; k++) if (v4[k] > mx) mx = v4[k];
+                if (mx >= 255.0f) done = 1;     // saturated
+                break;
+            case MC_COMP_MEAN:
+                sum += v4[0] + v4[1] + v4[2] + v4[3];
+                break;
+            case MC_COMP_STDDEV:
+                for (int k = 0; k < 4; k++) {
+                    sum += v4[k]; sum2 += v4[k] * v4[k];
+                }
+                break;
+            default:                            // ALPHA
+                for (int k = 0; k < 4 && !done; k++) {
+                    float a = (v4[k] * (1.0f / 255.0f) - a_th) * a_sc;
+                    if (a > 0.0f) {
+                        if (a > 1.0f) a = 1.0f;
+                        acc += (1.0f - A) * a * v4[k];
+                        A   += (1.0f - A) * a;
+                        if (A >= 0.98f) done = 1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    for (; it < cfg->nsteps && !done; it++) {
+        float v = mc_s_sample(s, pz, py, px, cfg->filter);
+        switch (cfg->comp) {
+        case MC_COMP_MIN:  if (v < mn) mn = v; break;
+        case MC_COMP_MAX:  if (v > mx) mx = v; break;
+        case MC_COMP_MEAN: sum += v; break;
+        case MC_COMP_STDDEV: sum += v; sum2 += v * v; break;
+        default: {                              // ALPHA
+            float a = (v * (1.0f / 255.0f) - a_th) * a_sc;
+            if (a > 0.0f) {
+                if (a > 1.0f) a = 1.0f;
+                acc += (1.0f - A) * a * v;
+                A   += (1.0f - A) * a;
+                if (A >= 0.98f) done = 1;
+            }
+            break;
+        }
+        }
+        pz += sz_; py += sy_; px += sx_;
+    }
+    switch (cfg->comp) {
+    case MC_COMP_MIN:  return to_u8(mn);
+    case MC_COMP_MAX:  return to_u8(mx);
+    case MC_COMP_MEAN:
+        return to_u8(cfg->nsteps ? sum / (float)cfg->nsteps : 0.0f);
+    case MC_COMP_STDDEV: {
+        if (!cfg->nsteps) return 0;
+        float m = sum / (float)cfg->nsteps;
+        float var = sum2 / (float)cfg->nsteps - m * m;
+        return to_u8(var > 0.0f ? sqrtf(var) : 0.0f);
+    }
+    case MC_COMP_ALPHA: return to_u8(acc);
+    default:           return 0;
+    }
+}
+
+void mc_render_points(mc_sampler *s,
+                      const float *pts, const float *normals,
+                      int w, int h, const mc_render_params *p, uint8_t *out) {
+    rcfg_t cfg = make_cfg(p);
+    size_t n = (size_t)w * h;
+    if (cfg.comp == MC_COMP_NONE || !normals) {
+        // slice fast path: no per-pixel normal handling, branch on the
+        // filter once
+        if (cfg.filter == MC_FILTER_NEAREST) {
+            for (size_t k = 0; k < n; k++) {
+                const float *P = pts + k * 3;
+                out[k] = pt_valid(P)
+                             ? to_u8(mc_s_nearest(s, P[0], P[1], P[2])) : 0;
+            }
+        } else {
+            // 4/8 pixels per mc_s_tri4/8 call (SIMD gather+lerp)
+            size_t k = 0;
+#ifdef MC_S_HAVE_TRI8
+            for (; k + 8 <= n; k += 8) {
+                const float *P = pts + k * 3;
+                int allv = 1;
+                for (int q = 0; q < 8; q++) allv &= pt_valid(P + q * 3);
+                if (allv) {
+                    float bz[8], by[8], bx[8], v8[8];
+                    for (int q = 0; q < 8; q++) {
+                        bz[q] = P[q * 3]; by[q] = P[q * 3 + 1];
+                        bx[q] = P[q * 3 + 2];
+                    }
+                    mc_s_tri8(s, bz, by, bx, v8);
+                    for (int q = 0; q < 8; q++) out[k + q] = to_u8(v8[q]);
+                } else {
+                    for (size_t q = k; q < k + 8; q++) {
+                        const float *Q = pts + q * 3;
+                        out[q] = pt_valid(Q)
+                            ? to_u8(mc_s_trilinear(s, Q[0], Q[1], Q[2])) : 0;
+                    }
+                }
+            }
+#endif
+            for (; k + 4 <= n; k += 4) {
+                const float *P = pts + k * 3;
+                if (pt_valid(P) && pt_valid(P + 3) &&
+                    pt_valid(P + 6) && pt_valid(P + 9)) {
+                    float bz[4] = { P[0], P[3], P[6], P[9]  };
+                    float by[4] = { P[1], P[4], P[7], P[10] };
+                    float bx[4] = { P[2], P[5], P[8], P[11] };
+                    float v4[4];
+                    mc_s_tri4(s, bz, by, bx, v4);
+                    out[k]     = to_u8(v4[0]);
+                    out[k + 1] = to_u8(v4[1]);
+                    out[k + 2] = to_u8(v4[2]);
+                    out[k + 3] = to_u8(v4[3]);
+                } else {
+                    for (size_t q = k; q < k + 4; q++) {
+                        const float *Q = pts + q * 3;
+                        out[q] = pt_valid(Q)
+                            ? to_u8(mc_s_trilinear(s, Q[0], Q[1], Q[2])) : 0;
+                    }
+                }
+            }
+            for (; k < n; k++) {
+                const float *P = pts + k * 3;
+                out[k] = pt_valid(P)
+                             ? to_u8(mc_s_trilinear(s, P[0], P[1], P[2])) : 0;
+            }
+        }
+        return;
+    }
+    for (size_t k = 0; k < n; k++)
+        out[k] = render_pixel(s, pts + k * 3, normals + k * 3, &cfg);
+}
+
+// ---------------------------------------------------------------------------
+// parallel core: row bands, one sampler per worker
+// ---------------------------------------------------------------------------
+// rowgen fills one row of points (+normals) into band-local scratch; plane
+// and quad renders go through this so no W*H grid is ever materialized
+// (a 1024^2 trilinear frame otherwise mallocs and touches 24 MB of points).
+typedef void (*rowgen_fn)(const void *ud, int row, int w,
+                          float *pts, float *normals);
+
+typedef struct {
+    const mc_sample_src *src;
+    const float *pts, *normals;     // dense mode (rowgen == NULL)
+    rowgen_fn rowgen;               // strip mode
+    const void *rg_ud;
+    int w, h;
+    const mc_render_params *p;
+    uint8_t *out;
+    int row0, row1;
+} band_t;
+
+static void *band_main(void *ud) {
+    band_t *b = ud;
+    mc_sampler *s = mc_sampler_new(b->src);
+    if (!s) return NULL;
+    if (!b->rowgen) {
+        size_t off = (size_t)b->row0 * b->w;
+        mc_render_points(s, b->pts + off * 3,
+                         b->normals ? b->normals + off * 3 : NULL,
+                         b->w, b->row1 - b->row0, b->p, b->out + off);
+    } else {
+        int need_n = b->p->comp != MC_COMP_NONE;
+        float *row = malloc((size_t)b->w * 3 * sizeof(float) * (need_n ? 2 : 1));
+        if (row) {
+            float *nrm = need_n ? row + (size_t)b->w * 3 : NULL;
+            for (int i = b->row0; i < b->row1; i++) {
+                b->rowgen(b->rg_ud, i, b->w, row, nrm);
+                mc_render_points(s, row, nrm, b->w, 1, b->p,
+                                 b->out + (size_t)i * b->w);
+            }
+            free(row);
+        }
+        else memset(b->out + (size_t)b->row0 * b->w, 0,
+                    (size_t)(b->row1 - b->row0) * b->w);
+    }
+    mc_sampler_free(s);
+    return NULL;
+}
+
+static void render_bands(const mc_sample_src *src,
+                         const float *pts, const float *normals,
+                         rowgen_fn rowgen, const void *rg_ud,
+                         int w, int h, const mc_render_params *p,
+                         uint8_t *out, int nthreads) {
+    if (w <= 0 || h <= 0) return;
+    if (nthreads <= 0) {
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        nthreads = nc > 0 ? (int)nc : 1;
+    }
+    if (nthreads > 16) nthreads = 16;
+    if (nthreads > h)  nthreads = h;
+    pthread_t th[16];
+    band_t bands[16];
+    int per = (h + nthreads - 1) / nthreads;
+    int nb = 0;
+    for (int t = 0; t < nthreads; t++) {
+        int r0 = t * per, r1 = r0 + per > h ? h : r0 + per;
+        if (r0 >= r1) break;
+        bands[nb] = (band_t){ src, pts, normals, rowgen, rg_ud,
+                              w, h, p, out, r0, r1 };
+        if (nthreads == 1) { band_main(&bands[nb]); continue; }
+        if (pthread_create(&th[nb], NULL, band_main, &bands[nb]) != 0) {
+            band_main(&bands[nb]);          // degrade to inline
+            continue;
+        }
+        nb++;
+    }
+    for (int t = 0; t < nb; t++) pthread_join(th[t], NULL);
+}
+
+void mc_render_points_par(const mc_sample_src *src,
+                          const float *pts, const float *normals,
+                          int w, int h, const mc_render_params *p,
+                          uint8_t *out, int nthreads) {
+    render_bands(src, pts, normals, NULL, NULL, w, h, p, out, nthreads);
+}
+
+// ---------------------------------------------------------------------------
+// plane surface
+// ---------------------------------------------------------------------------
+static inline void v3_norm(float *v) {
+    float l = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 1e-12f) { v[0] /= l; v[1] /= l; v[2] /= l; }
+}
+static inline void v3_cross(const float *a, const float *b, float *o) {
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+void mc_plane_basis(mc_plane *pl) {
+    float *n = pl->normal;
+    v3_norm(n);
+    // pick the world axis least aligned with n as the seed
+    float az = fabsf(n[0]), ay = fabsf(n[1]), ax = fabsf(n[2]);
+    float e[3] = {0, 0, 0};
+    if (az <= ay && az <= ax) e[0] = 1.0f;
+    else if (ay <= ax)        e[1] = 1.0f;
+    else                      e[2] = 1.0f;
+    v3_cross(n, e, pl->u); v3_norm(pl->u);
+    v3_cross(n, pl->u, pl->v); v3_norm(pl->v);
+}
+
+void mc_plane_gen(const mc_plane *pl, int w, int h, float scale,
+                  float *pts, float *normals) {
+    float cx = (float)w * 0.5f, cy = (float)h * 0.5f;
+    for (int i = 0; i < h; i++)
+        for (int j = 0; j < w; j++) {
+            float du = ((float)j - cx) * scale;
+            float dv = ((float)i - cy) * scale;
+            float *P = pts + ((size_t)i * w + j) * 3;
+            for (int k = 0; k < 3; k++)
+                P[k] = pl->origin[k] + du * pl->u[k] + dv * pl->v[k];
+            if (normals) {
+                float *N = normals + ((size_t)i * w + j) * 3;
+                N[0] = pl->normal[0]; N[1] = pl->normal[1]; N[2] = pl->normal[2];
+            }
+        }
+}
+
+// ---------------------------------------------------------------------------
+// quad surface
+// ---------------------------------------------------------------------------
+static inline int qvalid(const float *p) {
+    return !(p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f) &&
+           p[0] == p[0] && p[1] == p[1] && p[2] == p[2];
+}
+
+void mc_quad_gen(const mc_quad *q, float x0, float y0, float step,
+                 int w, int h, float *pts, float *normals) {
+    const int gw = q->gw, gh = q->gh;
+    for (int i = 0; i < h; i++) {
+        float *Prow = pts + (size_t)i * w * 3;
+        float *Nrow = normals ? normals + (size_t)i * w * 3 : NULL;
+        float gy = y0 + (float)i * step;
+        // row-invalid fast fill
+        if (!(gy >= 0.0f) || gy > (float)(gh - 1)) {
+            for (int j = 0; j < w; j++) {
+                Prow[j * 3] = Prow[j * 3 + 1] = Prow[j * 3 + 2] = -1.0f;
+                if (Nrow) Nrow[j * 3] = Nrow[j * 3 + 1] = Nrow[j * 3 + 2] = 0.0f;
+            }
+            continue;
+        }
+        int y0i = (int)gy;
+        if (y0i > gh - 2) y0i = gh - 2;
+        if (y0i < 0) y0i = 0;               // gh == 1
+        float fy = gy - (float)y0i;
+        const float *r0 = q->grid + (size_t)y0i * gw * 3;
+        const float *r1 = q->grid + (size_t)(y0i + (gh > 1)) * gw * 3;
+
+        // per-cell state, reloaded only when the pixel crosses a grid cell
+        int cell = -2, cell_ok = 0;
+        float A[3], B[3], du[3], dv0[3], dv1[3];
+        for (int j = 0; j < w; j++) {
+            float *P = Prow + j * 3;
+            float *N = Nrow ? Nrow + j * 3 : NULL;
+            P[0] = P[1] = P[2] = -1.0f;
+            if (N) N[0] = N[1] = N[2] = 0.0f;
+            float gx = x0 + (float)j * step;
+            if (!(gx >= 0.0f) || gx > (float)(gw - 1)) continue;
+            int x0i = (int)gx;
+            if (x0i > gw - 2) x0i = gw - 2;
+            if (x0i < 0) x0i = 0;           // gw == 1
+            if (x0i != cell) {
+                cell = x0i;
+                const float *p00 = r0 + (size_t)x0i * 3;
+                const float *p01 = r0 + (size_t)(x0i + (gw > 1)) * 3;
+                const float *p10 = r1 + (size_t)x0i * 3;
+                const float *p11 = r1 + (size_t)(x0i + (gw > 1)) * 3;
+                cell_ok = qvalid(p00) && qvalid(p01) &&
+                          qvalid(p10) && qvalid(p11);
+                if (cell_ok)
+                    for (int k = 0; k < 3; k++) {
+                        // y-lerped column endpoints: P = A + (B-A)*fx
+                        A[k] = p00[k] + (p10[k] - p00[k]) * fy;
+                        B[k] = p01[k] + (p11[k] - p01[k]) * fy;
+                        // bilinear tangents (du constant per cell row)
+                        du[k] = (p01[k] - p00[k]) * (1.0f - fy) +
+                                (p11[k] - p10[k]) * fy;
+                        dv0[k] = p10[k] - p00[k];
+                        dv1[k] = p11[k] - p01[k];
+                    }
+            }
+            if (!cell_ok) continue;
+            float fx = gx - (float)x0i;
+            P[0] = A[0] + (B[0] - A[0]) * fx;
+            P[1] = A[1] + (B[1] - A[1]) * fx;
+            P[2] = A[2] + (B[2] - A[2]) * fx;
+            if (N) {
+                float dv[3] = {
+                    dv0[0] + (dv1[0] - dv0[0]) * fx,
+                    dv0[1] + (dv1[1] - dv0[1]) * fx,
+                    dv0[2] + (dv1[2] - dv0[2]) * fx,
+                };
+                v3_cross(du, dv, N);
+                v3_norm(N);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// conveniences (row-strip rendering, no W*H grid)
+// ---------------------------------------------------------------------------
+typedef struct {
+    mc_plane pl;                // normal pre-normalized
+    float scale, cx, cy;
+} plane_rg;
+
+static void plane_rowgen(const void *ud, int row, int w,
+                         float *pts, float *normals) {
+    const plane_rg *g = ud;
+    float dv = ((float)row - g->cy) * g->scale;
+    float base[3], du[3];
+    for (int k = 0; k < 3; k++) {
+        base[k] = g->pl.origin[k] + dv * g->pl.v[k]
+                  - g->cx * g->scale * g->pl.u[k];
+        du[k] = g->scale * g->pl.u[k];
+    }
+    for (int j = 0; j < w; j++) {
+        pts[j * 3 + 0] = base[0] + (float)j * du[0];
+        pts[j * 3 + 1] = base[1] + (float)j * du[1];
+        pts[j * 3 + 2] = base[2] + (float)j * du[2];
+    }
+    if (normals)
+        for (int j = 0; j < w; j++) {
+            normals[j * 3 + 0] = g->pl.normal[0];
+            normals[j * 3 + 1] = g->pl.normal[1];
+            normals[j * 3 + 2] = g->pl.normal[2];
+        }
+}
+
+int mc_render_plane(const mc_sample_src *src, const mc_plane *pl,
+                    int w, int h, float scale,
+                    const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!src || !pl || !p || !out || w <= 0 || h <= 0) return -1;
+    plane_rg g = { *pl, scale, (float)w * 0.5f, (float)h * 0.5f };
+    v3_norm(g.pl.normal);
+    render_bands(src, NULL, NULL, plane_rowgen, &g, w, h, p, out, nthreads);
+    return 0;
+}
+
+typedef struct {
+    const mc_quad *q;
+    float x0, y0, step;
+} quad_rg;
+
+static void quad_rowgen(const void *ud, int row, int w,
+                        float *pts, float *normals) {
+    const quad_rg *g = ud;
+    mc_quad_gen(g->q, g->x0, g->y0 + (float)row * g->step, g->step,
+                w, 1, pts, normals);
+}
+
+int mc_render_quad(const mc_sample_src *src, const mc_quad *q,
+                   float x0, float y0, float step, int w, int h,
+                   const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!src || !q || !q->grid || q->gw < 1 || q->gh < 1 ||
+        !p || !out || w <= 0 || h <= 0) return -1;
+    quad_rg g = { q, x0, y0, step };
+    render_bands(src, NULL, NULL, quad_rowgen, &g, w, h, p, out, nthreads);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// LOD-matched rendering
+// ---------------------------------------------------------------------------
+int mc_render_pick_lod(const mc_sample_lods *ls, float vox_per_pixel) {
+    if (!ls || ls->nlods <= 1) return 0;
+    int L = 0;
+    float v = vox_per_pixel;
+    while (v >= 2.0f && L < ls->nlods - 1) { v *= 0.5f; L++; }
+    // skip levels the caller left empty
+    while (L > 0 && (ls->lods[L].nz <= 0 || !ls->lods[L].block)) L--;
+    return L;
+}
+
+float mc_quad_spacing(const mc_quad *q) {
+    if (!q || !q->grid || q->gw < 2 || q->gh < 1) return 1.0f;
+    // probe up to 32 horizontal neighbor pairs along the grid diagonal
+    double sum = 0.0;
+    int n = 0;
+    int probes = q->gh < 32 ? q->gh : 32;
+    for (int i = 0; i < probes; i++) {
+        int gy = (int)(((int64_t)i * (q->gh - 1)) / (probes > 1 ? probes - 1 : 1));
+        int gx = (int)(((int64_t)i * (q->gw - 2)) / (probes > 1 ? probes - 1 : 1));
+        const float *a = q->grid + ((size_t)gy * q->gw + gx) * 3;
+        const float *b = a + 3;
+        if (!qvalid(a) || !qvalid(b)) continue;
+        float dz = b[0] - a[0], dy = b[1] - a[1], dx = b[2] - a[2];
+        sum += sqrtf(dz * dz + dy * dy + dx * dx);
+        n++;
+    }
+    return n ? (float)(sum / n) : 1.0f;
+}
+
+// wrap a rowgen: remap generated LOD-0 points into LOD-L voxel space.
+// c_L = c_0 * 2^-L + (0.5 * 2^-L - 0.5); border points that map a fraction
+// below 0 clamp to 0 (they are inside voxel 0 of the coarse level) instead
+// of tripping the <0 invalid convention.
+typedef struct {
+    rowgen_fn inner;
+    const void *inner_ud;
+    float a, b;
+} lod_rg;
+
+static void lod_rowgen(const void *ud, int row, int w,
+                       float *pts, float *normals) {
+    const lod_rg *g = ud;
+    g->inner(g->inner_ud, row, w, pts, normals);
+    for (int j = 0; j < w; j++) {
+        float *P = pts + (size_t)j * 3;
+        if (!pt_valid(P)) continue;
+        for (int k = 0; k < 3; k++) {
+            float v = P[k] * g->a + g->b;
+            P[k] = v < 0.0f ? 0.0f : v;
+        }
+    }
+    // normals are directions: unchanged under uniform scaling
+}
+
+static int render_lod(const mc_sample_lods *ls, int L,
+                      rowgen_fn inner, const void *inner_ud,
+                      int w, int h, const mc_render_params *p,
+                      uint8_t *out, int nthreads) {
+    const float inv = 1.0f / (float)(1 << L);
+    lod_rg g = { inner, inner_ud, inv, 0.5f * inv - 0.5f };
+    mc_render_params pl_ = *p;
+    pl_.t0 = p->t0 * inv;       // same physical slab ...
+    pl_.t1 = p->t1 * inv;       // ... stepped at the coarse level's pitch
+    render_bands(&ls->lods[L], NULL, NULL, lod_rowgen, &g, w, h, &pl_,
+                 out, nthreads);
+    return 0;
+}
+
+int mc_render_plane_lod(const mc_sample_lods *ls, const mc_plane *pl,
+                        int w, int h, float scale,
+                        const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!ls || !pl || !p || !out || w <= 0 || h <= 0) return -1;
+    int L = mc_render_pick_lod(ls, scale);
+    if (L == 0)
+        return mc_render_plane(&ls->lods[0], pl, w, h, scale, p, out, nthreads);
+    plane_rg g = { *pl, scale, (float)w * 0.5f, (float)h * 0.5f };
+    v3_norm(g.pl.normal);
+    return render_lod(ls, L, plane_rowgen, &g, w, h, p, out, nthreads);
+}
+
+int mc_render_quad_lod(const mc_sample_lods *ls, const mc_quad *q,
+                       float x0, float y0, float step, int w, int h,
+                       const mc_render_params *p, uint8_t *out, int nthreads) {
+    if (!ls || !q || !q->grid || q->gw < 1 || q->gh < 1 ||
+        !p || !out || w <= 0 || h <= 0) return -1;
+    int L = mc_render_pick_lod(ls, step * mc_quad_spacing(q));
+    if (L == 0)
+        return mc_render_quad(&ls->lods[0], q, x0, y0, step, w, h, p, out,
+                              nthreads);
+    quad_rg g = { q, x0, y0, step };
+    return render_lod(ls, L, quad_rowgen, &g, w, h, p, out, nthreads);
+}
+
+// ---------------------------------------------------------------------------
+// 3D resampling (surface-aligned volumes)
+// ---------------------------------------------------------------------------
+typedef struct {
+    const mc_sample_src *src;
+    const mc_quad *q;
+    float x0, y0, step;
+    float t0, dt;
+    int w, h, nlayers;
+    mc_filter f;
+    uint8_t *out;
+    int row0, row1;
+} qvol_band_t;
+
+static void *qvol_band_main(void *ud) {
+    qvol_band_t *b = ud;
+    mc_sampler *s = mc_sampler_new(b->src);
+    float *row = malloc((size_t)b->w * 6 * sizeof(float));
+    const size_t layer = (size_t)b->w * b->h;
+    if (!s || !row) {
+        for (int k = 0; k < b->nlayers; k++)
+            memset(b->out + layer * k + (size_t)b->row0 * b->w, 0,
+                   (size_t)(b->row1 - b->row0) * b->w);
+        free(row); mc_sampler_free(s);
+        return NULL;
+    }
+    float *nrm = row + (size_t)b->w * 3;
+    quad_rg g = { b->q, b->x0, b->y0, b->step };
+    for (int i = b->row0; i < b->row1; i++) {
+        quad_rowgen(&g, i, b->w, row, nrm);
+        for (int j = 0; j < b->w; j++) {
+            const float *P = row + (size_t)j * 3;
+            const float *N = nrm + (size_t)j * 3;
+            uint8_t *o = b->out + (size_t)i * b->w + j;
+            if (!pt_valid(P)) {
+                for (int k = 0; k < b->nlayers; k++) o[layer * k] = 0;
+                continue;
+            }
+            float nz = N[0], ny = N[1], nx = N[2];
+            float n2 = nz * nz + ny * ny + nx * nx;
+            if (n2 >= 1e-12f && (n2 < 0.9998f || n2 > 1.0002f)) {
+                float nl = 1.0f / sqrtf(n2);
+                nz *= nl; ny *= nl; nx *= nl;
+            }
+            float pz = P[0] + b->t0 * nz, py = P[1] + b->t0 * ny,
+                  px = P[2] + b->t0 * nx;
+            const float sz_ = b->dt * nz, sy_ = b->dt * ny, sx_ = b->dt * nx;
+            int k = 0;
+            if (b->f == MC_FILTER_TRILINEAR) {
+                for (; k + 4 <= b->nlayers; k += 4) {
+                    float bz[4], by[4], bx[4], v4[4];
+                    for (int t = 0; t < 4; t++) {
+                        bz[t] = pz; by[t] = py; bx[t] = px;
+                        pz += sz_; py += sy_; px += sx_;
+                    }
+                    mc_s_tri4(s, bz, by, bx, v4);
+                    for (int t = 0; t < 4; t++)
+                        o[layer * (k + t)] = to_u8(v4[t]);
+                }
+            }
+            for (; k < b->nlayers; k++) {
+                o[layer * k] = to_u8(mc_s_sample(s, pz, py, px, b->f));
+                pz += sz_; py += sy_; px += sx_;
+            }
+        }
+    }
+    free(row);
+    mc_sampler_free(s);
+    return NULL;
+}
+
+int mc_sample_quad_volume(const mc_sample_src *src, const mc_quad *q,
+                          float x0, float y0, float step, int w, int h,
+                          float t0, float dt, int nlayers,
+                          mc_filter f, uint8_t *out, int nthreads) {
+    if (!src || !q || !q->grid || q->gw < 1 || q->gh < 1 ||
+        !out || w <= 0 || h <= 0 || nlayers <= 0) return -1;
+    if (nthreads <= 0) {
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        nthreads = nc > 0 ? (int)nc : 1;
+    }
+    if (nthreads > 16) nthreads = 16;
+    if (nthreads > h)  nthreads = h;
+    pthread_t th[16];
+    qvol_band_t bands[16];
+    int per = (h + nthreads - 1) / nthreads;
+    int nb = 0;
+    for (int t = 0; t < nthreads; t++) {
+        int r0 = t * per, r1 = r0 + per > h ? h : r0 + per;
+        if (r0 >= r1) break;
+        bands[nb] = (qvol_band_t){ src, q, x0, y0, step, t0, dt,
+                                   w, h, nlayers, f, out, r0, r1 };
+        if (nthreads == 1 ||
+            pthread_create(&th[nb], NULL, qvol_band_main, &bands[nb]) != 0) {
+            qvol_band_main(&bands[nb]);
+            continue;
+        }
+        nb++;
+    }
+    for (int t = 0; t < nb; t++) pthread_join(th[t], NULL);
+    return 0;
+}
+
+int mc_sample_box(const mc_sample_src *src,
+                  const float origin[3], const float du[3],
+                  const float dv[3], const float dw[3],
+                  int w, int h, int d,
+                  mc_filter f, uint8_t *out, int nthreads) {
+    if (!src || !origin || !du || !dv || !dw || !out ||
+        w <= 0 || h <= 0 || d <= 0) return -1;
+    // each depth slice is a plane render with the layer offset folded into
+    // the origin; comp NONE so no normals are needed
+    mc_render_params p = { .filter = f, .comp = MC_COMP_NONE };
+    for (int k = 0; k < d; k++) {
+        mc_plane pl;
+        for (int c = 0; c < 3; c++) {
+            // mc_plane_gen centers the image; sample with corner semantics
+            pl.origin[c] = origin[c] + (float)k * dw[c] +
+                           ((float)w * 0.5f) * du[c] + ((float)h * 0.5f) * dv[c];
+            pl.normal[c] = 0.0f;
+            pl.u[c] = du[c];
+            pl.v[c] = dv[c];
+        }
+        if (mc_render_plane(src, &pl, w, h, 1.0f, &p,
+                            out + (size_t)k * w * h, nthreads) != 0)
+            return -1;
+    }
+    return 0;
+}
+
+// ============================================================================
+// mc_zarr — zarr v3-sharded-c3d + v2-flat reader (dep: zstd)
+// ============================================================================
+#include <zstd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <zstd.h>
+
+// ---------------------------------------------------------------------------
+// tiny JSON scraping — enough for zarr.json / .zarray (no general parser).
+// ---------------------------------------------------------------------------
+
+// First integer array of `n` ints after the literal `"key"`. -1 on miss.
+static int json_int_array(const char *j, const char *key, long out[], int n) {
+    const char *p = strstr(j, key);
+    if (!p) return -1;
+    p = strchr(p, '[');
+    if (!p) return -1;
+    ++p;
+    for (int i = 0; i < n; ++i) {
+        char *end;
+        out[i] = strtol(p, &end, 10);
+        if (end == p) return -1;
+        p = end;
+        while (*p == ',' || *p == ' ' || *p == '\n' || *p == '\t' || *p == '\r') ++p;
+    }
+    return 0;
+}
+
+// Is `needle` present anywhere in `j` (substring)?
+static int json_has(const char *j, const char *needle) {
+    return strstr(j, needle) != NULL;
+}
+
+// ---------------------------------------------------------------------------
+// blosc1 decode (shuffle=0, typesize=1) — lifted from tools/mc_fetch.c.
+// header: ver verlz flags typesize nbytes(4) blocksize(4) cbytes(4), LE.
+// ---------------------------------------------------------------------------
+static uint8_t *blosc_decode(const uint8_t *src, size_t srclen, size_t *out_len) {
+    if (srclen < 16) return NULL;
+    uint8_t flags = src[2];
+    uint32_t nbytes, blocksize, cbytes;
+    memcpy(&nbytes, src + 4, 4);
+    memcpy(&blocksize, src + 8, 4);
+    memcpy(&cbytes, src + 12, 4);
+    if (cbytes > srclen || !nbytes) return NULL;
+    if (flags & 0x1 || flags & 0x4) { fprintf(stderr, "mc_zarr: blosc shuffle unsupported\n"); return NULL; }
+    uint8_t *out = malloc(nbytes);
+    if (!out) return NULL;
+    if (flags & 0x2) {                              // memcpyed: raw payload follows header
+        if (16 + (size_t)nbytes > srclen) { free(out); return NULL; }
+        memcpy(out, src + 16, nbytes);
+        *out_len = nbytes;
+        return out;
+    }
+    uint32_t nblocks = (nbytes + blocksize - 1) / blocksize;
+    const uint8_t *bstarts = src + 16;
+    if (16 + (size_t)nblocks * 4 > srclen) { free(out); return NULL; }
+    size_t off = 0;
+    for (uint32_t b = 0; b < nblocks; ++b) {
+        uint32_t bs;
+        memcpy(&bs, bstarts + (size_t)b * 4, 4);
+        uint32_t neblock = (b == nblocks - 1) ? nbytes - b * blocksize : blocksize;
+        if ((size_t)bs + 4 > srclen) { free(out); return NULL; }
+        int32_t cb;
+        memcpy(&cb, src + bs, 4);
+        const uint8_t *payload = src + bs + 4;
+        if (cb <= 0 || (size_t)bs + 4 + (size_t)cb > srclen) { free(out); return NULL; }
+        if ((uint32_t)cb == neblock) {
+            memcpy(out + off, payload, neblock);    // stored uncompressed
+        } else {
+            size_t got = ZSTD_decompress(out + off, neblock, payload, (size_t)cb);
+            if (ZSTD_isError(got) || got != neblock) { free(out); return NULL; }
+        }
+        off += neblock;
+    }
+    *out_len = nbytes;
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// mc_zarr handle
+// ---------------------------------------------------------------------------
+enum { ZV3 = 3, ZV2 = 2 };
+
+// Cached shard index footer: the (offset,len) table is immutable per shard, so
+// read the 64KB footer ONCE and reuse it for all of a shard's inner chunks.
+// Without this, fetching a shard's 4096 chunks one-at-a-time re-reads 64KB *4096.
+#define MC_FOOTER_CACHE 64
+typedef struct {
+    uint64_t shard_id;     // (sz<<40)|(sy<<20)|sx, ~0 = empty slot
+    uint8_t *idx;          // malloc'd footer bytes (n_inner*16)
+    uint64_t lru;          // last-use tick
+} footer_ent;
+
+struct mc_zarr {
+    mc_zarr_read_fn read;
+    void *ud;
+    int version;            // ZV3 | ZV2
+    int shape[3];           // voxels (z,y,x)
+    int shard_edge;         // v3: chunk_grid chunk_shape; v2: == inner_edge
+    int inner_edge;         // v3: sharding inner chunk; v2: .zarray chunks
+    int inner_grid[3];      // ceil(shape/inner_edge) per axis (z,y,x)
+    int per;                // inner chunks per shard axis = shard_edge/inner_edge
+    char codec[16];         // "c3d" | "blosc" | "raw"
+    char sep;               // v2 dimension separator ('.' default, or '/')
+
+    pthread_mutex_t fmu;    // guards the footer cache
+    footer_ent fcache[MC_FOOTER_CACHE];
+    uint64_t ftick;
+};
+
+// fetch a whole object by key; returns malloc'd buf or NULL (sets *len).
+// `err` (optional): *err=1 if the read FAILED (transient — retry, do NOT treat
+// as air); *err=0 if the object is genuinely absent (clean 404 -> confirmed
+// air) or present. Distinguishes z->read's -1 (error) from 0+NULL (404).
+static uint8_t *fetch_all(mc_zarr *z, const char *key, size_t *len, int *err) {
+    if (err) *err = 0;
+    uint8_t *buf = NULL;
+    size_t n = 0;
+    if (z->read(z->ud, key, 0, 0, &buf, &n) < 0) {   // transient error
+        free(buf); *len = 0; if (err) *err = 1; return NULL;
+    }
+    *len = n;                                         // 0 + NULL == clean 404 (air)
+    return buf;
+}
+
+mc_zarr *mc_zarr_open(mc_zarr_read_fn read, void *ud) {
+    if (!read) return NULL;
+    size_t jl = 0;
+    uint8_t *jb = NULL;
+    int v3 = 1;
+    if (read(ud, "zarr.json", 0, 0, &jb, &jl) < 0 || !jb || !jl) {
+        free(jb);
+        jb = NULL;
+        jl = 0;
+        v3 = 0;
+        if (read(ud, ".zarray", 0, 0, &jb, &jl) < 0 || !jb || !jl) { free(jb); return NULL; }
+    }
+    char *j = malloc(jl + 1);
+    if (!j) { free(jb); return NULL; }
+    memcpy(j, jb, jl);
+    j[jl] = 0;
+    free(jb);
+
+    mc_zarr *z = calloc(1, sizeof *z);
+    if (!z) { free(j); return NULL; }
+    pthread_mutex_init(&z->fmu, NULL);
+    z->read = read;
+    z->ud = ud;
+
+    long shp[3];
+    if (json_int_array(j, "\"shape\"", shp, 3) != 0) { free(j); free(z); return NULL; }
+    z->shape[0] = (int)shp[0];
+    z->shape[1] = (int)shp[1];
+    z->shape[2] = (int)shp[2];
+
+    if (v3) {
+        z->version = ZV3;
+        if (!json_has(j, "sharding_indexed")) { free(j); free(z); return NULL; }
+        // chunk_grid.chunk_shape = shard edge (first int array after "chunk_grid").
+        const char *cg = strstr(j, "\"chunk_grid\"");
+        long shard[3];
+        if (!cg || json_int_array(cg, "\"chunk_shape\"", shard, 3) != 0) { free(j); free(z); return NULL; }
+        // sharding_indexed configuration.chunk_shape = inner edge (after that codec).
+        const char *sh = strstr(j, "sharding_indexed");
+        // chunk_shape appears in the sharding config BEFORE the codec name in the
+        // emitted json; search from the codecs array start instead.
+        const char *cc = strstr(j, "\"codecs\"");
+        long inner[3];
+        if (!cc || json_int_array(cc, "\"chunk_shape\"", inner, 3) != 0) { free(j); free(z); return NULL; }
+        (void)sh;
+        z->shard_edge = (int)shard[0];
+        z->inner_edge = (int)inner[0];
+        // inner codec: these archives are always c3d.
+        if (json_has(j, "\"c3d\"")) snprintf(z->codec, sizeof z->codec, "c3d");
+        else { fprintf(stderr, "mc_zarr: v3 inner codec not c3d (unsupported)\n"); free(j); free(z); return NULL; }
+    } else {
+        z->version = ZV2;
+        long ch[3];
+        if (json_int_array(j, "\"chunks\"", ch, 3) != 0) { free(j); free(z); return NULL; }
+        z->inner_edge = (int)ch[0];
+        z->shard_edge = (int)ch[0];           // a v2 chunk is its own shard
+        // compressor: null -> raw, else blosc (the standardized scroll zarrs).
+        if (json_has(j, "\"compressor\": null") || json_has(j, "\"compressor\":null"))
+            snprintf(z->codec, sizeof z->codec, "raw");
+        else snprintf(z->codec, sizeof z->codec, "blosc");
+        // dimension_separator default '.'
+        z->sep = json_has(j, "\"dimension_separator\": \"/\"") ? '/' : '.';
+    }
+
+    free(j);
+    if (z->inner_edge <= 0 || z->shard_edge <= 0 || z->shard_edge % z->inner_edge) {
+        free(z);
+        return NULL;
+    }
+    z->per = z->shard_edge / z->inner_edge;
+    for (int d = 0; d < 3; ++d)
+        z->inner_grid[d] = (z->shape[d] + z->inner_edge - 1) / z->inner_edge;
+    return z;
+}
+
+void mc_zarr_free(mc_zarr *z) {
+    if (!z) return;
+    for (int i = 0; i < MC_FOOTER_CACHE; ++i) free(z->fcache[i].idx);
+    pthread_mutex_destroy(&z->fmu);
+    free(z);
+}
+
+void mc_zarr_shape(const mc_zarr *z, int *nz, int *ny, int *nx) {
+    if (nz) *nz = z->shape[0];
+    if (ny) *ny = z->shape[1];
+    if (nx) *nx = z->shape[2];
+}
+int mc_zarr_inner_edge(const mc_zarr *z) { return z->inner_edge; }
+int mc_zarr_shard_edge(const mc_zarr *z) { return z->shard_edge; }
+const char *mc_zarr_inner_codec(const mc_zarr *z) { return z->codec; }
+void mc_zarr_inner_grid(const mc_zarr *z, int *nz, int *ny, int *nx) {
+    if (nz) *nz = z->inner_grid[0];
+    if (ny) *ny = z->inner_grid[1];
+    if (nx) *nx = z->inner_grid[2];
+}
+
+// ---------------------------------------------------------------------------
+// keys
+// ---------------------------------------------------------------------------
+
+// v3 shard key for the shard containing global inner chunk (cz,cy,cx): "c/sz/sy/sx".
+// v2 chunk key for inner chunk (cz,cy,cx): "cz<sep>cy<sep>cx".
+static void chunk_key(const mc_zarr *z, int cz, int cy, int cx, char out[64]) {
+    if (z->version == ZV3) {
+        int sz = cz / z->per, sy = cy / z->per, sx = cx / z->per;
+        snprintf(out, 64, "c/%d/%d/%d", sz, sy, sx);
+    } else {
+        snprintf(out, 64, "%d%c%d%c%d", cz, z->sep, cy, z->sep, cx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v3 shard index: n_inner entries of (offset:u64, nbytes:u64) LE at shard start.
+// missing == both == 0xFFFF...F. Linear order row-major, z slowest.
+// ---------------------------------------------------------------------------
+static int index_entry(const uint8_t *idx, size_t n_inner, size_t lin,
+                       uint64_t *off, uint64_t *nb) {
+    if (lin >= n_inner) return -1;
+    memcpy(off, idx + lin * 16, 8);
+    memcpy(nb, idx + lin * 16 + 8, 8);
+    if (*off == ~(uint64_t)0 && *nb == ~(uint64_t)0) return 1;   // missing
+    return 0;
+}
+
+// shard-relative linear inner index, row-major (z slowest, x fastest).
+static size_t inner_linear(const mc_zarr *z, int cz, int cy, int cx) {
+    int rz = cz % z->per, ry = cy % z->per, rx = cx % z->per;
+    return ((size_t)rz * z->per + ry) * z->per + rx;
+}
+
+// Get the shard's index footer (n_inner*16 bytes), cached. Reads it once per
+// shard via one ranged GET, then serves all the shard's chunks from RAM.
+// Returns a borrowed pointer valid until the entry is evicted; copy out the
+// (off,len) you need while you still need them (callers do this immediately).
+// NULL if the shard is absent (all air) or on error.
+// `err` (optional) distinguishes the two NULL returns: *err=1 means the footer
+// READ FAILED (transient — caller must retry, NOT treat as air); *err=0 means
+// the shard is genuinely absent (a clean 404 — confirmed air).
+static const uint8_t *footer_get_ex(mc_zarr *z, int cz, int cy, int cx, int *err) {
+    if (err) *err = 0;
+    if (z->version != ZV3) return NULL;
+    uint64_t sid = ((uint64_t)(cz / z->per) << 40) |
+                   ((uint64_t)(cy / z->per) << 20) | (uint64_t)(cx / z->per);
+    pthread_mutex_lock(&z->fmu);
+    for (int i = 0; i < MC_FOOTER_CACHE; ++i)
+        if (z->fcache[i].idx && z->fcache[i].shard_id == sid) {
+            z->fcache[i].lru = ++z->ftick;
+            const uint8_t *p = z->fcache[i].idx;
+            pthread_mutex_unlock(&z->fmu);
+            return p;
+        }
+    pthread_mutex_unlock(&z->fmu);
+
+    // miss: fetch the footer (outside the lock — it's one ranged GET).
+    char key[64];
+    chunk_key(z, cz, cy, cx, key);
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    size_t idx_bytes = n_inner * 16;
+    uint8_t *idx = NULL;
+    size_t got = 0;
+    int rc = z->read(z->ud, key, 0, idx_bytes, &idx, &got);
+    if (rc < 0) {                       // transient read error -> retry, NOT air
+        free(idx);
+        if (err) *err = 1;
+        return NULL;
+    }
+    if (!idx || got < idx_bytes) {      // clean 404 / short -> genuinely absent shard
+        free(idx);
+        return NULL;                    // *err stays 0
+    }
+
+    pthread_mutex_lock(&z->fmu);
+    // re-check (another thread may have inserted it); if so, drop ours.
+    int victim = 0;
+    uint64_t oldest = ~0ull;
+    for (int i = 0; i < MC_FOOTER_CACHE; ++i) {
+        if (z->fcache[i].idx && z->fcache[i].shard_id == sid) {
+            free(idx);
+            z->fcache[i].lru = ++z->ftick;
+            const uint8_t *p = z->fcache[i].idx;
+            pthread_mutex_unlock(&z->fmu);
+            return p;
+        }
+        if (!z->fcache[i].idx) { victim = i; oldest = 0; }
+        else if (z->fcache[i].lru < oldest) { oldest = z->fcache[i].lru; victim = i; }
+    }
+    free(z->fcache[victim].idx);
+    z->fcache[victim].idx = idx;
+    z->fcache[victim].shard_id = sid;
+    z->fcache[victim].lru = ++z->ftick;
+    pthread_mutex_unlock(&z->fmu);
+    return idx;
+}
+static const uint8_t *footer_get(mc_zarr *z, int cz, int cy, int cx) {
+    return footer_get_ex(z, cz, cy, cx, NULL);
+}
+
+int mc_zarr_shard_all_air(mc_zarr *z, int cz, int cy, int cx) {
+    if (z->version != ZV3) {
+        // v2: "all air" == the single chunk object is absent.
+        char key[64];
+        chunk_key(z, cz, cy, cx, key);
+        uint8_t *b = NULL;
+        size_t n = 0;
+        if (z->read(z->ud, key, 0, 1, &b, &n) < 0) return -1;
+        free(b);
+        return n == 0 ? 1 : 0;
+    }
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    const uint8_t *idx = footer_get(z, cz, cy, cx);
+    if (!idx) return 1;   // absent shard = air
+    for (size_t i = 0; i < n_inner; ++i) {
+        uint64_t off, nb;
+        if (index_entry(idx, n_inner, i, &off, &nb) == 0) return 0;
+    }
+    return 1;
+}
+
+// decode a v2 chunk blob (blosc/raw) into a fresh dense buffer.
+static uint8_t *v2_decode(const mc_zarr *z, uint8_t *blob, size_t blen, size_t *out_len) {
+    if (strcmp(z->codec, "raw") == 0) { *out_len = blen; return blob; }   // takes ownership
+    size_t dl = 0;
+    uint8_t *dense = blosc_decode(blob, blen, &dl);
+    free(blob);
+    if (!dense) return NULL;
+    *out_len = dl;
+    return dense;
+}
+
+// Locate one inner chunk WITHOUT fetching: fill its object key + byte range from
+// the cached shard footer. Returns 0 (found: *off/*nb set, c3d raw range), 1
+// (absent/air), <0 (error). v2 chunks are whole objects -> off=0,nb=0 (full GET).
+// Lets a caller batch many chunks' ranged GETs into one s3_get_batch.
+// 0 found (off/nb set), 1 confirmed air (clean 404 / missing index entry),
+// <0 transient READ ERROR (caller must retry, NOT mark the region air).
+int mc_zarr_chunk_locate(mc_zarr *z, int cz, int cy, int cx,
+                         char key_out[64], uint64_t *off, uint64_t *nb) {
+    chunk_key(z, cz, cy, cx, key_out);
+    if (z->version == ZV2) { *off = 0; *nb = 0; return 0; }
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    int err = 0;
+    const uint8_t *idx = footer_get_ex(z, cz, cy, cx, &err);
+    if (!idx) return err ? -1 : 1;                          // read error -> retry; else air
+    size_t lin = inner_linear(z, cz, cy, cx);
+    int st = index_entry(idx, n_inner, lin, off, nb);
+    if (st != 0) return 1;                                   // missing entry -> confirmed air
+    return 0;
+}
+
+int mc_zarr_read_inner(mc_zarr *z, int cz, int cy, int cx, uint8_t **raw, size_t *len) {
+    *raw = NULL;
+    *len = 0;
+    char key[64];
+    chunk_key(z, cz, cy, cx, key);
+
+    if (z->version == ZV2) {
+        // v2: a 404 (chunk object doesn't exist on S3) == confirmed air. A read
+        // error must retry, not be recorded as air.
+        size_t blen = 0; int err = 0;
+        uint8_t *blob = fetch_all(z, key, &blen, &err);
+        if (err) { free(blob); return -1; }               // transient -> retry
+        if (!blob || !blen) { free(blob); return 1; }     // clean 404 -> confirmed air
+        size_t dl = 0;
+        uint8_t *dense = v2_decode(z, blob, blen, &dl);
+        if (!dense) return -1;
+        *raw = dense;
+        *len = dl;
+        return 0;
+    }
+
+    // v3: get the (cached) index footer, then the one inner chunk's payload range.
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    int ferr = 0;
+    const uint8_t *idx = footer_get_ex(z, cz, cy, cx, &ferr);
+    if (!idx) return ferr ? -1 : 1;                         // read error -> retry; else air
+    size_t lin = inner_linear(z, cz, cy, cx);
+    uint64_t off, nb;
+    int st = index_entry(idx, n_inner, lin, &off, &nb);
+    if (st != 0) return 1;                                   // index air marker -> confirmed air
+    uint8_t *payload = NULL;
+    size_t plen = 0;
+    if (z->read(z->ud, key, off, nb, &payload, &plen) < 0) { return -1; }  // transient
+    if (!payload || plen < nb) { free(payload); return -1; }               // short -> retry
+    *raw = payload;
+    *len = nb;
+    return 0;   // c3d raw bytes — caller decodes.
+}
+
+int mc_zarr_read_shard(mc_zarr *z, int cz, int cy, int cx,
+                       mc_zarr_chunk_fn sink, void *sink_ud) {
+    if (z->version == ZV2) {
+        // a v2 "shard" is one chunk.
+        uint8_t *dense = NULL;
+        size_t dl = 0;
+        int st = mc_zarr_read_inner(z, cz, cy, cx, &dense, &dl);
+        if (st < 0) return -1;
+        if (st == 0) { sink(sink_ud, cz, cy, cx, dense, dl); free(dense); }
+        return 0;
+    }
+
+    // v3: read the index footer ONCE, then range-GET each present inner chunk
+    // individually (no whole-shard buffering). Each chunk is sunk + freed before
+    // the next, so RAM stays at one chunk and disk grows per-chunk.
+    char key[64];
+    chunk_key(z, cz, cy, cx, key);
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    const uint8_t *idx = footer_get(z, cz, cy, cx);
+    if (!idx) return 0;   // absent shard = all air
+    int sz0 = (cz / z->per) * z->per, sy0 = (cy / z->per) * z->per, sx0 = (cx / z->per) * z->per;
+    for (int iz = 0; iz < z->per; ++iz)
+        for (int iy = 0; iy < z->per; ++iy)
+            for (int ix = 0; ix < z->per; ++ix) {
+                size_t lin = ((size_t)iz * z->per + iy) * z->per + ix;
+                uint64_t off, nb;
+                if (index_entry(idx, n_inner, lin, &off, &nb) != 0) continue;
+                int gz = sz0 + iz, gy = sy0 + iy, gx = sx0 + ix;
+                if (gz >= z->inner_grid[0] || gy >= z->inner_grid[1] || gx >= z->inner_grid[2])
+                    continue;
+                uint8_t *payload = NULL;
+                size_t plen = 0;
+                if (z->read(z->ud, key, off, nb, &payload, &plen) < 0) return -1;
+                if (payload && plen >= nb)
+                    sink(sink_ud, gz, gy, gx, payload, (size_t)nb);   // c3d raw bytes
+                free(payload);
+            }
+    return 0;
+}
+
+int mc_zarr_shard_index(mc_zarr *z, int cz, int cy, int cx,
+                        char key_out[64], mc_zarr_range **out, int *n) {
+    *out = NULL;
+    *n = 0;
+    if (z->version == ZV2) {
+        // a v2 "shard" is one chunk object; whole-object fetch (off/len = 0).
+        chunk_key(z, cz, cy, cx, key_out);
+        mc_zarr_range *r = malloc(sizeof *r);
+        if (!r) return -1;
+        r[0] = (mc_zarr_range){cz, cy, cx, 0, 0};
+        *out = r;
+        *n = 1;
+        return 0;
+    }
+    chunk_key(z, cz, cy, cx, key_out);
+    size_t n_inner = (size_t)z->per * z->per * z->per;
+    const uint8_t *idx = footer_get(z, cz, cy, cx);
+    if (!idx) return 0;                                     // absent shard = all air
+    mc_zarr_range *arr = malloc(n_inner * sizeof *arr);
+    if (!arr) return -1;
+    int sz0 = (cz / z->per) * z->per, sy0 = (cy / z->per) * z->per, sx0 = (cx / z->per) * z->per;
+    int cnt = 0;
+    for (int iz = 0; iz < z->per; ++iz)
+        for (int iy = 0; iy < z->per; ++iy)
+            for (int ix = 0; ix < z->per; ++ix) {
+                size_t lin = ((size_t)iz * z->per + iy) * z->per + ix;
+                uint64_t off, nb;
+                if (index_entry(idx, n_inner, lin, &off, &nb) != 0) continue;
+                int gz = sz0 + iz, gy = sy0 + iy, gx = sx0 + ix;
+                if (gz >= z->inner_grid[0] || gy >= z->inner_grid[1] || gx >= z->inner_grid[2])
+                    continue;
+                arr[cnt++] = (mc_zarr_range){gz, gy, gx, off, nb};
+            }
+    *out = arr;
+    *n = cnt;
+    return 0;
+}
+
+// ============================================================================
+// mc_s3 — s3://-backed mc_reader glue (dep: libs3)
+// ============================================================================
+#include "libs3.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct mc_s3 {
+    s3_client *cl;
+    char *url;
+    mc_reader *r;
+};
+
+static int s3_read_cb(void *ud, uint64_t off, uint32_t len, uint8_t *dst){
+    mc_s3 *s=ud;
+    s3_response resp={0};
+    if(s3_get_range(s->cl,s->url,off,len,&resp)!=S3_OK || !s3_response_ok(&resp)){
+        s3_response_free(&resp);
+        return -1;
+    }
+    int rc=-1;
+    if(resp.status==206 && resp.body_len>=len){
+        memcpy(dst,resp.body,len); rc=0;          // proper ranged reply
+    } else if(resp.status==200 && resp.body_len>=off+len){
+        memcpy(dst,resp.body+off,len); rc=0;      // server ignored Range and
+    }                                             // sent the whole object
+    s3_response_free(&resp);
+    return rc;
+}
+
+mc_s3 *mc_s3_open(const char *url){
+    if(!url) return NULL;
+    mc_s3 *s=calloc(1,sizeof *s);
+    s3_config cfg={0};
+    s->cl=s3_client_new(&cfg);
+    if(!s->cl){ free(s); return NULL; }
+    s->url=strdup(url);
+    s3_response head={0};
+    uint64_t total=0;
+    if(s3_head(s->cl,url,&head)==S3_OK && s3_response_ok(&head))
+        total=head.content_length;
+    s3_response_free(&head);
+    if(!total){ mc_s3_close(s); return NULL; }
+    s->r=mc_open_streaming(s3_read_cb,s,total);
+    if(!s->r){ mc_s3_close(s); return NULL; }
+    mc_reader_set_partial_fetch(s->r,1);
+    return s;
+}
+mc_reader *mc_s3_reader(mc_s3 *s){ return s?s->r:NULL; }
+void mc_s3_close(mc_s3 *s){
+    if(!s) return;
+    if(s->r) mc_close(s->r);
+    if(s->cl) s3_client_free(s->cl);
+    free(s->url);
+    free(s);
+}
+
+// ============================================================================
+// mc_volume — remote zarr -> local .mca (deps: mc_zarr, libs3, c3d)
+// ============================================================================
+#include "c3d.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+
+#define MAXLOD 8
+#define CHUNK 256
+#define PER (CHUNK / BLK)   // 16 blocks per chunk axis
+
+static void *decoder_main(void *ud);
+static void *dl_main(void *ud);
+static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int cx);
+
+// portable thread naming: macOS names the calling thread (1 arg), glibc
+// takes (thread, name)
+static void mc_thread_setname(const char *name) {
+#if defined(__APPLE__)
+    pthread_setname_np(name);
+#elif defined(__linux__)
+    pthread_setname_np(pthread_self(), name);
+#else
+    (void)name;
+#endif
+}
+static const uint8_t *zero256(void);   // shared 32-aligned 256^3 zero buffer
+
+// ---- timing log (MCV_LOG=1 to enable) -------------------------------------
+static int g_log = -1;
+static double mcv_now(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;   // ms
+}
+#define MCVLOG(...) do { \
+    if (g_log < 0) g_log = getenv("MCV_LOG") ? 1 : 0; \
+    if (g_log) { fprintf(stderr, "[mcv %10.1f] ", mcv_now()); \
+                 fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); fflush(stderr); } \
+} while (0)
+
+// ---------------------------------------------------------------------------
+// per-level source (one mc_zarr + its S3 key prefix)
+// ---------------------------------------------------------------------------
+typedef struct {
+    mc_volume *vol;     // back-pointer (for the shared s3 client + net counter)
+    char prefix[1024];  // e.g. "s3://bucket/root/0" (no trailing slash)
+    mc_zarr *z;
+} level_t;
+
+struct mc_volume {
+    s3_client *s3;             // NULL for a local-filesystem source
+    int local;                 // 1 => root is a local dir, read via file_read
+    char root[1024];           // s3://bucket/root, or /local/dir (no trailing slash)
+    int nlods;
+    level_t lv[MAXLOD];
+    mc_archive *arc;           // ONE archive, all LODs
+    mc_cache *cache;
+    float quality;
+
+    atomic_uint_fast64_t net_bytes;
+
+    pthread_mutex_t mu;        // guards the decode queue + request stack
+    pthread_cond_t cv;         // request-stack not-empty (wakes download threads)
+
+    // Decode pipeline: download threads enqueue raw payloads here; a pool of
+    // decode workers drains them (decode -> re-encode -> append). This keeps the
+    // network saturated (downloaders never wait on CPU) and CPU saturated
+    // (decoders run in parallel), instead of serializing download+decode.
+    pthread_t decoders[32];
+    int ndecoders;
+    struct decode_item *dq;    // ring of pending decode items (slot bound is high;
+    int dq_cap, dq_head, dq_tail;        // the real backpressure is dq_bytes below)
+    size_t dq_bytes;           // compressed bytes currently queued (staging size)
+    size_t dq_byte_budget;     // block producers above this (RAM-budgeted staging)
+    pthread_cond_t dq_ne;      // not-empty (wake a decoder)
+    pthread_cond_t dq_nf;      // not-full  (wake a blocked producer)
+    int stop;
+
+    // Interactive download-request stack (LIFO): a render miss pushes "fetch the
+    // shard around region R". Download threads pop the NEWEST request (current
+    // view) first; when full, the OLDEST (stalest, camera moved on) is dropped.
+    uint64_t *reqstk;          // region keys
+    int rs_cap, rs_n;
+    pthread_t dlthreads[16];
+    int ndl;
+
+    mc_volume_ready_fn ready_cb;   // fired when a region becomes serveable
+    void *ready_ud;
+};
+
+// One unit of decode work: the sub^3 cube of source chunks covering one 256^3
+// region. For c3d (sub=1) nsub==1; for v2 (sub=2) up to 8. Owns the raw bytes.
+typedef struct decode_item {
+    int lod, rz, ry, rx;       // target 256^3 region coords
+    int sub;                   // 1 (c3d) or 2 (v2)
+    int nsub;                  // number of valid sub-chunks
+    int oz[8], oy[8], ox[8];   // sub-chunk voxel offsets within the region
+    uint8_t *raw[8];           // owned compressed bytes (freed by the decoder)
+    size_t rlen[8];
+} decode_item;
+
+// RAM the item occupies in the staging queue: its buffered source bytes —
+// c3d compressed, or v2 blosc/zstd/raw decoded-dense, whatever was read. The
+// byte budget thus naturally holds fewer of the larger (decoded) v2 items.
+static size_t decode_item_bytes(const decode_item *it) {
+    size_t b = 0;
+    for (int k = 0; k < it->nsub; ++k) b += it->rlen[k];
+    return b ? b : 1;                                   // ZERO/air items count as 1
+}
+
+// ---------------------------------------------------------------------------
+// s3 byte source for mc_zarr (prepends the level prefix to the object key)
+// ---------------------------------------------------------------------------
+static int s3_read(void *ud, const char *key, uint64_t off, uint64_t len,
+                   uint8_t **out, size_t *out_len) {
+    level_t *lv = ud;
+    char url[1280];
+    snprintf(url, sizeof url, "%s/%s", lv->prefix, key);
+    s3_response resp = {0};
+    s3_status st;
+    if (len == 0) st = s3_get(lv->vol->s3, url, &resp);
+    else          st = s3_get_range(lv->vol->s3, url, off, len, &resp);
+    if (st != S3_OK) { s3_response_free(&resp); *out = NULL; *out_len = 0; return -1; }
+    if (s3_response_not_found(&resp)) { s3_response_free(&resp); *out = NULL; *out_len = 0; return 0; }
+    if (!s3_response_ok(&resp)) { s3_response_free(&resp); *out = NULL; *out_len = 0; return -1; }
+    // honor a server that ignored Range and sent the whole object.
+    const uint8_t *src = resp.body;
+    size_t n = resp.body_len;
+    if (len != 0 && resp.status == 200 && n >= off + len) { src += off; n = len; }
+    uint8_t *buf = malloc(n ? n : 1);
+    if (!buf) { s3_response_free(&resp); *out = NULL; *out_len = 0; return -1; }
+    memcpy(buf, src, n);
+    s3_response_free(&resp);
+    atomic_fetch_add_explicit(&lv->vol->net_bytes, n, memory_order_relaxed);
+    *out = buf;
+    *out_len = n;
+    return 0;
+}
+
+// Local-filesystem source: mirror of s3_read but reads "<prefix>/<key>" from
+// disk. Same contract: return 0 with *out=NULL on a missing key (so the level
+// probe / air detection behaves like a 404), <0 on real I/O error, 0 with a
+// malloc'd buffer otherwise. `off`/`len` honor ranged reads (footer/index).
+static int file_read(void *ud, const char *key, uint64_t off, uint64_t len,
+                     uint8_t **out, size_t *out_len) {
+    level_t *lv = ud;
+    char path[1280];
+    snprintf(path, sizeof path, "%s/%s", lv->prefix, key);
+    *out = NULL; *out_len = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;                              // missing key == 404
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long fsz = ftell(f);
+    if (fsz < 0) { fclose(f); return -1; }
+    uint64_t start = off;
+    uint64_t want  = (len == 0) ? (uint64_t)fsz : len;
+    if (start > (uint64_t)fsz) { fclose(f); return 0; }      // past EOF
+    if (start + want > (uint64_t)fsz) want = (uint64_t)fsz - start;
+    if (fseek(f, (long)start, SEEK_SET) != 0) { fclose(f); return -1; }
+    uint8_t *buf = malloc(want ? want : 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t got = want ? fread(buf, 1, want, f) : 0;
+    fclose(f);
+    if (got != want) { free(buf); return -1; }
+    atomic_fetch_add_explicit(&lv->vol->net_bytes, got, memory_order_relaxed);
+    *out = buf; *out_len = got;
+    return 0;
+}
+
+// pack a region (lod,cz,cy,cx) into a 64-bit key.
+static uint64_t rkey(int lod, int cz, int cy, int cx) {
+    return ((uint64_t)(lod & 7) << 60) | ((uint64_t)(cz & 0xFFFFF) << 40) |
+           ((uint64_t)(cy & 0xFFFFF) << 20) | (uint64_t)(cx & 0xFFFFF);
+}
+
+// ---------------------------------------------------------------------------
+// transcode one 256^3 region (cz,cy,cx) of lod into the .mca. caller ensures
+// single-flight. returns 1 transcoded data, 0 air, <0 error.
+// ---------------------------------------------------------------------------
+// decode one source inner-chunk's raw bytes into `dst` (edge^3, edge = source
+// inner_edge: 256 for c3d, 128 for v2). dst need not be 32-aligned for v2; c3d
+// needs a 32-aligned 256^3 (the v3 case always passes the region buffer).
+// `dec` is a caller-owned, reusable c3d decoder (one per decode-pool thread):
+// c3d_decoder_new allocates a 64MB coeff buffer + 2MB symbol buffer, so making
+// one per chunk costs ~14% of a decode in alloc/first-touch/free. Reusing the
+// thread's decoder across chunks is bit-identical (it carries only scratch).
+static void decode_inner(c3d_decoder *dec, const char *codec,
+                         const uint8_t *raw, size_t rlen, uint8_t *dst, int edge) {
+    size_t vox = (size_t)edge * edge * edge;
+    if (strcmp(codec, "c3d") == 0) {
+        c3d_decoder_chunk_decode(dec, raw, rlen, dst);  // c3d edge is always 256
+    } else {                                            // blosc/raw: already dense u8
+        if (rlen >= vox) memcpy(dst, raw, vox);
+        else { memset(dst, 0, vox); memcpy(dst, raw, rlen); }
+    }
+}
+
+// blit a src (edge^3) into the 256^3 region buffer at sub-offset (oz,oy,ox) voxels.
+static void blit_sub(uint8_t *region, const uint8_t *src, int edge,
+                     int oz, int oy, int ox) {
+    for (int z = 0; z < edge; ++z)
+        for (int y = 0; y < edge; ++y)
+            memcpy(region + (((size_t)(oz + z) * CHUNK + (oy + y)) * CHUNK + ox),
+                   src + ((size_t)z * edge + y) * edge, (size_t)edge);
+}
+
+// Decode one item (the sub^3 cube for a region) -> assemble 256^3 -> append.
+// Frees the item's raw buffers. Runs on a decode-pool thread (off the download
+// thread). The c3d decode + mc re-encode are the CPU cost we keep off the net.
+static void decode_one(mc_volume *v, c3d_decoder *dec, decode_item *it) {
+    const char *codec = mc_zarr_inner_codec(v->lv[it->lod].z);
+    const int edge = CHUNK / it->sub;
+    if (it->nsub == 0) {                               // all air -> ZERO
+        mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, zero256());
+        return;
+    }
+    uint8_t *dense = NULL;
+    if (posix_memalign((void **)&dense, 64, (size_t)CHUNK * CHUNK * CHUNK)) goto done;
+    double t_dec0 = mcv_now();
+    if (it->sub == 1) {                                // c3d: chunk == region
+        decode_inner(dec, codec, it->raw[0], it->rlen[0], dense, CHUNK);
+    } else {                                           // v2: blit the cube
+        memset(dense, 0, (size_t)CHUNK * CHUNK * CHUNK);
+        uint8_t *tile = malloc((size_t)edge * edge * edge);
+        if (tile) {
+            for (int k = 0; k < it->nsub; ++k) {
+                decode_inner(dec, codec, it->raw[k], it->rlen[k], tile, edge);
+                blit_sub(dense, tile, edge, it->oz[k], it->oy[k], it->ox[k]);
+            }
+            free(tile);
+        }
+    }
+    double t_enc0 = mcv_now();
+    mc_archive_append_chunk_raw(v->arc, it->lod, it->rz, it->ry, it->rx, dense);
+    double t_end = mcv_now();
+    MCVLOG("decoded   lod%d region(%d,%d,%d) codec=%s decode=%.0fms encode=%.0fms",
+           it->lod, it->rz, it->ry, it->rx, codec,
+           t_enc0 - t_dec0, t_end - t_enc0);
+    free(dense);
+done:
+    for (int k = 0; k < it->nsub; ++k) free(it->raw[k]);
+}
+
+// Decode-pool worker: drain decode items, decode off the download thread.
+// Owns ONE reusable c3d decoder for its lifetime (the 64MB coeff buffer alloc
+// is ~14% of a decode; reuse amortizes it to once per thread).
+static void *decoder_main(void *ud) {
+    mc_volume *v = ud;
+    mc_thread_setname("mc-decode");        // distinguish in profilers
+    c3d_decoder *dec = c3d_decoder_new();
+    if (dec) c3d_decoder_set_denoise(dec, false);   // render cache: no denoise pass
+    for (;;) {
+        pthread_mutex_lock(&v->mu);
+        while (v->dq_head == v->dq_tail && !v->stop) pthread_cond_wait(&v->dq_ne, &v->mu);
+        if (v->stop && v->dq_head == v->dq_tail) { pthread_mutex_unlock(&v->mu); break; }
+        decode_item it = v->dq[v->dq_head];
+        v->dq_head = (v->dq_head + 1) % v->dq_cap;
+        v->dq_bytes -= decode_item_bytes(&it);         // free staging budget
+        pthread_cond_signal(&v->dq_nf);                // wake a blocked producer
+        pthread_mutex_unlock(&v->mu);
+        decode_one(v, dec, &it);
+        if (v->ready_cb) v->ready_cb(v->ready_ud);     // region became serveable
+    }
+    if (dec) c3d_decoder_free(dec);
+    return NULL;
+}
+
+// Producer: push a decode item. Backpressure is BYTE-budgeted (RAM-budgeted
+// staging): the download thread only blocks when the queued compressed bytes
+// exceed dq_byte_budget — so downloads run far ahead of the CPU-bound decode
+// pool and the network stays saturated, instead of stalling on a slot count.
+// (A secondary slot-full guard covers the unlikely ring-wrap.) Takes ownership
+// of the item's raw buffers.
+static void decode_push(mc_volume *v, const decode_item *it) {
+    const size_t ib = decode_item_bytes(it);
+    pthread_mutex_lock(&v->mu);
+    int next = (v->dq_tail + 1) % v->dq_cap;
+    int blocked = 0;
+    while (!v->stop &&
+           (next == v->dq_head ||                       // ring full (rare; cap is huge)
+            (v->dq_bytes + ib > v->dq_byte_budget && v->dq_head != v->dq_tail))) {
+        blocked = 1;
+        pthread_cond_wait(&v->dq_nf, &v->mu);
+        next = (v->dq_tail + 1) % v->dq_cap;
+    }
+    if (v->stop) { pthread_mutex_unlock(&v->mu);
+        for (int k = 0; k < it->nsub; ++k) free(it->raw[k]); return; }
+    v->dq[v->dq_tail] = *it;
+    v->dq_tail = next;
+    v->dq_bytes += ib;
+    pthread_cond_signal(&v->dq_ne);
+    size_t qb = v->dq_bytes;
+    pthread_mutex_unlock(&v->mu);
+    if (blocked) MCVLOG("decode_q  FULL (staging budget hit) queued=%.0fMB", qb / 1048576.0);
+}
+
+// unpack a region key.
+static void runpack(uint64_t k, int *lod, int *cz, int *cy, int *cx) {
+    *lod = (int)((k >> 60) & 7);
+    *cz = (int)((k >> 40) & 0xFFFFF);
+    *cy = (int)((k >> 20) & 0xFFFFF);
+    *cx = (int)(k & 0xFFFFF);
+}
+
+// Push an interactive download request (region key) onto the LIFO stack. Newest
+// on top. If full, drop the BOTTOM (stalest). Deduped against the stack. Wakes a
+// download thread. (cv doubles as the stack's not-empty signal.)
+static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
+    uint64_t key = rkey(lod, cz, cy, cx);
+    pthread_mutex_lock(&v->mu);
+    for (int i = 0; i < v->rs_n; ++i)
+        if (v->reqstk[i] == key) { pthread_mutex_unlock(&v->mu); return; }   // already queued
+    if (v->rs_n == v->rs_cap) {                         // full -> drop bottom
+        memmove(&v->reqstk[0], &v->reqstk[1], (size_t)(v->rs_cap - 1) * sizeof(uint64_t));
+        v->rs_n--;
+    }
+    v->reqstk[v->rs_n++] = key;                         // push on top
+    MCVLOG("req_push  lod%d region(%d,%d,%d) stack_depth=%d", lod, cz, cy, cx, v->rs_n);
+    pthread_cond_signal(&v->cv);
+    pthread_mutex_unlock(&v->mu);
+}
+
+// Download thread: pop the newest request, download its shard (-> decode queue).
+// Drain up to DL_BATCH region requests from the LIFO stack (newest first) and
+// fetch their source chunks in ONE s3_get_batch — per-region precision (no
+// whole-shard pull) AND high concurrency (32 GETs over the pooled connections),
+// which is what saturates the link. c3d (sub=1) = one chunk per region; v2
+// regions fall back to the per-chunk cube path.
+enum { DL_BATCH = 32 };
+static void *dl_main(void *ud) {
+    mc_volume *v = ud;
+    mc_thread_setname("mc-download");      // distinguish in profilers
+    for (;;) {
+        int lods[DL_BATCH], rz[DL_BATCH], ry[DL_BATCH], rx[DL_BATCH];
+        int m = 0;
+        pthread_mutex_lock(&v->mu);
+        while (v->rs_n == 0 && !v->stop) pthread_cond_wait(&v->cv, &v->mu);
+        if (v->stop && v->rs_n == 0) { pthread_mutex_unlock(&v->mu); return NULL; }
+        while (m < DL_BATCH && v->rs_n > 0) {           // grab a batch, newest first
+            uint64_t key = v->reqstk[--v->rs_n];
+            runpack(key, &lods[m], &rz[m], &ry[m], &rx[m]);
+            ++m;
+        }
+        pthread_mutex_unlock(&v->mu);
+
+        // Locate each region's c3d source chunk via the cached footer; build one
+        // batched ranged-GET. v2 (sub>1) and local both use the per-region path.
+        s3_range_req reqs[DL_BATCH];
+        s3_response  resp[DL_BATCH];
+        char urls[DL_BATCH][1280];
+        int ri[DL_BATCH], nq = 0;                       // ri[q] -> request index
+        for (int i = 0; i < m; ++i) {
+            mc_zarr *z = v->lv[lods[i]].z;
+            const int sub = CHUNK / mc_zarr_inner_edge(z);
+            if (v->local || sub != 1) {                 // local / v2: direct per-region
+                mc_volume_prefetch_region(v, lods[i], rz[i]*sub, ry[i]*sub, rx[i]*sub);
+                continue;
+            }
+            if (mc_archive_chunk_coverage(v->arc, lods[i], rz[i], ry[i], rx[i]) != MC_ABSENT)
+                continue;                               // already resident
+            char key[64]; uint64_t off, nb;
+            int st = mc_zarr_chunk_locate(z, rz[i], ry[i], rx[i], key, &off, &nb);
+            if (st < 0)                                 // transient read error: leave ABSENT
+                continue;                               // (retry on next miss), do NOT mark air
+            if (st > 0) {                               // CONFIRMED air (footer ok + air marker)
+                decode_item air = {lods[i], rz[i], ry[i], rx[i], 1, 0, {0},{0},{0}, {0},{0}};
+                decode_push(v, &air);
+                continue;
+            }
+            snprintf(urls[nq], sizeof urls[nq], "%s/%s", v->lv[lods[i]].prefix, key);
+            reqs[nq] = (s3_range_req){urls[nq], off, nb};
+            ri[nq] = i;
+            ++nq;
+        }
+        if (nq == 0) continue;
+        MCVLOG("dl_batch  %d regions -> %d ranged GETs", m, nq);
+        memset(resp, 0, sizeof(s3_response) * nq);
+        s3_get_batch(v->s3, reqs, (size_t)nq, 32, resp);
+        for (int q = 0; q < nq; ++q) {
+            int i = ri[q];
+            if (s3_response_ok(&resp[q]) && resp[q].body_len >= reqs[q].length && reqs[q].length) {
+                uint8_t *raw = malloc(reqs[q].length);
+                if (raw) {
+                    memcpy(raw, resp[q].body, reqs[q].length);
+                    atomic_fetch_add_explicit(&v->net_bytes, reqs[q].length, memory_order_relaxed);
+                    decode_item it = {lods[i], rz[i], ry[i], rx[i], 1, 1, {0},{0},{0}, {0},{0}};
+                    it.raw[0] = raw; it.rlen[0] = reqs[q].length;
+                    decode_push(v, &it);
+                }
+            }
+            s3_response_free(&resp[q]);
+        }
+    }
+}
+
+// Blocking fill of one region (get_block / CLI): download its shard synchronously
+// through the same decode queue, then wait for that region's coverage to resolve.
+static mc_cover ensure_region(mc_volume *v, int lod, int cz, int cy, int cx) {
+    mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+    if (cov != MC_ABSENT) return cov;
+    const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
+    mc_volume_prefetch_region(v, lod, cz * sub, cy * sub, cx * sub);  // just this region
+    // wait for the decoders to drain enough that this region is covered.
+    for (int spin = 0; spin < 100000; ++spin) {
+        cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+        if (cov != MC_ABSENT) return cov;
+        struct timespec ts = {0, 1000000};             // 1ms
+        nanosleep(&ts, NULL);
+    }
+    return mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+}
+
+// ---------------------------------------------------------------------------
+// shared 32-aligned zero region (for air)
+// ---------------------------------------------------------------------------
+static uint8_t *g_zero = NULL;
+static void init_zero(void) {
+    if (posix_memalign((void **)&g_zero, 64, (size_t)CHUNK * CHUNK * CHUNK) == 0)
+        memset(g_zero, 0, (size_t)CHUNK * CHUNK * CHUNK);
+}
+static const uint8_t *zero256(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, init_zero);
+    return g_zero;
+}
+
+// ===========================================================================
+// open / discovery
+// ===========================================================================
+
+// strip a trailing '/'.
+static void rstrip_slash(char *s) {
+    size_t n = strlen(s);
+    while (n && s[n - 1] == '/') s[--n] = 0;
+}
+
+mc_volume *mc_volume_open(const char *url, const char *cache_dir,
+                          size_t cache_bytes, float quality) {
+    return mc_volume_open_ex(url, cache_dir, cache_bytes, quality, NULL);
+}
+
+mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
+                             size_t cache_bytes, float quality,
+                             const mc_volume_config *cfg) {
+    if (!url || !cache_dir) return NULL;
+    mc_volume *v = calloc(1, sizeof *v);
+    if (!v) return NULL;
+    v->quality = quality;
+    atomic_init(&v->net_bytes, 0);
+    pthread_mutex_init(&v->mu, NULL);
+    pthread_cond_init(&v->cv, NULL);
+
+    // Local vs remote: a URL with a "scheme://" is remote (s3/https), otherwise
+    // `url` is a local filesystem directory read via file_read (no S3 client).
+    v->local = (strstr(url, "://") == NULL);
+    if (!v->local) {
+        // s3 client: full credential resolution (profile/IMDS/SSO/env), else anonymous.
+        s3_config cfg = {0};
+        s3_credentials creds = {0};
+        if (s3_credentials_load(NULL, &creds) == S3_OK) cfg.creds = creds;
+        v->s3 = s3_client_new(&cfg);
+        s3_credentials_free(&creds);
+        if (!v->s3) { free(v); return NULL; }
+    }
+    mc_zarr_read_fn read_cb = v->local ? file_read : s3_read;
+
+    snprintf(v->root, sizeof v->root, "%s", url);
+    rstrip_slash(v->root);
+
+    // discover levels: probe "<root>/<i>/zarr.json" for i=0.. until a gap.
+    for (int i = 0; i < MAXLOD; ++i) {
+        level_t *lv = &v->lv[i];
+        lv->vol = v;
+        snprintf(lv->prefix, sizeof lv->prefix, "%s/%d", v->root, i);
+        mc_zarr *z = mc_zarr_open(read_cb, lv);
+        if (!z) { lv->prefix[0] = 0; break; }
+        lv->z = z;
+        v->nlods = i + 1;
+    }
+    if (v->nlods == 0) { if (v->s3) s3_client_free(v->s3); free(v); return NULL; }
+
+    // local .mca dims from LOD0 shape (padded to 256 internally by mc).
+    int nz, ny, nx;
+    mc_zarr_shape(v->lv[0].z, &nz, &ny, &nx);
+    char path[2048];
+    // archive name from the last path component of the root.
+    const char *base = strrchr(v->root, '/');
+    base = base ? base + 1 : v->root;
+    snprintf(path, sizeof path, "%s/%s.mca", cache_dir, base);
+    v->arc = mc_archive_open_dims(path, nx, ny, nz, quality);
+    if (!v->arc) {
+        for (int i = 0; i < v->nlods; ++i) mc_zarr_free(v->lv[i].z);
+        s3_client_free(v->s3); free(v); return NULL;
+    }
+    v->cache = mc_cache_new_archive(cache_bytes, v->arc);
+    if (!v->cache) {
+        mc_archive_close(v->arc);
+        for (int i = 0; i < v->nlods; ++i) mc_zarr_free(v->lv[i].z);
+        s3_client_free(v->s3); free(v); return NULL;
+    }
+
+    // Pipeline: a few download threads (network-bound, pop the LIFO request
+    // stack) feed a bounded decode queue drained by a decode pool (CPU-bound).
+    pthread_cond_init(&v->dq_ne, NULL);
+    pthread_cond_init(&v->dq_nf, NULL);
+    // Staging queue: downloaded compressed chunks wait here for the (CPU-bound)
+    // decode pool. Backpressure is BYTE-budgeted (default 2GB) so downloads run
+    // far ahead of decode and the network stays saturated, decoupling the two.
+    // The ring slot count just needs to exceed however many items fit in the
+    // budget — size it from the budget assuming small (~64KB) chunks, capped.
+    v->dq_byte_budget = (cfg && cfg->staging_bytes > 0) ? cfg->staging_bytes
+                                                        : (2ull << 30);   // 2 GB
+    if (v->dq_byte_budget < (64ull << 20)) v->dq_byte_budget = 64ull << 20;
+    v->dq_bytes = 0;
+    v->dq_cap = (int)(v->dq_byte_budget / (64ull << 10)) + 8;   // ~budget/64KB slots
+    if (v->dq_cap < 256) v->dq_cap = 256; if (v->dq_cap > 131072) v->dq_cap = 131072;
+    v->dq = calloc((size_t)v->dq_cap, sizeof *v->dq);
+    // LIFO request stack: just 8-byte region keys, so it can be large — a fast
+    // navigation enqueues many thousands of on-screen region misses, and we
+    // don't want to drop ones still in view. 64K keys = 512KB.
+    v->rs_cap = (cfg && cfg->request_stack > 0) ? cfg->request_stack : 65536;
+    if (v->rs_cap < 256) v->rs_cap = 256; if (v->rs_cap > (1<<22)) v->rs_cap = (1<<22);
+    v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
+
+    // Decoders default to nproc/2: the c3d/wavelet decode is memory-bandwidth-
+    // bound (a 256^3 decode streams ~16MB), so threads past ~half the cores
+    // saturate the bus and only inflate per-decode latency (measured: 1T 103ms,
+    // 8T 176ms, 16T 305ms — ~same throughput past 8 but 2x the latency). Caller
+    // may override via mc_volume_config; clamp to the fixed pool arrays.
+    long nproc = sysconf(_SC_NPROCESSORS_ONLN);
+    int nd = (cfg && cfg->decoders > 0) ? cfg->decoders
+                                        : (nproc > 2 ? (int)(nproc / 2) : 2);
+    if (nd < 1) nd = 1; if (nd > 32) nd = 32;          // decoders[32]
+    v->ndecoders = nd;
+    for (int i = 0; i < v->ndecoders; ++i)
+        pthread_create(&v->decoders[i], NULL, decoder_main, v);
+    int ndl = (cfg && cfg->dl_threads > 0) ? cfg->dl_threads : 8;
+    if (ndl < 1) ndl = 1; if (ndl > 16) ndl = 16;      // dlthreads[16]
+    v->ndl = ndl;
+    for (int i = 0; i < v->ndl; ++i)
+        pthread_create(&v->dlthreads[i], NULL, dl_main, v);
+    MCVLOG("open      %s  decoders=%d dl_threads=%d staging=%.1fGB(slots=%d) rs_cap=%d",
+           url, v->ndecoders, v->ndl, v->dq_byte_budget / 1073741824.0, v->dq_cap, v->rs_cap);
+    return v;
+}
+
+void mc_volume_free(mc_volume *v) {
+    if (!v) return;
+    // stop download + decode threads.
+    pthread_mutex_lock(&v->mu);
+    v->stop = 1;
+    pthread_cond_broadcast(&v->cv);      // wake download threads
+    pthread_cond_broadcast(&v->dq_ne);   // wake decoders
+    pthread_cond_broadcast(&v->dq_nf);   // wake blocked producers
+    pthread_mutex_unlock(&v->mu);
+    for (int i = 0; i < v->ndl; ++i) pthread_join(v->dlthreads[i], NULL);
+    for (int i = 0; i < v->ndecoders; ++i) pthread_join(v->decoders[i], NULL);
+    // drain any remaining decode items (free their raw buffers).
+    while (v->dq_head != v->dq_tail) {
+        decode_item *it = &v->dq[v->dq_head];
+        for (int k = 0; k < it->nsub; ++k) free(it->raw[k]);
+        v->dq_head = (v->dq_head + 1) % v->dq_cap;
+    }
+    pthread_cond_destroy(&v->dq_ne);
+    pthread_cond_destroy(&v->dq_nf);
+    if (v->cache) mc_cache_free(v->cache);
+    if (v->arc) mc_archive_close(v->arc);
+    for (int i = 0; i < v->nlods; ++i) if (v->lv[i].z) mc_zarr_free(v->lv[i].z);
+    if (v->s3) s3_client_free(v->s3);
+    free(v->dq);
+    free(v->reqstk);
+    pthread_mutex_destroy(&v->mu);
+    pthread_cond_destroy(&v->cv);
+    free(v);
+}
+
+int  mc_volume_nlods(const mc_volume *v) { return v ? v->nlods : 0; }
+void mc_volume_shape(const mc_volume *v, int lod, int *nz, int *ny, int *nx) {
+    mc_zarr_shape(v->lv[lod].z, nz, ny, nx);
+}
+void mc_volume_block_grid(const mc_volume *v, int lod, int *nz, int *ny, int *nx) {
+    int sz, sy, sx;
+    mc_zarr_shape(v->lv[lod].z, &sz, &sy, &sx);
+    if (nz) *nz = (sz + BLK - 1) / BLK;
+    if (ny) *ny = (sy + BLK - 1) / BLK;
+    if (nx) *nx = (sx + BLK - 1) / BLK;
+}
+int mc_volume_get_level_meta(const mc_volume *v, int lod, mc_volume_level_meta *out) {
+    if (!v || !out || lod < 0 || lod >= v->nlods) return -1;
+    const mc_zarr *z = v->lv[lod].z;
+    mc_zarr_shape(z, &out->shape[0], &out->shape[1], &out->shape[2]);
+    out->inner_edge = mc_zarr_inner_edge(z);
+    out->shard_edge = mc_zarr_shard_edge(z);
+    const char *c = mc_zarr_inner_codec(z);
+    snprintf(out->codec, sizeof out->codec, "%s", c ? c : "");
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// block serving
+// ---------------------------------------------------------------------------
+int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst) {
+    if (lod < 0 || lod >= v->nlods) { memset(dst, 0, BLK * BLK * BLK); return 0; }
+    int cz = bz / PER, cy = by / PER, cx = bx / PER;
+    mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+    if (cov == MC_ABSENT) {
+        req_push(v, lod, cz, cy, cx);   // LIFO download request; render falls to coarser LOD
+        memset(dst, 0, BLK * BLK * BLK);
+        return 0;
+    }
+    if (cov == MC_ZERO) { memset(dst, 0, BLK * BLK * BLK); return 1; }
+    mc_cache_get_copy(v->cache, lod, bz, by, bx, dst);
+    return 1;
+}
+
+int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst) {
+    if (lod < 0 || lod >= v->nlods) { memset(dst, 0, BLK * BLK * BLK); return -1; }
+    int cz = bz / PER, cy = by / PER, cx = bx / PER;
+    mc_cover cov = ensure_region(v, lod, cz, cy, cx);
+    if (cov == MC_ZERO || cov == MC_ABSENT) { memset(dst, 0, BLK * BLK * BLK); return cov == MC_ZERO ? 0 : -1; }
+    mc_cache_get_copy(v->cache, lod, bz, by, bx, dst);
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// sampling source
+// ---------------------------------------------------------------------------
+static const uint8_t *vol_block(const mc_sample_src *src,
+                                int bz, int by, int bx, uint8_t *tmp) {
+    mc_volume *v = src->ud;
+    int r = src->aux2 ? mc_volume_get_block(v, src->aux, bz, by, bx, tmp)
+                      : mc_volume_try_block(v, src->aux, bz, by, bx, tmp);
+    return r == 1 ? tmp : NULL;
+}
+
+mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking) {
+    mc_sample_src s = {0};
+    s.ud = v; s.aux = lod; s.aux2 = blocking; s.block = vol_block;
+    mc_volume_shape(v, lod, &s.nz, &s.ny, &s.nx);
+    return s;
+}
+
+mc_sample_lods mc_volume_sample_lods(mc_volume *v, int blocking) {
+    mc_sample_lods ls = {0};
+    ls.nlods = v->nlods < 8 ? v->nlods : 8;
+    for (int l = 0; l < ls.nlods; l++)
+        ls.lods[l] = mc_volume_sample_src(v, l, blocking);
+    return ls;
+}
+
+// ---------------------------------------------------------------------------
+// prefetch — batch a whole shard's present inner chunks in ONE parallel
+// s3_get_batch (many concurrent GETs over pooled connections), then decode +
+// assemble into 256^3 regions and append. This is the throughput path: the
+// parallelism lives in libs3's connection pool, so a FEW prefetch driver
+// threads saturate bandwidth without a thread-per-GET explosion. RAM is bounded
+// by one shard's compressed chunks (a fraction of the decoded shard).
+// (cz,cy,cx) is any source inner-chunk in the target shard.
+// ---------------------------------------------------------------------------
+// Download ONE 256^3 region's source chunk(s) and push it to the decode queue —
+// the interactive path. The shard index (64KB footer) is read once and cached
+// (footer_get / mc_zarr_read_inner), so this is: cached footer lookup + a single
+// ranged GET per source chunk (1 for c3d, up to 8 for a v2 sub^3 cube). NO
+// whole-shard download. (cz,cy,cx) = the source inner-chunk coord of the region.
+static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int cx) {
+    if (lod < 0 || lod >= v->nlods) return;
+    mc_zarr *z = v->lv[lod].z;
+    const int edge = mc_zarr_inner_edge(z);            // 256 (c3d) or 128 (v2)
+    const int sub = CHUNK / edge;                      // source chunks per region axis
+    const int rz = cz / sub, ry = cy / sub, rx = cx / sub;   // 256^3 region coords
+    if (mc_archive_chunk_coverage(v->arc, lod, rz, ry, rx) != MC_ABSENT) return;  // already have it
+
+    if (sub == 1) {                                    // c3d / v2-256: one chunk == region
+        uint8_t *raw = NULL; size_t rlen = 0;
+        int st = mc_zarr_read_inner(z, cz, cy, cx, &raw, &rlen);
+        if (st < 0) { free(raw); return; }             // transient error -> leave ABSENT, retry
+        if (st > 0 || !raw || !rlen) {                 // CONFIRMED air -> ZERO region
+            free(raw);
+            decode_item air = {lod, rz, ry, rx, 1, 0, {0},{0},{0}, {0},{0}};
+            decode_push(v, &air);
+            return;
+        }
+        atomic_fetch_add_explicit(&v->net_bytes, rlen, memory_order_relaxed);
+        decode_item it = {lod, rz, ry, rx, 1, 1, {0},{0},{0}, {0},{0}};
+        it.raw[0] = raw; it.rlen[0] = rlen;
+        decode_push(v, &it);
+        return;
+    }
+
+    // v2 sub^3 cube: fetch each present source chunk of the region's cube. A
+    // transient read error on ANY sub-chunk aborts the whole region (leave it
+    // ABSENT to retry) rather than recording a partial/air result.
+    int sz0 = rz * sub, sy0 = ry * sub, sx0 = rx * sub;
+    decode_item it = {lod, rz, ry, rx, sub, 0, {0},{0},{0}, {0},{0}};
+    for (int dz = 0; dz < sub; ++dz)
+    for (int dy = 0; dy < sub; ++dy)
+    for (int dx = 0; dx < sub; ++dx) {
+        uint8_t *raw = NULL; size_t rlen = 0;
+        int st = mc_zarr_read_inner(z, sz0 + dz, sy0 + dy, sx0 + dx, &raw, &rlen);
+        if (st < 0) {                                  // transient -> abort, retry region
+            for (int k = 0; k < it.nsub; ++k) free(it.raw[k]);
+            free(raw);
+            return;
+        }
+        if (st > 0 || !raw || !rlen) { free(raw); continue; }   // this sub-chunk confirmed air
+        atomic_fetch_add_explicit(&v->net_bytes, rlen, memory_order_relaxed);
+        int k = it.nsub++;
+        it.raw[k] = raw; it.rlen[k] = rlen;
+        it.oz[k] = dz * edge; it.oy[k] = dy * edge; it.ox[k] = dx * edge;
+    }
+    decode_push(v, &it);                               // nsub==0 -> all sub-chunks air -> ZERO
+}
+
+// Download a shard's present chunks (one parallel s3_get_batch) and PUSH each
+// region's raw payload(s) to the decode queue — NO decode on this (download)
+// thread. Decoders drain the queue in parallel, so the network stays saturated.
+// Backpressure in decode_push bounds RAM. (cz,cy,cx) = source inner-chunk coord.
+// NOTE: bulk path (CLI prefetch). The interactive render path uses
+// mc_volume_prefetch_region (one region) so navigation never pulls a whole shard.
+void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
+    if (lod < 0 || lod >= v->nlods) return;
+    level_t *lv = &v->lv[lod];
+    mc_zarr *z = lv->z;
+    const int edge = mc_zarr_inner_edge(z);            // 256 (c3d) or 128 (v2)
+    const int sub = CHUNK / edge;                      // source chunks per region axis
+
+    char shard_key[64];
+    mc_zarr_range *ranges = NULL;
+    int nr = 0;
+    double t0 = mcv_now();
+    if (mc_zarr_shard_index(z, cz, cy, cx, shard_key, &ranges, &nr) < 0) {
+        MCVLOG("shard_idx lod%d src(%d,%d,%d) FAILED", lod, cz, cy, cx); return;
+    }
+    MCVLOG("shard_idx lod%d src(%d,%d,%d) -> %d present chunks (footer %.0fms)",
+           lod, cz, cy, cx, nr, mcv_now() - t0);
+    if (nr == 0) { free(ranges); return; }             // all air
+
+    char shard_url[1280];
+    snprintf(shard_url, sizeof shard_url, "%s/%s", lv->prefix, shard_key);
+    uint64_t got = 0;
+    int nbatch = 0;
+
+    // Download the shard's chunks in batches of MC_BATCH (bounded buffering),
+    // then hand each region's raw bytes to the decode pool. v2 groups the sub^3
+    // cube per region; c3d is 1:1.
+    enum { MC_BATCH = 48 };
+    s3_range_req reqs[MC_BATCH];
+    s3_response resp[MC_BATCH];
+    int idx[MC_BATCH];
+    for (int base = 0; base < nr; ) {
+        int nq = 0;
+        while (base < nr && nq < MC_BATCH) {
+            mc_zarr_range *rg = &ranges[base++];
+            int rz = rg->cz / sub, ry = rg->cy / sub, rx = rg->cx / sub;
+            if (mc_archive_chunk_coverage(v->arc, lod, rz, ry, rx) != MC_ABSENT) continue;
+            reqs[nq] = (s3_range_req){shard_url, rg->off, rg->len};
+            idx[nq] = base - 1;
+            ++nq;
+        }
+        if (nq == 0) continue;
+        memset(resp, 0, sizeof resp);
+        double tb = mcv_now();
+        if (v->local) {
+            // Local: each req is a ranged read of the shard file. No network, no
+            // batching win — just pread each range into an s3_response so the
+            // decode-push path below is identical to the remote case.
+            FILE *lf = fopen(shard_url, "rb");
+            for (int i = 0; i < nq; ++i) {
+                if (!lf) { resp[i].status = 404; continue; }
+                if (fseek(lf, (long)reqs[i].offset, SEEK_SET) != 0) { resp[i].status = 500; continue; }
+                uint8_t *b = malloc(reqs[i].length ? reqs[i].length : 1);
+                if (!b) { resp[i].status = 500; continue; }
+                size_t g = reqs[i].length ? fread(b, 1, reqs[i].length, lf) : 0;
+                if (g != reqs[i].length) { free(b); resp[i].status = 500; continue; }
+                resp[i].status = 200; resp[i].body = b; resp[i].body_len = g;
+            }
+            if (lf) fclose(lf);
+        } else {
+            s3_get_batch(v->s3, reqs, (size_t)nq, 32, resp);   // partial ok; check each
+        }
+        { int ok = 0; uint64_t bytes = 0;
+          for (int i = 0; i < nq; ++i) if (s3_response_ok(&resp[i])) { ok++; bytes += resp[i].body_len; }
+          // Count ACTUAL transferred bytes per batch (the real network/disk
+          // throughput), not just the kept-chunk bytes accumulated in `got`
+          // below — and do it per batch so a download-rate readout updates
+          // promptly instead of only when the whole shard finishes.
+          atomic_fetch_add_explicit(&v->net_bytes, bytes, memory_order_relaxed);
+          MCVLOG("batch#%d  lod%d nq=%d ok=%d %.2fMB in %.0fms = %.1f MB/s",
+                 nbatch++, lod, nq, ok, bytes/1048576.0, mcv_now()-tb,
+                 bytes/1048576.0/((mcv_now()-tb)/1000.0)); }
+
+        if (sub == 1) {                                // c3d: one chunk == one region
+            for (int i = 0; i < nq; ++i) {
+                mc_zarr_range *rg = &ranges[idx[i]];
+                if (s3_response_ok(&resp[i]) && rg->len && resp[i].body_len >= rg->len) {
+                    decode_item it = {lod, rg->cz, rg->cy, rg->cx, 1, 1, {0},{0},{0}, {0},{0}};
+                    it.raw[0] = malloc(rg->len);
+                    if (it.raw[0]) { memcpy(it.raw[0], resp[i].body, rg->len); it.rlen[0] = rg->len;
+                        got += rg->len; decode_push(v, &it); }
+                }
+                s3_response_free(&resp[i]);
+            }
+        } else {                                       // v2: regroup the cube per region
+            // Build one decode_item per distinct region in this batch.
+            for (int i = 0; i < nq; ++i) {
+                if (idx[i] < 0) continue;              // already consumed into a cube
+                mc_zarr_range *r0 = &ranges[idx[i]];
+                int rz = r0->cz / sub, ry = r0->cy / sub, rx = r0->cx / sub;
+                decode_item it = {lod, rz, ry, rx, sub, 0, {0},{0},{0}, {0},{0}};
+                for (int j = i; j < nq; ++j) {
+                    if (idx[j] < 0) continue;
+                    mc_zarr_range *rg = &ranges[idx[j]];
+                    if (rg->cz / sub != rz || rg->cy / sub != ry || rg->cx / sub != rx) continue;
+                    if (s3_response_ok(&resp[j]) && resp[j].body_len >= rg->len && it.nsub < 8) {
+                        size_t rlen = rg->len ? rg->len : resp[j].body_len;
+                        uint8_t *buf = malloc(rlen);
+                        if (buf) { memcpy(buf, resp[j].body, rlen);
+                            int k = it.nsub++;
+                            it.raw[k] = buf; it.rlen[k] = rlen;
+                            it.oz[k] = (rg->cz % sub) * edge;
+                            it.oy[k] = (rg->cy % sub) * edge;
+                            it.ox[k] = (rg->cx % sub) * edge;
+                            got += rlen;
+                        }
+                    }
+                    idx[j] = -1;                       // consumed
+                }
+                decode_push(v, &it);                   // nsub may be 0 -> ZERO region
+            }
+            for (int i = 0; i < nq; ++i) s3_response_free(&resp[i]);
+        }
+    }
+    (void)got;   // net_bytes is now counted per batch above (actual transfer)
+    free(ranges);
+}
+
+void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel) {
+    (void)nthreads;   // TODO: thread team; serial walk for now.
+    if (lod < 0 || lod >= v->nlods) return;
+    int gz, gy, gx;
+    mc_zarr_inner_grid(v->lv[lod].z, &gz, &gy, &gx);
+    int per = mc_zarr_shard_edge(v->lv[lod].z) / mc_zarr_inner_edge(v->lv[lod].z);
+    for (int sz = 0; sz < gz; sz += per)
+        for (int sy = 0; sy < gy; sy += per)
+            for (int sx = 0; sx < gx; sx += per) {
+                if (cancel && *cancel) return;
+                mc_volume_prefetch_shard(v, lod, sz, sy, sx);
+            }
+}
+
+size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes) {
+    return (v && v->cache) ? mc_cache_resize(v->cache, bytes) : 0;
+}
+
+size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes) {
+    if (!v) return 0;
+    if (bytes < (64ull << 20)) bytes = 64ull << 20;    // floor 64MB
+    pthread_mutex_lock(&v->mu);
+    v->dq_byte_budget = bytes;
+    pthread_cond_broadcast(&v->dq_nf);                 // a raise may unblock producers
+    size_t installed = v->dq_byte_budget;
+    pthread_mutex_unlock(&v->mu);
+    return installed;
+}
+
+void mc_volume_set_ready_cb(mc_volume *v, mc_volume_ready_fn cb, void *ud) {
+    v->ready_cb = cb;
+    v->ready_ud = ud;
+}
+
+void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
+    mc_cache_stats cs = {0};
+    if (v->cache) mc_cache_get_stats(v->cache, &cs);
+    out->cache_hits = cs.hits;
+    out->cache_misses = cs.misses;
+    out->cache_used_blocks = cs.used;
+    out->cache_cap_blocks = cs.slots;
+    out->disk_bytes = v->arc ? mc_archive_data_len(v->arc) : 0;
+    out->net_bytes = atomic_load_explicit(&v->net_bytes, memory_order_relaxed);
+    out->regions_inflight = (uint64_t)v->rs_n;
 }
