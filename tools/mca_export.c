@@ -38,6 +38,7 @@
 #include <libgen.h>
 #include <malloc.h>
 #include <limits.h>
+#include <time.h>
 
 typedef uint8_t u8;
 #define MCC 256                 /* mc chunk edge */
@@ -703,6 +704,124 @@ static void apply_meta(fy_pipeline_cfg *c, const char *key, double v) {
     else if (!strcmp(key,"window_hi"))             c->window_hi = v;
 }
 
+
+/* ---- provenance: stamp the export's full parameterization into the archive's
+ * user-metadata carveout (the [256B..128KB) region every .mca reserves), so the
+ * archive is self-describing: profile, every resolved parameter (CLI knobs +
+ * the post-calibration pipeline config), and the source metadata.json inlined
+ * verbatim. Read back with mc_archive_metadata()/mc_metadata(). ---- */
+static size_t prov_escape(char *d, size_t cap, const char *s){
+    size_t n=0;
+    for(; *s && n+8<cap; ++s){
+        unsigned char ch=(unsigned char)*s;
+        if(ch=='"'||ch=='\\'){ d[n++]='\\'; d[n++]=(char)ch; }
+        else if(ch<0x20) n+=(size_t)snprintf(d+n,cap-n,"\\u%04x",ch);
+        else d[n++]=(char)ch;
+    }
+    d[n]=0; return n;
+}
+static void stamp_provenance(mc_archive *arc, const char *in, const char *out,
+                             const char *profile, float quality, int process,
+                             const char *meta_path, const fy_pipeline_cfg *c,
+                             long SB, long BAND, int nthreads, int niothreads, int qcap,
+                             double mem_gb, double cache_gb){
+    size_t cap=120*1024;
+    char *j=malloc(cap); if(!j) return;
+    char ein[PATH_MAX*2], eout[PATH_MAX*2], emp[PATH_MAX*2];
+    prov_escape(ein,sizeof ein,in); prov_escape(eout,sizeof eout,out);
+    prov_escape(emp,sizeof emp,meta_path);
+    char ts[32]; { time_t now=time(NULL); struct tm tm; gmtime_r(&now,&tm);
+                   strftime(ts,sizeof ts,"%Y-%m-%dT%H:%M:%SZ",&tm); }
+    size_t n=(size_t)snprintf(j,cap,
+        "{\n"
+        " \"tool\": \"mca_export\",\n"
+        " \"created_utc\": \"%s\",\n"
+        " \"input\": \"%s\",\n"
+        " \"output\": \"%s\",\n"
+        " \"profile\": \"%s\",\n"
+        " \"quality\": %.4g,\n"
+        " \"process\": %d,\n"
+        " \"cli\": {\"sb\": %ld, \"band\": %ld, \"threads\": %d, \"io_threads\": %d,"
+        " \"queue\": %d, \"mem_gb\": %.3g, \"cache_gb\": %.3g,"
+        " \"downscale\": \"%s\", \"alpha\": %.4g},\n",
+        ts,ein,eout,profile,(double)quality,process,SB,BAND,nthreads,niothreads,qcap,
+        mem_gb,cache_gb,g_ds==FY_DS_BOX?"box":"cbox",(double)g_alpha);
+    n+=(size_t)snprintf(j+n,cap-n,
+        " \"pipeline\": {\n"
+        "  \"delta_beta\": %.6g, \"energy_kev\": %.6g, \"distance_mm\": %.6g,"
+        " \"pixel_um\": %.6g,\n"
+        "  \"unsharp_sigma\": %.6g, \"unsharp_coeff\": %.6g,\n"
+        "  \"machine_current_start\": %.6g, \"machine_current_stop\": %.6g,\n"
+        "  \"window_lo\": %.6g, \"window_hi\": %.6g,\n"
+        "  \"do_deconv\": %d, \"use_matched_deconv\": %d, \"psf_sigma_vox\": %.6g,"
+        " \"deconv_tikhonov\": %.6g,\n"
+        "  \"guided_eps\": %.8g, \"guided_subsample\": %d, \"denoise_k\": %.6g,\n"
+        "  \"do_air_zero\": %d, \"air_cut_u8\": %d, \"air_cut_band\": %d,"
+        " \"air_thresh\": %.6g, \"air_cut_aggr\": %.6g,\n"
+        "  \"scratch_passes\": %d,\n"
+        "  \"do_normalize\": %d, \"norm_lo\": %d, \"norm_hi\": %d,\n"
+        "  \"do_zdrift\": %d, \"do_dering\": %d, \"dering_cy\": %.6g, \"dering_cx\": %.6g,\n"
+        "  \"calib_budget_gb\": %.6g,\n"
+        "  \"do_musica\": %d, \"musica_p\": %.6g, \"musica_levels\": %d, \"musica_core\": %.6g,\n"
+        "  \"no_dither\": %d, \"halo\": %d\n"
+        " },\n"
+        " \"calibration\": {\n"
+        "  \"have_norm\": %d, \"norm_lo\": %d, \"norm_hi\": %d,\n"
+        "  \"have_zdrift\": %d, \"vol_z\": %ld,\n"
+        "  \"have_dering\": %d,\n"
+        "  \"psf_p5\": %.6g, \"psf_med\": %.6g, \"psf_z_ratio\": %.6g,\n"
+        "  \"have_eps_r\": %d, \"eps_fn_a\": %.8g, \"eps_fn_b\": %.8g, \"eps_fn_med\": %.8g,\n"
+        "  \"have_dec_range\": %d, \"dec_lo\": %.8g, \"dec_hi\": %.8g\n"
+        " },\n"
+        " \"source_metadata_path\": \"%s\",\n",
+        c->delta_beta,c->energy_kev,c->distance_mm,c->pixel_um,
+        c->unsharp_sigma,c->unsharp_coeff,
+        c->machine_current_start,c->machine_current_stop,
+        c->window_lo,c->window_hi,
+        c->do_deconv,c->use_matched_deconv,c->psf_sigma_vox,c->deconv_tikhonov,
+        c->guided_eps,c->guided_subsample,c->denoise_k,
+        c->do_air_zero,c->air_cut_u8,c->air_cut_band,c->air_thresh,c->air_cut_aggr,
+        c->scratch_passes,
+        c->do_normalize,c->norm_lo,c->norm_hi,
+        c->do_zdrift,c->do_dering,c->dering_cy,c->dering_cx,
+        c->calib_budget_gb,
+        c->do_musica,c->musica_p,c->musica_levels,c->musica_core,
+        c->no_dither,c->halo,
+        c->have_norm,c->norm_lo,c->norm_hi,
+        c->have_zdrift,c->vol_z,
+        c->have_dering,
+        c->psf_p5,c->psf_med,c->psf_z_ratio,
+        c->have_eps_r,c->eps_fn_a,c->eps_fn_b,c->eps_fn_med,
+        c->have_dec_range,c->dec_lo,c->dec_hi,
+        emp);
+    /* inline the source metadata.json verbatim when it reads as a JSON value;
+     * keep ~32KB headroom under the region cap for it. */
+    int inlined=0;
+    FILE *mf=fopen(meta_path,"rb");
+    if(mf){
+        fseek(mf,0,SEEK_END); long ml=ftell(mf); fseek(mf,0,SEEK_SET);
+        if(ml>0 && (size_t)ml<cap-n-64){
+            char *mb=malloc((size_t)ml+1);
+            if(mb && fread(mb,1,(size_t)ml,mf)==(size_t)ml){
+                mb[ml]=0; char *p=mb; while(*p==' '||*p=='\n'||*p=='\r'||*p=='\t')p++;
+                if(*p=='{'||*p=='['){
+                    n+=(size_t)snprintf(j+n,cap-n," \"source_metadata\": %s\n}\n",p);
+                    inlined=1;
+                }
+            }
+            free(mb);
+        }
+        fclose(mf);
+    }
+    if(!inlined) n+=(size_t)snprintf(j+n,cap-n," \"source_metadata\": null\n}\n");
+    if(mc_archive_set_metadata(arc,j,n)==0)
+        fprintf(stderr,"provenance: %zu B stamped into archive metadata (source %s)\n",
+                n,inlined?"inlined":"absent");
+    else
+        fprintf(stderr,"provenance: WARNING metadata stamp failed (%zu B)\n",n);
+    free(j);
+}
+
 int main(int argc, char **argv){
     if(argc<3){
         fprintf(stderr,"usage: %s <in_zarr|s3://...> <out.mc> [--profile P] [--quality Q]"
@@ -860,6 +979,11 @@ int main(int argc, char **argv){
     fprintf(stderr,"units %ld (%ldx%ld tiles x %ld bands), SB=%ld BAND=%ld halo=%ld, "
                    "%d compute + %d io threads, queue %d\n",
             sc.nunits,sc.ntx,sc.nty,sc.nbz,SB,BAND,sc.halo,nc_,ni_,qc_);
+
+    /* stamp provenance now that every parameter is RESOLVED (post-calibration,
+     * post auto-sizing) -- the archive records what actually ran, not the CLI */
+    stamp_provenance(arc,in,out,profile,quality,process,meta_path,&cfg,
+                     SB,BAND,nc_,ni_,qc_,mem_gb,cache_gb);
 
     pthread_t stat_t; pthread_create(&stat_t,NULL,stats_worker,&sc); pthread_detach(stat_t);
     pthread_t *iot=malloc(ni_*sizeof *iot), *cot=malloc(nc_*sizeof *cot);

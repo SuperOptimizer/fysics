@@ -1443,19 +1443,44 @@ static inline uint16_t mc_chunk_fmaplen(const uint8_t*arc, uint64_t chunk_off){
 }
 // block (bz,by,bx) present? -> 1 + its payload (abs_off, len). 0 = ZERO block. Offsets
 // are implicit (cumulative len of present blocks before it); ZERO blocks cost 1 bitmap bit.
-static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,int bx,
-                          uint64_t *abs_off, uint32_t *len){
+// Per-block payload (abs_off,len) within a chunk blob. The on-disk layout stores
+// only present-block lengths (offsets implicit = prefix sum). Computing that prefix
+// sum + rank per call is O(block-index): summed over a chunk's 4096 blocks it is
+// O(n^2) (~16M ops/chunk) -- the render-path cost when a frame samples many blocks
+// of one chunk. We cache, thread-locally, a full per-chunk index built in ONE
+// O(4096) pass: bi -> abs_off (0 = absent block). Render samples are spatially
+// coherent (consecutive blocks share a chunk), so the table is built once per
+// chunk and every block lookup is O(1).
+typedef struct { const uint8_t*arc; uint64_t chunk_off, tag; uint64_t off[MC_GRID3]; uint16_t len[MC_GRID3]; } mc_chunk_idx;
+static const mc_chunk_idx *mc_chunk_index(const uint8_t*arc, uint64_t chunk_off){
+    static _Thread_local mc_chunk_idx idx = { .arc=NULL, .chunk_off=~0ull, .tag=0 };
+    // Key on (arc base, chunk_off, content hash). chunk_off alone is unsafe: it is
+    // reused across archives (same tree position -> same EOF offset) and after a
+    // re-append, so the stored xxh64 disambiguates content. Otherwise a stale index
+    // from a different chunk is served (caught by mc_v6 par-vs-serial).
+    uint64_t tag = mc_chunk_stored_hash(arc, chunk_off);
+    if(idx.arc==arc && idx.chunk_off==chunk_off && idx.tag==tag) return &idx;   // hot
     uint64_t bm_off = chunk_off + MC_BLOB_HDR + mc_chunk_fmaplen(arc,chunk_off);
     const uint8_t*bm = arc + bm_off;
-    int bi=(bz*16+by)*16+bx;
-    if(!mc_bit_get(bm,bi)) return 0;
     int npresent=0; for(int i=0;i<MC_BITMAP_BYTES;++i) npresent+=__builtin_popcount(bm[i]);
     const uint8_t*lens = arc + bm_off + MC_BITMAP_BYTES;
-    uint64_t pay_base = bm_off + MC_BITMAP_BYTES + (uint64_t)npresent*2;
-    int slot = mc_rank(bm,bi);
-    uint64_t cum=0; for(int s=0;s<slot;++s){ uint16_t l; memcpy(&l,lens+(size_t)s*2,2); cum+=l; }
-    uint16_t mylen; memcpy(&mylen, lens+(size_t)slot*2, 2);
-    *abs_off = pay_base + cum; *len = mylen;
+    uint64_t pay = bm_off + MC_BITMAP_BYTES + (uint64_t)npresent*2;   // first payload
+    int slot=0;
+    for(int bi=0; bi<MC_GRID3; ++bi){
+        if(mc_bit_get(bm,bi)){
+            uint16_t l; memcpy(&l, lens+(size_t)slot*2, 2);
+            idx.off[bi]=pay; idx.len[bi]=l; pay+=l; ++slot;
+        } else { idx.off[bi]=0; idx.len[bi]=0; }
+    }
+    idx.arc=arc; idx.chunk_off=chunk_off; idx.tag=tag;
+    return &idx;
+}
+static int mc_block_range(const uint8_t*arc, uint64_t chunk_off, int bz,int by,int bx,
+                          uint64_t *abs_off, uint32_t *len){
+    const mc_chunk_idx *ix = mc_chunk_index(arc, chunk_off);
+    int bi=(bz*16+by)*16+bx;
+    if(!ix->off[bi]) return 0;                        // absent (ZERO) block
+    *abs_off = ix->off[bi]; *len = ix->len[bi];
     return 1;
 }
 
@@ -1750,6 +1775,22 @@ int mc_build_to_file(mc_voxel_fn src, void *ud, const mc_build_opts *opts, const
 #define MC_RESERVE   (10ull*1024*1024*1024*1024)   // 10 TiB virtual reservation (NORESERVE)
 #define MC_GROW_STEP (1ull*1024*1024*1024)          // grow the file 1 GiB at a time
 
+// Coverage memo: an O(1) resident-region set so frozen render reads never walk
+// the node tree (mc_resolve_chunk) per absent block. Keyed by a region key that
+// packs (lod,cz,cy,cx); value bit distinguishes PRESENT from ZERO(air). Open
+// addressing, power-of-two, atomic slots — lock-free inserts from decode threads,
+// lock-free probes from render. Slot 0 = empty. Sized generously; never resizes
+// (a render archive's covered-region count is bounded by the volume's region
+// count, and we cap fill at the reserve anyway).
+#define MC_COV_CAP (1u<<20)            // 1M slots -> up to ~700k regions at 0.7 load
+// memo value = state(2 bits) | packed region key. Region coords are 256^3-chunk
+// indices (<= ~4096 even for a 77824^3 volume) so 12 bits/axis is ample; the key
+// fits in 39 bits, leaving the top free for state. state 0 = empty slot.
+#define MC_COV_PRESENT 1ull
+#define MC_COV_ZERO    2ull
+#define MC_COV_ABSENT  3ull            // VISITED-and-absent: memoized so re-probes
+                                       // of a not-yet-downloaded region are O(1)
+                                       // (overwritten -> PRESENT when it lands).
 struct mc_archive {
     int fd;
     u8 *base;                  // fixed mmap base (never moves)
@@ -1759,7 +1800,62 @@ struct mc_archive {
     float quality;
     uint64_t reserve;          // mmap reservation size (dims-derived, <= MC_RESERVE)
     pthread_mutex_t grow_mu;   // serializes ftruncate only; decode is lock-free
+    _Atomic uint64_t *cov;     // coverage memo slots (region key | flags), 0 = empty
+    _Atomic uint64_t gen;      // bumped on every publish; invalidates per-thread
+                               // chunk_off memos when a chunk is re-appended
 };
+
+// region key for the coverage memo: state in the top 2 bits, then lod(3)+12/axis.
+static inline uint64_t mc_covkey(int lod,int cz,int cy,int cx){
+    return ((uint64_t)(lod & 7) << 36) | ((uint64_t)(cz & 0xFFF) << 24) |
+           ((uint64_t)(cy & 0xFFF) << 12) | (uint64_t)(cx & 0xFFF);
+}
+#define MC_COV_STATE_SHIFT 62
+#define MC_COV_KEYMASK ((1ull<<MC_COV_STATE_SHIFT)-1)
+// probe the memo. PRESENT/ZERO/ABSENT if memoized, MC_ABSENT(== not found) only
+// when the slot is empty or the probe run is exhausted (caller then tree-walks).
+static int mc_cov_probe(mc_archive *a,int lod,int cz,int cy,int cx){
+    if(!a->cov) return -1;
+    uint64_t key = mc_covkey(lod,cz,cy,cx);
+    uint32_t h=(uint32_t)((key*0x9E3779B97F4A7C15ull)>>44);
+    for(int p=0;p<32;++p){
+        uint32_t i=(h+(uint32_t)p)&(MC_COV_CAP-1);
+        uint64_t cur=atomic_load_explicit(&a->cov[i],memory_order_acquire);
+        if(cur==0) return -1;                  // empty -> not memoized
+        if((cur & MC_COV_KEYMASK)==key){
+            uint64_t st = cur >> MC_COV_STATE_SHIFT;
+            return st==MC_COV_PRESENT?MC_PRESENT : st==MC_COV_ZERO?MC_ZERO : MC_ABSENT;
+        }
+    }
+    return -1;                                 // probe exhausted -> tree-walk
+}
+// insert/update the memo with an explicit state (PRESENT/ZERO/ABSENT). A later
+// PRESENT publish overwrites a prior ABSENT/ZERO for the same region in place.
+static void mc_cov_put_state(mc_archive *a,int lod,int cz,int cy,int cx,uint64_t state){
+    if(!a->cov) return;
+    uint64_t key = mc_covkey(lod,cz,cy,cx);
+    uint64_t val = key | (state<<MC_COV_STATE_SHIFT);
+    uint32_t h=(uint32_t)((key*0x9E3779B97F4A7C15ull)>>44);
+    for(int p=0;p<32;++p){
+        uint32_t i=(h+(uint32_t)p)&(MC_COV_CAP-1);
+        uint64_t cur=atomic_load_explicit(&a->cov[i],memory_order_relaxed);
+        if((cur & MC_COV_KEYMASK)==key && cur!=0){   // same region: update state
+            if(cur==val) return;
+            atomic_store_explicit(&a->cov[i],val,memory_order_release); return;
+        }
+        if(cur==0){
+            uint64_t exp=0;
+            if(atomic_compare_exchange_strong_explicit(&a->cov[i],&exp,val,
+                   memory_order_release,memory_order_relaxed)) return;
+            if((exp & MC_COV_KEYMASK)==key){  // lost race to same region
+                if(exp!=val) atomic_store_explicit(&a->cov[i],val,memory_order_release);
+                return; }
+        }
+    }
+}
+static inline void mc_cov_put(mc_archive *a,int lod,int cz,int cy,int cx,int is_zero){
+    mc_cov_put_state(a,lod,cz,cy,cx, is_zero?MC_COV_ZERO:MC_COV_PRESENT);
+}
 
 static int w_ensure(mc_archive *w, uint64_t need){
     uint64_t fl = atomic_load_explicit(&w->file_len, memory_order_acquire);
@@ -1837,6 +1933,8 @@ static int w_mark_zero(mc_archive *w,int lod,int cz,int cy,int cx){
     uint64_t slot = w_ensure_shard_slot(w,lod,cz,cy,cx);
     if(slot==~0ull) return -1;
     w_write_u64(w, slot, MC_SLOT_ZERO);
+    mc_cov_put(w, lod, cz, cy, cx, 1 /*air*/);
+    atomic_fetch_add_explicit(&w->gen, 1, memory_order_release);
     return 0;
 }
 
@@ -1849,6 +1947,8 @@ static int w_install_blob(mc_archive *w,int lod,int cz,int cy,int cx,const u8 *b
     // release fence so the payload bytes are visible before the commit word.
     atomic_thread_fence(memory_order_release);
     w_write_u64(w, slot, off);   // publish chunk offset = commit
+    mc_cov_put(w, lod, cz, cy, cx, 0 /*present*/);
+    atomic_fetch_add_explicit(&w->gen, 1, memory_order_release);
     // keep the header's total length current so the file is valid if reopened now.
     uint64_t cur = atomic_load_explicit(&w->cursor, memory_order_relaxed);
     w_write_u64(w, MCH_TOTLEN, cur);
@@ -1896,6 +1996,7 @@ mc_archive *mc_archive_open_dims(const char *path, int nx, int ny, int nz, float
     w->fd=fd; w->base=base; w->dim=dim; w->quality=quality; w->reserve=reserve;
     pthread_mutex_init(&w->grow_mu,NULL);
     atomic_store(&w->file_len, init_len);
+    w->cov = calloc(MC_COV_CAP, sizeof *w->cov);   // coverage memo (0 = empty)
 
     if(fresh){
         memset(base,0,MC_HDR);
@@ -2024,13 +2125,37 @@ uint64_t mc_archive_data_len(mc_archive *a){
     return a ? atomic_load_explicit(&a->cursor, memory_order_relaxed) : 0;
 }
 
+int mc_archive_set_metadata(mc_archive *a, const void *data, size_t len){
+    if(!a || (len && !data)) return -1;
+    if(len > MC_META_CAP) return -1;
+    if(len) memcpy(a->base + MC_HDR, data, len);
+    // publish the length AFTER the bytes so a concurrent flat read never sees
+    // a length covering unwritten content (same commit-word discipline as blobs).
+    atomic_thread_fence(memory_order_release);
+    uint64_t l = len; memcpy(a->base + MCH_METALEN, &l, 8);
+    return 0;
+}
+
+const char *mc_archive_metadata(mc_archive *a, size_t *out_len){
+    if(!a){ if(out_len) *out_len = 0; return NULL; }
+    return mc_metadata(a->base, out_len);
+}
+
 mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx){
     if(!a||lod<0||lod>7) return MC_ABSENT;
+    // Fast path: the coverage memo. A hit is O(1) and never touches the node tree
+    // (the per-block tree walk on the render worker was the 49ms cost). Regions
+    // made resident this session are always in the memo. A memo-miss falls back to
+    // the tree (covers disk-loaded archives committed in a prior session) and
+    // backfills the memo so the next probe is O(1).
+    int m = mc_cov_probe(a, lod, cz, cy, cx);
+    if(m >= 0) return (mc_cover)m;           // memoized (incl ABSENT) -> O(1)
     uint64_t root = w_read_u64(a, MCH_ROOTOFF+(uint64_t)lod*8);
     uint64_t off = mc_resolve_chunk(a->base, root, cz,cy,cx);
-    if(off==0) return MC_ABSENT;
-    if(off==MC_SLOT_ZERO) return MC_ZERO;
-    return MC_PRESENT;
+    if(off==0){ mc_cov_put_state(a,lod,cz,cy,cx,MC_COV_ABSENT); return MC_ABSENT; }
+    int zero = (off==MC_SLOT_ZERO);
+    mc_cov_put(a, lod, cz, cy, cx, zero);   // backfill for next time
+    return zero ? MC_ZERO : MC_PRESENT;
 }
 
 uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx){
@@ -2121,7 +2246,6 @@ typedef struct {
     uint16_t blen[MC_GRID3];
     uint8_t  bm[MC_BITMAP_BYTES];
     uint8_t  frac[MC_GRID3];
-    pthread_mutex_t bm_mu;
     _Atomic uint32_t next;
 } echunk_ctx;
 static void *echunk_worker(void *p){
@@ -2143,9 +2267,9 @@ static void *echunk_worker(void *p){
             uint32_t len=0;
             if(mc_enc_block(C,blk,&c->bufs[s],&len)){
                 c->blen[bi]=(uint16_t)len;
-                pthread_mutex_lock(&c->bm_mu);
+                // No lock: each stripe spans MC_GRID3/ENC_STRIPES=256 blocks = 32
+                // whole bitmap bytes, so stripes set DISJOINT bytes (8 blocks/byte).
                 mc_bit_set(c->bm,bi);
-                pthread_mutex_unlock(&c->bm_mu);
             }
         }
     }
@@ -2157,7 +2281,6 @@ int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
     if(!a||lod<0||lod>7||!vox) return -1;
     echunk_ctx *c=calloc(1,sizeof *c);
     c->vox=vox; c->q=q>0?q:a->quality;
-    pthread_mutex_init(&c->bm_mu,NULL);
     atomic_store(&c->next,0);
     int nt=auto_threads(nthreads); if(nt>ENC_STRIPES)nt=ENC_STRIPES;
     if(nt<=1) echunk_worker(c);
@@ -2191,7 +2314,6 @@ int mc_archive_append_chunk_par(mc_archive *a, int lod, int cz,int cy,int cx,
         free(st.p);
     }
     for(int s=0;s<ENC_STRIPES;++s) free(c->bufs[s].p);
-    pthread_mutex_destroy(&c->bm_mu);
     free(c);
     return rc;
 }
@@ -2346,6 +2468,7 @@ void mc_archive_close(mc_archive *a){
     if(ftruncate(a->fd,(off_t)cur)!=0) perror("mc_archive_close: ftruncate");
     close(a->fd);
     pthread_mutex_destroy(&a->grow_mu);
+    free(a->cov);
     free(a);
 }
 
@@ -2405,7 +2528,9 @@ const char *mc_metadata(const uint8_t *arc, size_t *out_len){
     return (const char*)(arc+off);
 }
 
-#define MC_RD_NODE_CACHE 64    // cached node tables per streaming reader (64*32KB = 2MB)
+#define MC_RD_NODE_CACHE 512   // cached node tables per streaming reader (512*32KB = 16MB):
+                               // a pan across a large volume touches many subtrees; a
+                               // churned-out table costs a serial ranged GET to re-fetch
 struct mc_reader {
     const uint8_t *arc;        // flat mode: archive buffer; streaming: NULL
     size_t len;
@@ -2510,6 +2635,23 @@ uint64_t mc_reader_chunk_blob_len(mc_reader *r, uint64_t chunk_off){
     uint64_t pay=0; for(int i=0;i<np;++i){ uint16_t l; memcpy(&l,lens+(size_t)i*2,2); pay+=l; }
     free(lens);
     return bm_off + MC_BITMAP_BYTES + (uint64_t)np*2 + pay - chunk_off;
+}
+
+// Copy `len` bytes of the chunk blob at `chunk_off` into `dst` (flat or streaming
+// reader). For .mca -> .mca verbatim copy: mc_reader_chunk_blob_len then this then
+// mc_archive_append_chunk_compressed. NOT thread-safe on a streaming reader (single
+// cbuf/codec ctx) -- caller serializes. Returns 0 on success.
+int mc_reader_read_blob(mc_reader *r, uint64_t chunk_off, size_t len, uint8_t *dst){
+    if(!r||!chunk_off||!len||!dst) return -1;
+    if(r->arc){ memcpy(dst, r->arc + chunk_off, len); return 0; }
+    // streaming: range-read in <=2^31 chunks (sread takes a uint32 len).
+    size_t done=0;
+    while(done<len){
+        uint32_t n = (len-done > 0x40000000u) ? 0x40000000u : (uint32_t)(len-done);
+        if(sread(r, chunk_off+done, n, dst+done)!=0) return -1;
+        done += n;
+    }
+    return 0;
 }
 
 void mc_reader_dims(mc_reader *r, int *nx, int *ny, int *nz){
@@ -2667,9 +2809,9 @@ static inline uint64_t khash(uint64_t k){
     return k;
 }
 
-// one shard: its own slice of the arena, its own map, lock, eviction state.
+// one shard: its own slice of the arena, its own map, eviction state. No lock:
+// all mutation is single-owner (THAW partitions fill by shard), reads are pure.
 typedef struct {
-    pthread_mutex_t mu;
     uint64_t *map_key;        // open addressing, linear probe, backward-shift delete
     uint32_t *map_slot;
     uint32_t  map_cap;        // power of two
@@ -2699,14 +2841,17 @@ struct mc_cache {
                                      // are inert (no behavior change for
                                      // clients that never tick)
     _Atomic uint32_t epoch;          // bumped at thaw; pins compare against it
+    // Miss set: open-addressing dedup table (slot 0 == empty). A thin slice
+    // re-probes the same 16^3 block from many pixels/bands; recording each unique
+    // absent block ONCE (not once per pixel) keeps the per-frame fill set ~= the
+    // real working set instead of ~100x larger. Lock-free insert via CAS.
     _Atomic uint64_t missq[MISSQ_CAP];
-    _Atomic uint32_t miss_w;
+    _Atomic uint32_t miss_n;          // approx live entries (for drain early-out)
     shard_t sh[NSHARD];
     mc_cache_src_fn src; void *src_ud;
     size_t arena_bytes;
     void *arena_base;
-    // reader binding (serialized decode)
-    pthread_mutex_t rd_mu;
+    // reader binding (single-owner decode; no lock)
     struct mc_reader *rd;
     struct mc_archive *ar;
 };
@@ -2714,15 +2859,33 @@ struct mc_cache {
 static uint32_t pow2_at_least(uint32_t v){ uint32_t p=1; while(p<v)p<<=1; return p; }
 static inline int slot_pinned(mc_cache *c, shard_t *sh, uint32_t slot);
 static inline int cache_frozen(mc_cache *c){ return atomic_load_explicit(&c->frozen,memory_order_acquire); }
+// Dedup insert into the miss set. Lock-free: hash, linear-probe a bounded run,
+// CAS an empty slot to `key`. If the key is already present (or lands in the
+// probe run), do nothing — recording the same absent block from another pixel is
+// free. Bounded probe (table is generously sized vs the per-frame working set);
+// on a full run we just drop the record (it re-records next frame).
 static void miss_record(mc_cache *c, uint64_t key){
-    uint32_t i=atomic_fetch_add_explicit(&c->miss_w,1,memory_order_relaxed);
-    atomic_store_explicit(&c->missq[i&(MISSQ_CAP-1)],key,memory_order_relaxed);
+    if(!key) return;
+    uint32_t h=(uint32_t)((key*0x9E3779B97F4A7C15ull)>>40);
+    for(int p=0;p<8;++p){
+        uint32_t i=(h+(uint32_t)p)&(MISSQ_CAP-1);
+        uint64_t cur=atomic_load_explicit(&c->missq[i],memory_order_relaxed);
+        if(cur==key) return;                          // already recorded
+        if(cur==0){
+            uint64_t exp=0;
+            if(atomic_compare_exchange_strong_explicit(&c->missq[i],&exp,key,
+                   memory_order_relaxed,memory_order_relaxed)){
+                atomic_fetch_add_explicit(&c->miss_n,1,memory_order_relaxed);
+                return;
+            }
+            if(exp==key) return;                      // racer inserted same key
+        }
+    }
 }
 
 mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
     mc_cache *c=calloc(1,sizeof *c);
     c->src=src; c->src_ud=src_ud;
-    pthread_mutex_init(&c->rd_mu,NULL);
     size_t nslot_total = bytes/BLK_BYTES; if(nslot_total<NSHARD) nslot_total=NSHARD;
     uint32_t per = (uint32_t)(nslot_total/NSHARD); if(per<1)per=1;
     c->arena_bytes = (size_t)per*NSHARD*BLK_BYTES;
@@ -2736,7 +2899,6 @@ mc_cache *mc_cache_new(size_t bytes, mc_cache_src_fn src, void *src_ud){
 #endif
     for(int s=0;s<NSHARD;++s){
         shard_t *sh=&c->sh[s];
-        pthread_mutex_init(&sh->mu,NULL);
         sh->nslot=per; sh->hand=0; sh->used=0;
         sh->arena=(mc_u8*)c->arena_base + (size_t)s*per*BLK_BYTES;
         sh->map_cap=pow2_at_least(per*2);
@@ -2786,25 +2948,20 @@ static void shard_init_tables(shard_t *sh, mc_u8 *arena_slice, uint32_t per){
 
 void mc_cache_free(mc_cache *c){
     if(!c) return;
-    for(int s=0;s<NSHARD;++s){
-        shard_t *sh=&c->sh[s];
-        pthread_mutex_destroy(&sh->mu);
-        shard_free_tables(sh);
-    }
+    for(int s=0;s<NSHARD;++s) shard_free_tables(&c->sh[s]);
 #if MC_CACHE_MMAP
     munmap(c->arena_base,c->arena_bytes);
 #else
     free(c->arena_base);
 #endif
-    pthread_mutex_destroy(&c->rd_mu);
     free(c);
 }
 
 // ---- runtime budget control -------------------------------------------------
 // Live-resize the decoded-block cache to `new_bytes`. The cache is just a cache,
 // so resizing DISCARDS resident blocks (re-decode on demand) rather than
-// migrating them. Locks every shard for the swap. Returns the byte budget
-// actually installed (rounded to whole slots over NSHARD), or 0 on failure.
+// migrating them. Single-owner: call only between ticks (no fill in flight).
+// Returns the byte budget actually installed (rounded to whole slots), or 0.
 size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
     if(!c) return 0;
     size_t nslot_total = new_bytes/BLK_BYTES; if(nslot_total<NSHARD) nslot_total=NSHARD;
@@ -2818,7 +2975,6 @@ size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
     void *na = malloc(new_arena);
     if(!na) return 0;
 #endif
-    for(int s=0;s<NSHARD;++s) pthread_mutex_lock(&c->sh[s].mu);
     for(int s=0;s<NSHARD;++s){
         shard_free_tables(&c->sh[s]);
         shard_init_tables(&c->sh[s], (mc_u8*)na + (size_t)s*per*BLK_BYTES, per);
@@ -2826,7 +2982,6 @@ size_t mc_cache_resize(mc_cache *c, size_t new_bytes){
     void *old = c->arena_base; size_t old_bytes = c->arena_bytes;
     c->arena_base = na; c->arena_bytes = new_arena;
     atomic_fetch_add(&c->epoch,1);   // invalidate outstanding pins
-    for(int s=0;s<NSHARD;++s) pthread_mutex_unlock(&c->sh[s].mu);
 #if MC_CACHE_MMAP
     munmap(old,old_bytes);
 #else
@@ -2840,11 +2995,7 @@ size_t mc_cache_capacity_bytes(const mc_cache *c){ return c ? c->arena_bytes : 0
 size_t mc_cache_used_bytes(mc_cache *c){
     if(!c) return 0;
     size_t used=0;
-    for(int s=0;s<NSHARD;++s){
-        pthread_mutex_lock(&c->sh[s].mu);
-        used += (size_t)c->sh[s].used;
-        pthread_mutex_unlock(&c->sh[s].mu);
-    }
+    for(int s=0;s<NSHARD;++s) used += (size_t)c->sh[s].used;   // racy read ok (stat)
     return used*BLK_BYTES;
 }
 
@@ -2998,174 +3149,131 @@ static inline shard_t *shard_of(mc_cache *c, uint64_t key){
     return &c->sh[(khash(key)>>56)&(NSHARD-1)];
 }
 
+// LOCK-FREE. FROZEN (render): bare probe; miss -> record + return NULL (caller
+// falls to coarser LOD). UNFROZEN (THAW / single-owner CLI): probe; miss ->
+// decode + insert. No lock: every mutation is single-owner by contract (THAW
+// partitions by shard; CLI is single-threaded). The cache arena is an immutable
+// snapshot during a frozen frame, so the probe needs no synchronization.
 const mc_u8 *mc_cache_get(mc_cache *c, int lod, int bz, int by, int bx){
     uint64_t key=bkey(lod,bz,by,bx);
     shard_t *sh=shard_of(c,key);
-    if(cache_frozen(c)){                      // immutable: bare probe, no locks
-        uint32_t mi=map_find(sh,key);
-        if(mi!=UINT32_MAX) return sh->arena+(size_t)sh->map_slot[mi]*BLK_BYTES;
-        miss_record(c,key);
-        return NULL;                          // caller: fall back to best_lod
-    }
-    pthread_mutex_lock(&sh->mu);
     uint32_t mi=map_find(sh,key);
     if(mi!=UINT32_MAX){
-        uint32_t slot=sh->map_slot[mi];
-        cache_touch(c,sh,slot); sh->hits++;
-        const mc_u8 *p=sh->arena+(size_t)slot*BLK_BYTES;
-        pthread_mutex_unlock(&sh->mu);
-        return p;
+        if(!cache_frozen(c)){ cache_touch(c,sh,sh->map_slot[mi]); sh->hits++; }
+        return sh->arena+(size_t)sh->map_slot[mi]*BLK_BYTES;
     }
+    if(cache_frozen(c)){ miss_record(c,key); return NULL; }
     sh->misses++;
-    pthread_mutex_unlock(&sh->mu);
-
-    mc_u8 tmp[BLK_BYTES];
-    c->src(c->src_ud,lod,bz,by,bx,tmp);            // decode outside the lock
-
-    pthread_mutex_lock(&sh->mu);
-    mi=map_find(sh,key);                           // racing thread may have inserted
-    uint32_t slot;
-    if(mi!=UINT32_MAX) slot=sh->map_slot[mi];
-    else {
-        slot=cache_alloc_slot(c,sh,key);
-        sh->slot_key[slot]=key;
-        map_insert(sh,key,slot);
-        memcpy(sh->arena+(size_t)slot*BLK_BYTES,tmp,BLK_BYTES);
-    }
+    uint32_t slot=cache_alloc_slot(c,sh,key);
+    sh->slot_key[slot]=key;
+    map_insert(sh,key,slot);
+    c->src(c->src_ud,lod,bz,by,bx,sh->arena+(size_t)slot*BLK_BYTES);   // decode in place
     cache_touch(c,sh,slot);
-    const mc_u8 *p=sh->arena+(size_t)slot*BLK_BYTES;
-    pthread_mutex_unlock(&sh->mu);
-    return p;
+    return sh->arena+(size_t)slot*BLK_BYTES;
 }
 
 void mc_cache_get_copy(mc_cache *c, int lod, int bz, int by, int bx, mc_u8 *dst){
     uint64_t key=bkey(lod,bz,by,bx);
     shard_t *sh=shard_of(c,key);
+    uint32_t mi=map_find(sh,key);
+    if(mi!=UINT32_MAX){
+        if(!cache_frozen(c)){ cache_touch(c,sh,sh->map_slot[mi]); sh->hits++; }
+        memcpy(dst,sh->arena+(size_t)sh->map_slot[mi]*BLK_BYTES,BLK_BYTES);
+        return;
+    }
     if(cache_frozen(c)){
-        uint32_t mi=map_find(sh,key);
-        if(mi!=UINT32_MAX){ memcpy(dst,sh->arena+(size_t)sh->map_slot[mi]*BLK_BYTES,BLK_BYTES); return; }
         miss_record(c,key);
         c->src(c->src_ud,lod,bz,by,bx,dst);   // read-through, no insert
         return;
     }
-    pthread_mutex_lock(&sh->mu);
-    uint32_t mi=map_find(sh,key);
-    if(mi!=UINT32_MAX){
-        uint32_t slot=sh->map_slot[mi];
-        cache_touch(c,sh,slot); sh->hits++;
-        memcpy(dst,sh->arena+(size_t)slot*BLK_BYTES,BLK_BYTES);
-        pthread_mutex_unlock(&sh->mu);
-        return;
-    }
     sh->misses++;
-    pthread_mutex_unlock(&sh->mu);
-    c->src(c->src_ud,lod,bz,by,bx,dst);
-    pthread_mutex_lock(&sh->mu);
-    if(map_find(sh,key)==UINT32_MAX){
-        uint32_t slot=cache_alloc_slot(c,sh,key);
-        sh->slot_key[slot]=key;
-        map_insert(sh,key,slot);
-        memcpy(sh->arena+(size_t)slot*BLK_BYTES,dst,BLK_BYTES);
-        cache_touch(c,sh,slot);
-    }
-    pthread_mutex_unlock(&sh->mu);
+    uint32_t slot=cache_alloc_slot(c,sh,key);
+    sh->slot_key[slot]=key;
+    map_insert(sh,key,slot);
+    c->src(c->src_ud,lod,bz,by,bx,sh->arena+(size_t)slot*BLK_BYTES);
+    memcpy(dst,sh->arena+(size_t)slot*BLK_BYTES,BLK_BYTES);
+    cache_touch(c,sh,slot);
 }
 
 int mc_cache_contains(mc_cache *c, int lod, int bz, int by, int bx){
     uint64_t key=bkey(lod,bz,by,bx);
     shard_t *sh=shard_of(c,key);
-    if(cache_frozen(c)) return map_find(sh,key)!=UINT32_MAX;
-    pthread_mutex_lock(&sh->mu);
-    int r = map_find(sh,key)!=UINT32_MAX;
-    pthread_mutex_unlock(&sh->mu);
-    return r;
+    return map_find(sh,key)!=UINT32_MAX;   // lock-free probe
 }
 
-// lookup-or-decode-insert; returns 1 if a decode happened.
+// lookup-or-decode-insert; returns 1 if a decode happened. LOCK-FREE: the caller
+// guarantees single-owner access to this block's shard (THAW partitions fill work
+// by shard so no two workers touch one shard). All shard mutation -- map, arena,
+// eviction rings -- happens here, only during THAW, only from the shard's owner.
 static int cache_fill_one(mc_cache *c, int lod, int bz, int by, int bx){
     uint64_t key=bkey(lod,bz,by,bx);
     shard_t *sh=shard_of(c,key);
-    pthread_mutex_lock(&sh->mu);
     uint32_t mi=map_find(sh,key);
     if(mi!=UINT32_MAX){
         cache_touch(c,sh,sh->map_slot[mi]); sh->hits++;
-        pthread_mutex_unlock(&sh->mu);
         return 0;
     }
     sh->misses++;
-    pthread_mutex_unlock(&sh->mu);
-    mc_u8 tmp[BLK_BYTES];
-    c->src(c->src_ud,lod,bz,by,bx,tmp);
-    pthread_mutex_lock(&sh->mu);
-    if(map_find(sh,key)==UINT32_MAX){
-        uint32_t slot=cache_alloc_slot(c,sh,key);
-        sh->slot_key[slot]=key;
-        map_insert(sh,key,slot);
-        memcpy(sh->arena+(size_t)slot*BLK_BYTES,tmp,BLK_BYTES);
-        cache_touch(c,sh,slot);
-    }
-    pthread_mutex_unlock(&sh->mu);
+    uint32_t slot=cache_alloc_slot(c,sh,key);
+    sh->slot_key[slot]=key;
+    map_insert(sh,key,slot);
+    c->src(c->src_ud,lod,bz,by,bx,sh->arena+(size_t)slot*BLK_BYTES);   // decode in place
+    cache_touch(c,sh,slot);
     return 1;
 }
 
+// THAW batch fill, partitioned by SHARD ownership. Each block is bucketed by its
+// shard; worker t owns shards { t, t+nt, t+2nt, ... }. Because a shard is touched
+// by exactly one worker, every shard mutation (map insert, slot alloc, eviction,
+// arena write) is single-owner and needs NO lock. This is the partitioned phase
+// update: parallelism by disjoint ownership, not by shared queue. The only sync
+// is the join at the end (the phase barrier). Caller must be UNFROZEN (THAW).
 typedef struct {
     mc_cache *c;
-    const mc_block_id *ids;     // sorted copy, grouped by chunk
-    const uint32_t *group_off;  // group g = ids[group_off[g] .. group_off[g+1])
-    uint32_t ngroups;
-    _Atomic uint32_t next;      // work-stealing group cursor
-    _Atomic size_t decoded;
+    const mc_block_id *ids;     // all blocks (unsorted)
+    const uint32_t *bucket;     // bucket[s] = head index into `link` for shard s (-1 end)
+    const uint32_t *link;       // link[i] = next block index in the same shard (-1 end)
+    int nt, t;                  // this worker owns shards s where s % nt == t
+    size_t decoded;             // written by this worker only
 } upd_ctx;
 static void *upd_worker(void *p){
     upd_ctx *u=p;
-    for(;;){
-        uint32_t g=atomic_fetch_add_explicit(&u->next,1,memory_order_relaxed);
-        if(g>=u->ngroups) break;
-        size_t dec=0;
-        for(uint32_t i=u->group_off[g];i<u->group_off[g+1];++i){
+    size_t dec=0;
+    for(int s=u->t; s<NSHARD; s+=u->nt){            // this worker's disjoint shards
+        for(uint32_t i=u->bucket[s]; i!=UINT32_MAX; i=u->link[i]){
             const mc_block_id *b=&u->ids[i];
             dec+=(size_t)cache_fill_one(u->c,b->lod,b->bz,b->by,b->bx);
         }
-        atomic_fetch_add_explicit(&u->decoded,dec,memory_order_relaxed);
     }
+    u->decoded=dec;
     return NULL;
-}
-static uint64_t upd_sortkey(const mc_block_id *b){    // chunk-major; low 12 bits = in-chunk
-    return ((uint64_t)(b->lod&7)<<60)
-         | ((uint64_t)(b->bz>>4)<<44) | ((uint64_t)(b->by>>4)<<28) | ((uint64_t)(b->bx>>4)<<12)
-         | ((uint64_t)(b->bz&15)<<8)  | ((uint64_t)(b->by&15)<<4)  | (uint64_t)(b->bx&15);
-}
-static int upd_cmp(const void *a,const void *b){
-    uint64_t ka=upd_sortkey(a), kb=upd_sortkey(b);
-    return ka<kb?-1:ka>kb?1:0;
 }
 size_t mc_cache_update(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads){
     if(!c||!ids||!n||cache_frozen(c)) return 0;
-    mc_block_id *s=malloc(n*sizeof *s);
-    memcpy(s,ids,n*sizeof *s);
-    qsort(s,n,sizeof *s,upd_cmp);
-    uint32_t *off=malloc((n+1)*sizeof *off);
-    uint32_t ng=0; off[0]=0;
-    for(size_t i=1;i<n;++i){
-        if((upd_sortkey(&s[i])>>12)!=(upd_sortkey(&s[i-1])>>12)) off[++ng]=(uint32_t)i;
+    // Bucket block indices by shard via per-shard singly-linked lists (no sort,
+    // no shared structure). bucket[s] heads shard s's chain through link[].
+    uint32_t *bucket=malloc(NSHARD*sizeof *bucket);
+    uint32_t *link=malloc(n*sizeof *link);
+    if(!bucket||!link){ free(bucket); free(link); return 0; }
+    for(int s=0;s<NSHARD;++s) bucket[s]=UINT32_MAX;
+    for(size_t i=0;i<n;++i){
+        uint64_t key=bkey(ids[i].lod,ids[i].bz,ids[i].by,ids[i].bx);
+        int s=(int)((khash(key)>>56)&(NSHARD-1));
+        link[i]=bucket[s]; bucket[s]=(uint32_t)i;
     }
-    off[++ng]=(uint32_t)n;
-    upd_ctx u={.c=c,.ids=s,.group_off=off,.ngroups=ng};
-    atomic_store(&u.next,0); atomic_store(&u.decoded,0);
     int nt=nthreads;
-    if(nt<=0){
-        long nc=sysconf(_SC_NPROCESSORS_ONLN);
-        nt=(int)(nc>0?nc:4);
-    }
-    if(nt>16)nt=16; if((uint32_t)nt>ng)nt=(int)ng;
-    if(nt<=1){ upd_worker(&u); }
+    if(nt<=0){ long nc=sysconf(_SC_NPROCESSORS_ONLN); nt=(int)(nc>0?nc:4); }
+    if(nt>16)nt=16; if(nt>NSHARD)nt=NSHARD; if(nt<1)nt=1;
+    upd_ctx u[16];
+    for(int t=0;t<nt;++t) u[t]=(upd_ctx){.c=c,.ids=ids,.bucket=bucket,.link=link,.nt=nt,.t=t,.decoded=0};
+    if(nt<=1){ upd_worker(&u[0]); }
     else {
         pthread_t th[16];
-        for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,upd_worker,&u);
-        for(int t=0;t<nt;++t) pthread_join(th[t],NULL);
+        for(int t=0;t<nt;++t) pthread_create(&th[t],NULL,upd_worker,&u[t]);
+        for(int t=0;t<nt;++t) pthread_join(th[t],NULL);   // phase barrier (join)
     }
-    size_t dec=atomic_load(&u.decoded);
-    free(s); free(off);
+    size_t dec=0; for(int t=0;t<nt;++t) dec+=u[t].decoded;
+    free(bucket); free(link);
     return dec;
 }
 
@@ -3179,68 +3287,72 @@ void mc_cache_thaw(mc_cache *c){
     atomic_store_explicit(&c->frozen,0,memory_order_release);
     atomic_fetch_add_explicit(&c->epoch,1,memory_order_relaxed);
 }
+// Record a block into the dedup miss set from outside the frozen read path
+// (e.g. mc_volume_try_block marking an ABSENT block for the downloader). Same
+// lock-free dedup insert; safe to call concurrently with frozen reads.
+void mc_cache_miss_mark(mc_cache *c, int lod, int bz, int by, int bx){
+    if(c) miss_record(c, bkey(lod,bz,by,bx));
+}
+
+// Drain the dedup miss set: emit each unique block once and clear its slot. Must
+// run while no frozen reads are inserting (thaw window) — consistent with the
+// game loop (thaw drains, then freeze reopens reads).
 size_t mc_cache_misses_drain(mc_cache *c, mc_block_id *out, size_t cap){
     if(!c||!out) return 0;
-    uint32_t w=atomic_load_explicit(&c->miss_w,memory_order_acquire);
-    uint32_t n=w>MISSQ_CAP?MISSQ_CAP:w;
+    if(atomic_load_explicit(&c->miss_n,memory_order_relaxed)==0) return 0;
     size_t m=0;
-    for(uint32_t i=0;i<n&&m<cap;++i){
-        uint64_t k=atomic_load_explicit(&c->missq[i&(MISSQ_CAP-1)],memory_order_relaxed);
+    for(uint32_t i=0;i<MISSQ_CAP;++i){
+        uint64_t k=atomic_load_explicit(&c->missq[i],memory_order_relaxed);
         if(!k) continue;
-        out[m].lod=(int)((k>>60)&7);
-        out[m].bz=(int)((k>>40)&0xFFFFF);
-        out[m].by=(int)((k>>20)&0xFFFFF);
-        out[m].bx=(int)(k&0xFFFFF);
-        m++;
+        atomic_store_explicit(&c->missq[i],0,memory_order_relaxed);   // clear slot
+        if(m<cap){
+            out[m].lod=(int)((k>>60)&7);
+            out[m].bz=(int)((k>>40)&0xFFFFF);
+            out[m].by=(int)((k>>20)&0xFFFFF);
+            out[m].bx=(int)(k&0xFFFFF);
+            m++;
+        }
     }
-    atomic_store_explicit(&c->miss_w,0,memory_order_release);
+    atomic_store_explicit(&c->miss_n,0,memory_order_relaxed);
     return m;
 }
 
 int mc_cache_best_lod(mc_cache *c, int finest_lod, int bz, int by, int bx){
-    int froz=cache_frozen(c);
     for(int l=finest_lod;l<8;++l){
         uint64_t key=bkey(l,bz,by,bx);
         shard_t *sh=shard_of(c,key);
-        int hit;
-        if(froz) hit = map_find(sh,key)!=UINT32_MAX;
-        else { pthread_mutex_lock(&sh->mu); hit = map_find(sh,key)!=UINT32_MAX; pthread_mutex_unlock(&sh->mu); }
-        if(hit) return l;
+        if(map_find(sh,key)!=UINT32_MAX) return l;   // lock-free probe
         bz>>=1; by>>=1; bx>>=1;
     }
     return -1;
 }
 
 // ---- async update tickets ---------------------------------------------------
+// Async ticket: same shard-partitioned, lock-free fill as mc_cache_update, but on
+// detached worker threads. Worker t owns shards { t, t+nth, ... } via per-shard
+// linked buckets -> single-owner, no lock. Cancel sets a flag workers poll.
 struct mc_cache_ticket {
     mc_cache *c;
-    mc_block_id *ids;            // owned sorted copy
-    uint32_t *group_off;
-    uint32_t ngroups;
-    _Atomic uint32_t next;
-    _Atomic uint32_t groups_done;
+    mc_block_id *ids;            // owned copy
+    uint32_t *bucket;           // bucket[s] = head index for shard s (UINT32_MAX end)
+    uint32_t *link;             // link[i]   = next block index in same shard
+    _Atomic uint32_t workers_done;
     _Atomic int cancel;
-    pthread_t th[16]; int nth;
+    pthread_t th[16]; int nth; int t_id[16];
     int joined;
 };
 static void *aupd_worker(void *p){
-    mc_cache_ticket *t=p;
-    for(;;){
-        if(atomic_load_explicit(&t->cancel,memory_order_relaxed)){
-            // mark remaining groups done so done() converges after cancel
-            uint32_t g=atomic_fetch_add_explicit(&t->next,1,memory_order_relaxed);
-            if(g>=t->ngroups) break;
-            atomic_fetch_add_explicit(&t->groups_done,1,memory_order_relaxed);
-            continue;
-        }
-        uint32_t g=atomic_fetch_add_explicit(&t->next,1,memory_order_relaxed);
-        if(g>=t->ngroups) break;
-        for(uint32_t i=t->group_off[g];i<t->group_off[g+1];++i){
+    mc_cache_ticket *t = ((void**)p)[0];
+    int me = (int)(intptr_t)((void**)p)[1];
+    free(p);
+    for(int s=me; s<NSHARD; s+=t->nth){
+        if(atomic_load_explicit(&t->cancel,memory_order_relaxed)) break;
+        for(uint32_t i=t->bucket[s]; i!=UINT32_MAX; i=t->link[i]){
             const mc_block_id *b=&t->ids[i];
             cache_fill_one(t->c,b->lod,b->bz,b->by,b->bx);
         }
-        atomic_fetch_add_explicit(&t->groups_done,1,memory_order_relaxed);
     }
+    atomic_fetch_add_explicit(&t->workers_done,1,memory_order_release);
     return NULL;
 }
 mc_cache_ticket *mc_cache_update_async(mc_cache *c, const mc_block_id *ids, size_t n, int nthreads){
@@ -3249,24 +3361,28 @@ mc_cache_ticket *mc_cache_update_async(mc_cache *c, const mc_block_id *ids, size
     t->c=c;
     t->ids=malloc(n*sizeof *t->ids);
     memcpy(t->ids,ids,n*sizeof *t->ids);
-    qsort(t->ids,n,sizeof *t->ids,upd_cmp);
-    t->group_off=malloc((n+1)*sizeof *t->group_off);
-    uint32_t ng=0; t->group_off[0]=0;
-    for(size_t i=1;i<n;++i)
-        if((upd_sortkey(&t->ids[i])>>12)!=(upd_sortkey(&t->ids[i-1])>>12)) t->group_off[++ng]=(uint32_t)i;
-    t->group_off[++ng]=(uint32_t)n;
-    t->ngroups=ng;
-    atomic_store(&t->next,0); atomic_store(&t->groups_done,0); atomic_store(&t->cancel,0);
+    t->bucket=malloc(NSHARD*sizeof *t->bucket);
+    t->link=malloc(n*sizeof *t->link);
+    for(int s=0;s<NSHARD;++s) t->bucket[s]=UINT32_MAX;
+    for(size_t i=0;i<n;++i){
+        uint64_t key=bkey(t->ids[i].lod,t->ids[i].bz,t->ids[i].by,t->ids[i].bx);
+        int s=(int)((khash(key)>>56)&(NSHARD-1));
+        t->link[i]=t->bucket[s]; t->bucket[s]=(uint32_t)i;
+    }
+    atomic_store(&t->workers_done,0); atomic_store(&t->cancel,0);
     int nt=nthreads;
     if(nt<=0){ long nc=sysconf(_SC_NPROCESSORS_ONLN); nt=(int)(nc>0?nc:4); }
-    if(nt>16)nt=16; if((uint32_t)nt>ng)nt=(int)ng;
+    if(nt>16)nt=16; if(nt>NSHARD)nt=NSHARD; if(nt<1)nt=1;
     t->nth=nt;
-    for(int i=0;i<nt;++i) pthread_create(&t->th[i],NULL,aupd_worker,t);
+    for(int i=0;i<nt;++i){
+        void **arg=malloc(2*sizeof(void*)); arg[0]=t; arg[1]=(void*)(intptr_t)i;
+        pthread_create(&t->th[i],NULL,aupd_worker,arg);
+    }
     return t;
 }
 int mc_cache_ticket_done(mc_cache_ticket *t){
     if(!t) return 1;
-    return atomic_load_explicit(&t->groups_done,memory_order_acquire)>=t->ngroups;
+    return atomic_load_explicit(&t->workers_done,memory_order_acquire)>=(uint32_t)t->nth;
 }
 void mc_cache_ticket_cancel(mc_cache_ticket *t){
     if(t) atomic_store_explicit(&t->cancel,1,memory_order_release);
@@ -3280,12 +3396,12 @@ void mc_cache_ticket_wait(mc_cache_ticket *t){ if(t) ticket_join(t); }
 void mc_cache_ticket_free(mc_cache_ticket *t){
     if(!t) return;
     ticket_join(t);
-    free(t->ids); free(t->group_off); free(t);
+    free(t->ids); free(t->bucket); free(t->link); free(t);
 }
 
-// resolve: ensure resident (parallel via mc_cache_update), then fill the
-// pointer table under shard locks; cache_touch stamps the current epoch so
-// these slots are pinned against eviction until the next thaw().
+// resolve: ensure resident (parallel via mc_cache_update), then fill the pointer
+// table; cache_touch stamps the current epoch so these slots are pinned against
+// eviction until the next thaw(). Lock-free: single-owner (THAW / CLI) contract.
 size_t mc_cache_resolve(mc_cache *c, const mc_block_id *ids, size_t n,
                         const mc_u8 **ptrs, int nthreads){
     if(!c||!ids||!n||!ptrs||cache_frozen(c)) return 0;
@@ -3293,14 +3409,12 @@ size_t mc_cache_resolve(mc_cache *c, const mc_block_id *ids, size_t n,
     for(size_t i=0;i<n;++i){
         uint64_t key=bkey(ids[i].lod,ids[i].bz,ids[i].by,ids[i].bx);
         shard_t *sh=shard_of(c,key);
-        pthread_mutex_lock(&sh->mu);
         uint32_t mi=map_find(sh,key);
         if(mi!=UINT32_MAX){
             uint32_t slot=sh->map_slot[mi];
             cache_touch(c,sh,slot);
             ptrs[i]=sh->arena+(size_t)slot*BLK_BYTES;
         } else ptrs[i]=NULL;   // evicted by same-batch pressure (set > capacity)
-        pthread_mutex_unlock(&sh->mu);
     }
     return dec;
 }
@@ -3309,15 +3423,11 @@ void mc_cache_prefetch_chunk(mc_cache *c, int lod, int cz, int cy, int cx){
     for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
         int gz=cz*16+bz, gy=cy*16+by, gx=cx*16+bx;
         uint64_t key=bkey(lod,gz,gy,gx);
-        shard_t *sh=shard_of(c,key);
-        pthread_mutex_lock(&sh->mu);
-        int have = map_find(sh,key)!=UINT32_MAX;
-        pthread_mutex_unlock(&sh->mu);
-        if(!have) (void)mc_cache_get(c,lod,gz,gy,gx);
+        if(map_find(shard_of(c,key),key)==UINT32_MAX) (void)mc_cache_get(c,lod,gz,gy,gx);
     }
 }
 
-// remove one key if present (shard lock held by caller paths below)
+// remove one key if present. Single-owner (UNFROZEN/THAW) — no lock.
 static void shard_remove_key(shard_t *sh, uint64_t key){
     uint32_t mi=map_find(sh,key);
     if(mi==UINT32_MAX) return;
@@ -3331,17 +3441,13 @@ void mc_cache_invalidate_chunk(mc_cache *c, int lod, int cz, int cy, int cx){
     if(cache_frozen(c)) return;
     for(int bz=0;bz<16;++bz)for(int by=0;by<16;++by)for(int bx=0;bx<16;++bx){
         uint64_t key=bkey(lod,cz*16+bz,cy*16+by,cx*16+bx);
-        shard_t *sh=shard_of(c,key);
-        pthread_mutex_lock(&sh->mu);
-        shard_remove_key(sh,key);
-        pthread_mutex_unlock(&sh->mu);
+        shard_remove_key(shard_of(c,key),key);
     }
 }
 
 void mc_cache_clear(mc_cache *c){
-    for(int s=0;s<NSHARD;++s){
+    for(int s=0;s<NSHARD;++s){            // single-owner: call only while no fill runs
         shard_t *sh=&c->sh[s];
-        pthread_mutex_lock(&sh->mu);
         memset(sh->map_key,0,(size_t)sh->map_cap*8);
         memset(sh->slot_key,0,(size_t)sh->nslot*8);
         memset(sh->slot_ref,0,sh->nslot);
@@ -3350,7 +3456,6 @@ void mc_cache_clear(mc_cache *c){
         sh->g_head=0; memset(sh->gfp,0,4u*sh->g_cap);
         memset(sh->gset,0xFF,4u*sh->gset_cap);
         memset(sh->slot_inmain,0,sh->nslot);
-        pthread_mutex_unlock(&sh->mu);
     }
 }
 
@@ -3366,7 +3471,17 @@ void mc_cache_get_stats(mc_cache *c, mc_cache_stats *out){
 // ---- bindings ----
 static void src_archive(void *ud, int lod, int bz,int by,int bx, mc_u8 *dst){
     struct mc_archive *a=ud;
-    uint64_t co=mc_archive_chunk_offset(a,lod,bz>>4,by>>4,bx>>4);
+    // The tree walk (mc_resolve_chunk) is identical for all 4096 blocks of a chunk;
+    // memoize the last (lod,cz,cy,cx)->chunk_off thread-locally. Render samples are
+    // chunk-coherent so this collapses the per-block walk to one walk per chunk.
+    int cz=bz>>4, cy=by>>4, cx=bx>>4;
+    static _Thread_local const struct mc_archive *la=NULL;
+    static _Thread_local int llod=-1,lcz=-1,lcy=-1,lcx=-1; static _Thread_local uint64_t lco=0,lgen=0;
+    uint64_t gen=atomic_load_explicit(&a->gen,memory_order_acquire);
+    uint64_t co;
+    if(la==a && lgen==gen && llod==lod && lcz==cz && lcy==cy && lcx==cx) co=lco;
+    else { co=mc_archive_chunk_offset(a,lod,cz,cy,cx);   // re-resolve if archive grew
+           la=a; lgen=gen; llod=lod; lcz=cz; lcy=cy; lcx=cx; lco=co; }
     mc_archive_decode_block(a,co,bz&15,by&15,bx&15,dst);
 }
 mc_cache *mc_cache_new_archive(size_t bytes, struct mc_archive *a){
@@ -3376,11 +3491,9 @@ mc_cache *mc_cache_new_archive(size_t bytes, struct mc_archive *a){
 }
 typedef struct { mc_cache *c; } rdwrap_t;
 static void src_reader(void *ud, int lod, int bz,int by,int bx, mc_u8 *dst){
-    mc_cache *c=ud;
-    pthread_mutex_lock(&c->rd_mu);
+    mc_cache *c=ud;                                 // single-owner (THAW/CLI): no lock
     uint64_t co=mc_chunk_offset(c->rd,lod,bz>>4,by>>4,bx>>4);
     mc_decode_block(c->rd,co,bz&15,by&15,bx&15,dst);
-    pthread_mutex_unlock(&c->rd_mu);
 }
 mc_cache *mc_cache_new_reader(size_t bytes, struct mc_reader *r){
     mc_cache *c=mc_cache_new(bytes,NULL,NULL);
@@ -3401,10 +3514,15 @@ mc_cache *mc_cache_new_reader(size_t bytes, struct mc_reader *r){
 
 #define MC_S_MEMO 256   // covers an oblique 1024-px row's block working set
 
+// Pointer-only memo entry (16B, was 4112B). The block() source returns a STABLE
+// pointer the memo caches directly: the cache/arena source (mc_volume interactive
+// path) returns an arena/zero pointer valid for the frozen frame; dense bypasses
+// mc_s_block entirely. The only source that synthesizes into a scratch buffer is
+// the CLI blocking path -- for THAT, owns_ptr is 0 and we use a per-sampler buf[]
+// (allocated only then) so cached pointers don't alias one shared scratch.
 typedef struct {
     int bz, by, bx;             // -1 = empty
     const uint8_t *ptr;         // NULL = known-absent (sampled as 0)
-    uint8_t buf[4096];
 } mc_s_memo;
 
 struct mc_sampler {
@@ -3412,6 +3530,8 @@ struct mc_sampler {
     int nbz, nby, nbx;
     int lbz, lby, lbx;          // last block touched (ray-coherence cache)
     const uint8_t *lptr;
+    int rbz, rby, rbx, rres;    // last residency probe (ray-coherence cache)
+    uint8_t (*scratch)[4096];   // per-entry synth buffers, only if !owns_ptr (else NULL)
     mc_s_memo m[MC_S_MEMO];
 };
 
@@ -3419,10 +3539,14 @@ static inline const uint8_t *mc_s_block(mc_sampler *s, int bz, int by, int bx) {
     if (bz == s->lbz && by == s->lby && bx == s->lbx) return s->lptr;
     unsigned h = ((unsigned)bz * 73856093u) ^ ((unsigned)by * 19349663u) ^
                  ((unsigned)bx * 83492791u);
-    mc_s_memo *e = &s->m[h & (MC_S_MEMO - 1)];
+    unsigned slot = h & (MC_S_MEMO - 1);
+    mc_s_memo *e = &s->m[slot];
     if (!(e->bz == bz && e->by == by && e->bx == bx)) {
         e->bz = bz; e->by = by; e->bx = bx;
-        e->ptr = s->src.block(&s->src, bz, by, bx, e->buf);
+        // owns_ptr sources return a stable pointer (cache arena); cache it directly.
+        // Otherwise synthesize into this slot's own scratch buffer.
+        uint8_t *tmp = s->scratch ? s->scratch[slot] : NULL;
+        e->ptr = s->src.block(&s->src, bz, by, bx, tmp);
     }
     s->lbz = bz; s->lby = by; s->lbx = bx; s->lptr = e->ptr;
     return e->ptr;
@@ -3845,6 +3969,7 @@ mc_sample_src mc_sample_src_cache(struct mc_cache *c, int lod,
                                   int nz, int ny, int nx) {
     mc_sample_src s = {0};
     s.ud = c; s.aux = lod; s.block = cache_block;
+    s.owns_ptr = 1;                       // cache_block returns stable arena pointers
     s.nz = nz; s.ny = ny; s.nx = nx;
     return s;
 }
@@ -3887,21 +4012,102 @@ mc_sampler *mc_sampler_new(const mc_sample_src *src) {
     s->nbz = (src->nz + BLK - 1) / BLK;
     s->nby = (src->ny + BLK - 1) / BLK;
     s->nbx = (src->nx + BLK - 1) / BLK;
+    // Per-entry 4KB scratch only for sources that synthesize into tmp (!owns_ptr).
+    // The interactive cache path (owns_ptr) caches stable arena pointers -> the
+    // sampler is ~5KB instead of ~1MB (no per-frame alloc/page-fault storm).
+    s->scratch = (src->owns_ptr || src->dense) ? NULL
+                 : malloc((size_t)MC_S_MEMO * 4096);
     mc_sampler_reset(s);
     return s;
 }
 
-void mc_sampler_free(mc_sampler *s) { free(s); }
+void mc_sampler_free(mc_sampler *s) { if (s) { free(s->scratch); free(s); } }
 
 void mc_sampler_reset(mc_sampler *s) {
     if (!s) return;
     for (int i = 0; i < MC_S_MEMO; i++) s->m[i].bz = -1;
     s->lbz = s->lby = s->lbx = -1;
     s->lptr = NULL;
+    s->rbz = s->rby = s->rbx = -1; s->rres = 0;
 }
 
 float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f) {
     return mc_s_sample(s, z, y, x, f);
+}
+
+// Is the block covering voxel (z,y,x) resident at this sampler's level?
+// Mirrors mc_s_trilinear's block lookup; NULL = absent (frozen miss / air).
+static inline int mc_s_block_resident(mc_sampler *s, float z, float y, float x) {
+    int z0 = (int)floorf(z), y0 = (int)floorf(y), x0 = (int)floorf(x);
+    if (z0 < 0 || y0 < 0 || x0 < 0 ||
+        z0 >= s->src.nz || y0 >= s->src.ny || x0 >= s->src.nx) return 0;
+    if (s->src.dense) return 1;                    // dense source: always resident
+    int bz = z0 >> 4, by = y0 >> 4, bx = x0 >> 4;
+    if (bz == s->rbz && by == s->rby && bx == s->rbx) return s->rres;  // ray-coherent
+    // CHEAP probe if the source provides one: this must NOT decode (the LOD
+    // fallback's whole point is to skip the fine-level decode-on-render-thread).
+    int r = s->src.resident ? s->src.resident(&s->src, bz, by, bx)
+                            : (mc_s_block(s, bz, by, bx) != NULL);   // may decode
+    s->rbz = bz; s->rby = by; s->rbx = bx; s->rres = r;
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// LOD sampler: one sub-sampler per pyramid level + coarser-LOD fallback.
+// ---------------------------------------------------------------------------
+struct mc_lod_sampler {
+    int nlods;
+    mc_sampler *lv[8];          // lv[i] = sampler for level i (NULL if empty)
+};
+
+mc_lod_sampler *mc_lod_sampler_new(const mc_sample_lods *ls) {
+    if (!ls || ls->nlods <= 0) return NULL;
+    mc_lod_sampler *s = calloc(1, sizeof *s);
+    if (!s) return NULL;
+    s->nlods = ls->nlods < 8 ? ls->nlods : 8;
+    for (int i = 0; i < s->nlods; i++)
+        if (ls->lods[i].block && ls->lods[i].nz > 0)
+            s->lv[i] = mc_sampler_new(&ls->lods[i]);   // NULL ok: treated as empty
+    return s;
+}
+
+void mc_lod_sampler_free(mc_lod_sampler *s) {
+    if (!s) return;
+    for (int i = 0; i < s->nlods; i++) mc_sampler_free(s->lv[i]);
+    free(s);
+}
+
+void mc_lod_sampler_reset(mc_lod_sampler *s) {
+    if (!s) return;
+    for (int i = 0; i < s->nlods; i++) mc_sampler_reset(s->lv[i]);
+}
+
+float mc_lod_sample(mc_lod_sampler *s, int lod, int lod_fallback,
+                    float z, float y, float x, mc_filter f) {
+    if (!s) return 0.0f;
+    if (!(z == z) || !(y == y) || !(x == x)) return 0.0f;   // NaN
+    if (lod < 0) lod = 0;
+    // L0 -> requested level: c_L = (c_0 + 0.5) * 2^-lod - 0.5
+    if (lod > 0) {
+        const float inv = 1.0f / (float)(1 << lod);
+        z = (z + 0.5f) * inv - 0.5f;
+        y = (y + 0.5f) * inv - 0.5f;
+        x = (x + 0.5f) * inv - 0.5f;
+    }
+    for (int L = lod; L < s->nlods; L++) {
+        mc_sampler *sub = s->lv[L];
+        // Sample this level only if its block for the point is resident. (At the
+        // requested level a resident block samples full quality; an absent one
+        // either falls through to coarser or, without fallback, returns 0.)
+        if (sub && mc_s_block_resident(sub, z, y, x))
+            return mc_s_sample(sub, z, y, x, f);
+        if (!lod_fallback) break;          // no walk: requested level only
+        // descend to next coarser level: c' = (c + 0.5)*0.5 - 0.5
+        z = (z + 0.5f) * 0.5f - 0.5f;
+        y = (y + 0.5f) * 0.5f - 0.5f;
+        x = (x + 0.5f) * 0.5f - 0.5f;
+    }
+    return 0.0f;   // nothing resident along the chain
 }
 
 static inline int pt_valid(const float *p) {
@@ -4355,10 +4561,85 @@ typedef struct {
     const mc_render_params *p;
     uint8_t *out;
     int row0, row1;
+    // LOD-fallback mode: when ls != NULL, sample via a per-band mc_lod_sampler
+    // at level `lod` with coarser-LOD fallback instead of the single `src`.
+    const mc_sample_lods *ls;
+    int lod;
 } band_t;
+
+// LOD-fallback point render: coords are native level-0 voxel space; each pixel
+// samples the requested level (`lod`) with coarser-LOD fallback. Slice path
+// (comp==NONE) only — the interactive nav case; composites stay single-level.
+//
+// Fast path: the common case is "all blocks resident at `lod`" (steady state and
+// air, since air decodes to a resident zero block). For a group of 8 points whose
+// level-`lod` blocks are ALL resident, sample with the 8-wide SIMD kernel on the
+// level-`lod` sampler — same speed as the non-fallback render. Only groups that
+// touch an ABSENT block fall to the per-lane coarse-LOD walk (transient, while a
+// freshly-entered level streams in).
+static void render_points_lod(mc_lod_sampler *ls, int lod,
+                              const float *pts, int w, int h,
+                              const mc_render_params *p, uint8_t *out) {
+    const mc_filter f = (mc_filter)p->filter;
+    const size_t n = (size_t)w * h;
+    mc_sampler *L = (lod >= 0 && lod < ls->nlods) ? ls->lv[lod] : NULL;
+    const float inv = lod > 0 ? 1.0f / (float)(1 << lod) : 1.0f;
+    // L0 -> level-`lod` voxel coord (half-voxel-center correct).
+    #define MC_L0_TO_L(c) ((c + 0.5f) * inv - 0.5f)
+
+    size_t k = 0;
+#ifdef MC_S_HAVE_TRI8
+    if (L && f == MC_FILTER_TRILINEAR) {
+        float pz[8], py[8], px[8], v8[8];
+        for (; k + 8 <= n; k += 8) {
+            int allv = 1, allres = 1;
+            for (int q = 0; q < 8; q++) {
+                const float *P = pts + (k + q) * 3;
+                if (!pt_valid(P)) { allv = 0; break; }
+                float z = MC_L0_TO_L(P[0]), y = MC_L0_TO_L(P[1]), x = MC_L0_TO_L(P[2]);
+                pz[q] = z; py[q] = y; px[q] = x;
+                // resident block at L? (covers air: air is a resident zero block)
+                if (!mc_s_block_resident(L, z, y, x)) { allres = 0; }
+            }
+            if (allv && allres) {
+                mc_s_tri8(L, pz, py, px, v8);
+                for (int q = 0; q < 8; q++) out[k + q] = to_u8(v8[q]);
+            } else {
+                for (int q = 0; q < 8; q++) {
+                    const float *P = pts + (k + q) * 3;
+                    out[k + q] = pt_valid(P)
+                        ? to_u8(mc_lod_sample(ls, lod, 1, P[0], P[1], P[2], f)) : 0;
+                }
+            }
+        }
+    }
+#endif
+    for (; k < n; k++) {
+        const float *P = pts + k * 3;
+        out[k] = pt_valid(P)
+            ? to_u8(mc_lod_sample(ls, lod, 1, P[0], P[1], P[2], f)) : 0;
+    }
+    #undef MC_L0_TO_L
+}
 
 static void *band_main(void *ud) {
     band_t *b = ud;
+    if (b->ls) {
+        mc_lod_sampler *ls = mc_lod_sampler_new(b->ls);
+        if (!ls) return NULL;
+        float *row = malloc((size_t)b->w * 3 * sizeof(float));
+        if (row) {
+            for (int i = b->row0; i < b->row1; i++) {
+                b->rowgen(b->rg_ud, i, b->w, row, NULL);   // L0 coords, no normals
+                render_points_lod(ls, b->lod, row, b->w, 1, b->p,
+                                  b->out + (size_t)i * b->w);
+            }
+            free(row);
+        } else memset(b->out + (size_t)b->row0 * b->w, 0,
+                      (size_t)(b->row1 - b->row0) * b->w);
+        mc_lod_sampler_free(ls);
+        return NULL;
+    }
     mc_sampler *s = mc_sampler_new(b->src);
     if (!s) return NULL;
     if (!b->rowgen) {
@@ -4385,11 +4666,14 @@ static void *band_main(void *ud) {
     return NULL;
 }
 
-static void render_bands(const mc_sample_src *src,
-                         const float *pts, const float *normals,
-                         rowgen_fn rowgen, const void *rg_ud,
-                         int w, int h, const mc_render_params *p,
-                         uint8_t *out, int nthreads) {
+// ls != NULL selects LOD-fallback mode (rowgen produces level-0 coords, each
+// band builds an mc_lod_sampler at `lod`). Otherwise single-source mode.
+static void render_bands_ex(const mc_sample_src *src,
+                            const float *pts, const float *normals,
+                            rowgen_fn rowgen, const void *rg_ud,
+                            const mc_sample_lods *ls, int lod,
+                            int w, int h, const mc_render_params *p,
+                            uint8_t *out, int nthreads) {
     if (w <= 0 || h <= 0) return;
     if (nthreads <= 0) {
         long nc = sysconf(_SC_NPROCESSORS_ONLN);
@@ -4405,7 +4689,7 @@ static void render_bands(const mc_sample_src *src,
         int r0 = t * per, r1 = r0 + per > h ? h : r0 + per;
         if (r0 >= r1) break;
         bands[nb] = (band_t){ src, pts, normals, rowgen, rg_ud,
-                              w, h, p, out, r0, r1 };
+                              w, h, p, out, r0, r1, ls, lod };
         if (nthreads == 1) { band_main(&bands[nb]); continue; }
         if (pthread_create(&th[nb], NULL, band_main, &bands[nb]) != 0) {
             band_main(&bands[nb]);          // degrade to inline
@@ -4416,12 +4700,404 @@ static void render_bands(const mc_sample_src *src,
     for (int t = 0; t < nb; t++) pthread_join(th[t], NULL);
 }
 
+static void render_bands(const mc_sample_src *src,
+                         const float *pts, const float *normals,
+                         rowgen_fn rowgen, const void *rg_ud,
+                         int w, int h, const mc_render_params *p,
+                         uint8_t *out, int nthreads) {
+    render_bands_ex(src, pts, normals, rowgen, rg_ud, NULL, 0,
+                    w, h, p, out, nthreads);
+}
+
 void mc_render_points_par(const mc_sample_src *src,
                           const float *pts, const float *normals,
                           int w, int h, const mc_render_params *p,
                           uint8_t *out, int nthreads) {
     render_bands(src, pts, normals, NULL, NULL, w, h, p, out, nthreads);
 }
+
+// dense-points renderer (one band-local row scratch fed from the caller's
+// level-0 point grid) with LOD-fallback sampling at `lod`.
+static void densepts_rowgen(const void *ud, int row, int w,
+                            float *pts, float *normals) {
+    (void)normals;
+    const float *base = (const float *)ud;
+    memcpy(pts, base + (size_t)row * w * 3, (size_t)w * 3 * sizeof(float));
+}
+
+void mc_render_points_par_lod(const mc_sample_lods *ls, int lod,
+                              const float *ptsL0, int w, int h,
+                              const mc_render_params *p,
+                              uint8_t *out, int nthreads) {
+    if (!ls || !ptsL0 || !out || w <= 0 || h <= 0) return;
+    if (lod < 0) lod = 0;
+    if (lod >= ls->nlods) lod = ls->nlods - 1;
+    render_bands_ex(NULL, NULL, NULL, densepts_rowgen, ptsL0, ls, lod,
+                    w, h, p, out, nthreads);
+}
+
+// ===========================================================================
+// mc_colormap — window/level + colormap LUT (moved out of volume-cartographer).
+// mc_render emits u8; this maps u8 -> ARGB32 for display. EVERY colormap is a
+// static [256][3] grayscale->RGB table (palettes baked from the originals; tints
+// generated as v*channel). mc stays dependency-free. Ids match the GUI strings.
+// ===========================================================================
+static const uint8_t MC_CMAP_VIRIDIS[256][3] = {
+{68,1,84},{68,2,86},{69,4,87},{69,5,89},{70,7,90},{70,8,92},{70,10,93},{70,11,94},
+{71,13,96},{71,14,97},{71,16,99},{71,17,100},{71,19,101},{72,20,103},{72,22,104},{72,23,105},
+{72,24,106},{72,26,108},{72,27,109},{72,28,110},{72,29,111},{72,31,112},{72,32,113},{72,33,115},
+{72,35,116},{72,36,117},{72,37,118},{72,38,119},{72,40,120},{72,41,121},{71,42,122},{71,44,122},
+{71,45,123},{71,46,124},{71,47,125},{70,48,126},{70,50,126},{70,51,127},{70,52,128},{69,53,129},
+{69,55,129},{69,56,130},{68,57,131},{68,58,131},{68,59,132},{67,61,132},{67,62,133},{66,63,133},
+{66,64,134},{66,65,134},{65,66,135},{65,68,135},{64,69,136},{64,70,136},{63,71,136},{63,72,137},
+{62,73,137},{62,74,137},{62,76,138},{61,77,138},{61,78,138},{60,79,138},{60,80,139},{59,81,139},
+{59,82,139},{58,83,139},{58,84,140},{57,85,140},{57,86,140},{56,88,140},{56,89,140},{55,90,140},
+{55,91,141},{54,92,141},{54,93,141},{53,94,141},{53,95,141},{52,96,141},{52,97,141},{51,98,141},
+{51,99,141},{50,100,142},{50,101,142},{49,102,142},{49,103,142},{49,104,142},{48,105,142},{48,106,142},
+{47,107,142},{47,108,142},{46,109,142},{46,110,142},{46,111,142},{45,112,142},{45,113,142},{44,113,142},
+{44,114,142},{44,115,142},{43,116,142},{43,117,142},{42,118,142},{42,119,142},{42,120,142},{41,121,142},
+{41,122,142},{41,123,142},{40,124,142},{40,125,142},{39,126,142},{39,127,142},{39,128,142},{38,129,142},
+{38,130,142},{38,130,142},{37,131,142},{37,132,142},{37,133,142},{36,134,142},{36,135,142},{35,136,142},
+{35,137,142},{35,138,141},{34,139,141},{34,140,141},{34,141,141},{33,142,141},{33,143,141},{33,144,141},
+{33,145,140},{32,146,140},{32,146,140},{32,147,140},{31,148,140},{31,149,139},{31,150,139},{31,151,139},
+{31,152,139},{31,153,138},{31,154,138},{30,155,138},{30,156,137},{30,157,137},{31,158,137},{31,159,136},
+{31,160,136},{31,161,136},{31,161,135},{31,162,135},{32,163,134},{32,164,134},{33,165,133},{33,166,133},
+{34,167,133},{34,168,132},{35,169,131},{36,170,131},{37,171,130},{37,172,130},{38,173,129},{39,173,129},
+{40,174,128},{41,175,127},{42,176,127},{44,177,126},{45,178,125},{46,179,124},{47,180,124},{49,181,123},
+{50,182,122},{52,182,121},{53,183,121},{55,184,120},{56,185,119},{58,186,118},{59,187,117},{61,188,116},
+{63,188,115},{64,189,114},{66,190,113},{68,191,112},{70,192,111},{72,193,110},{74,193,109},{76,194,108},
+{78,195,107},{80,196,106},{82,197,105},{84,197,104},{86,198,103},{88,199,101},{90,200,100},{92,200,99},
+{94,201,98},{96,202,96},{99,203,95},{101,203,94},{103,204,92},{105,205,91},{108,205,90},{110,206,88},
+{112,207,87},{115,208,86},{117,208,84},{119,209,83},{122,209,81},{124,210,80},{127,211,78},{129,211,77},
+{132,212,75},{134,213,73},{137,213,72},{139,214,70},{142,214,69},{144,215,67},{147,215,65},{149,216,64},
+{152,216,62},{155,217,60},{157,217,59},{160,218,57},{162,218,55},{165,219,54},{168,219,52},{170,220,50},
+{173,220,48},{176,221,47},{178,221,45},{181,222,43},{184,222,41},{186,222,40},{189,223,38},{192,223,37},
+{194,223,35},{197,224,33},{200,224,32},{202,225,31},{205,225,29},{208,225,28},{210,226,27},{213,226,26},
+{216,226,25},{218,227,25},{221,227,24},{223,227,24},{226,228,24},{229,228,25},{231,228,25},{234,229,26},
+{236,229,27},{239,229,28},{241,229,29},{244,230,30},{246,230,32},{248,230,33},{251,231,35},{253,231,37},
+};
+static const uint8_t MC_CMAP_MAGMA[256][3] = {
+{0,0,4},{1,0,5},{1,1,6},{1,1,8},{2,1,9},{2,2,11},{2,2,13},{3,3,15},
+{3,3,18},{4,4,20},{5,4,22},{6,5,24},{6,5,26},{7,6,28},{8,7,30},{9,7,32},
+{10,8,34},{11,9,36},{12,9,38},{13,10,41},{14,11,43},{16,11,45},{17,12,47},{18,13,49},
+{19,13,52},{20,14,54},{21,14,56},{22,15,59},{24,15,61},{25,16,63},{26,16,66},{28,16,68},
+{29,17,71},{30,17,73},{32,17,75},{33,17,78},{34,17,80},{36,18,83},{37,18,85},{39,18,88},
+{41,17,90},{42,17,92},{44,17,95},{45,17,97},{47,17,99},{49,17,101},{51,16,103},{52,16,105},
+{54,16,107},{56,16,108},{57,15,110},{59,15,112},{61,15,113},{63,15,114},{64,15,116},{66,15,117},
+{68,15,118},{69,16,119},{71,16,120},{73,16,120},{74,16,121},{76,17,122},{78,17,123},{79,18,123},
+{81,18,124},{82,19,124},{84,19,125},{86,20,125},{87,21,126},{89,21,126},{90,22,126},{92,22,127},
+{93,23,127},{95,24,127},{96,24,128},{98,25,128},{100,26,128},{101,26,128},{103,27,128},{104,28,129},
+{106,28,129},{107,29,129},{109,29,129},{110,30,129},{112,31,129},{114,31,129},{115,32,129},{117,33,129},
+{118,33,129},{120,34,129},{121,34,130},{123,35,130},{124,35,130},{126,36,130},{128,37,130},{129,37,129},
+{131,38,129},{132,38,129},{134,39,129},{136,39,129},{137,40,129},{139,41,129},{140,41,129},{142,42,129},
+{144,42,129},{145,43,129},{147,43,128},{148,44,128},{150,44,128},{152,45,128},{153,45,128},{155,46,127},
+{156,46,127},{158,47,127},{160,47,127},{161,48,126},{163,48,126},{165,49,126},{166,49,125},{168,50,125},
+{170,51,125},{171,51,124},{173,52,124},{174,52,123},{176,53,123},{178,53,123},{179,54,122},{181,54,122},
+{183,55,121},{184,55,121},{186,56,120},{188,57,120},{189,57,119},{191,58,119},{192,58,118},{194,59,117},
+{196,60,117},{197,60,116},{199,61,115},{200,62,115},{202,62,114},{204,63,113},{205,64,113},{207,64,112},
+{208,65,111},{210,66,111},{211,67,110},{213,68,109},{214,69,108},{216,69,108},{217,70,107},{219,71,106},
+{220,72,105},{222,73,104},{223,74,104},{224,76,103},{226,77,102},{227,78,101},{228,79,100},{229,80,100},
+{231,82,99},{232,83,98},{233,84,98},{234,86,97},{235,87,96},{236,88,96},{237,90,95},{238,91,94},
+{239,93,94},{240,95,94},{241,96,93},{242,98,93},{242,100,92},{243,101,92},{244,103,92},{244,105,92},
+{245,107,92},{246,108,92},{246,110,92},{247,112,92},{247,114,92},{248,116,92},{248,118,92},{249,120,93},
+{249,121,93},{249,123,93},{250,125,94},{250,127,94},{250,129,95},{251,131,95},{251,133,96},{251,135,97},
+{252,137,97},{252,138,98},{252,140,99},{252,142,100},{252,144,101},{253,146,102},{253,148,103},{253,150,104},
+{253,152,105},{253,154,106},{253,155,107},{254,157,108},{254,159,109},{254,161,110},{254,163,111},{254,165,113},
+{254,167,114},{254,169,115},{254,170,116},{254,172,118},{254,174,119},{254,176,120},{254,178,122},{254,180,123},
+{254,182,124},{254,183,126},{254,185,127},{254,187,129},{254,189,130},{254,191,132},{254,193,133},{254,194,135},
+{254,196,136},{254,198,138},{254,200,140},{254,202,141},{254,204,143},{254,205,144},{254,207,146},{254,209,148},
+{254,211,149},{254,213,151},{254,215,153},{254,216,154},{253,218,156},{253,220,158},{253,222,160},{253,224,161},
+{253,226,163},{253,227,165},{253,229,167},{253,231,169},{253,233,170},{253,235,172},{252,236,174},{252,238,176},
+{252,240,178},{252,242,180},{252,244,182},{252,246,184},{252,247,185},{252,249,187},{252,251,189},{252,253,191},
+};
+static const uint8_t MC_CMAP_FIRE[256][3] = {
+{0,0,0},{2,0,0},{5,0,0},{8,0,0},{10,0,0},{12,0,0},{15,0,0},{18,0,0},
+{20,0,0},{22,0,0},{25,0,0},{27,0,0},{30,0,0},{32,0,0},{35,0,0},{38,0,0},
+{40,0,0},{42,0,0},{45,0,0},{48,0,0},{50,0,0},{52,0,0},{55,0,0},{57,0,0},
+{60,0,0},{62,0,0},{65,0,0},{68,0,0},{70,0,0},{72,0,0},{75,0,0},{78,0,0},
+{80,0,0},{82,0,0},{85,0,0},{88,0,0},{90,0,0},{92,0,0},{95,0,0},{98,0,0},
+{100,0,0},{102,0,0},{105,0,0},{108,0,0},{110,0,0},{112,0,0},{115,0,0},{117,0,0},
+{120,0,0},{122,0,0},{125,0,0},{128,0,0},{130,0,0},{132,0,0},{135,0,0},{138,0,0},
+{140,0,0},{142,0,0},{145,0,0},{148,0,0},{150,0,0},{152,0,0},{155,0,0},{158,0,0},
+{160,0,0},{162,0,0},{165,0,0},{168,0,0},{170,0,0},{172,0,0},{175,0,0},{178,0,0},
+{180,0,0},{182,0,0},{185,0,0},{188,0,0},{190,0,0},{192,0,0},{195,0,0},{198,0,0},
+{200,0,0},{202,0,0},{205,0,0},{208,0,0},{210,0,0},{212,0,0},{215,0,0},{218,0,0},
+{220,0,0},{223,0,0},{225,0,0},{228,0,0},{230,0,0},{232,0,0},{235,0,0},{238,0,0},
+{240,0,0},{243,0,0},{245,0,0},{248,0,0},{250,0,0},{252,0,0},{253,2,0},{254,4,0},
+{254,6,0},{255,8,0},{255,10,0},{255,13,0},{255,15,0},{255,18,0},{255,20,0},{255,22,0},
+{255,25,0},{255,28,0},{255,30,0},{255,32,0},{255,35,0},{255,38,0},{255,40,0},{255,42,0},
+{255,45,0},{255,48,0},{255,50,0},{255,52,0},{255,55,0},{255,58,0},{255,60,0},{255,62,0},
+{255,65,0},{255,68,0},{255,70,0},{255,72,0},{255,75,0},{255,78,0},{255,80,0},{255,82,0},
+{255,85,0},{255,88,0},{255,90,0},{255,92,0},{255,95,0},{255,98,0},{255,100,0},{255,102,0},
+{255,105,0},{255,108,0},{255,110,0},{255,112,0},{255,115,0},{255,118,0},{255,120,0},{255,122,0},
+{255,125,0},{255,128,0},{255,130,0},{255,132,0},{255,135,0},{255,138,0},{255,140,0},{255,142,0},
+{255,145,0},{255,148,0},{255,150,0},{255,152,0},{255,155,0},{255,158,0},{255,160,0},{255,162,0},
+{255,165,0},{255,168,0},{255,170,0},{255,172,0},{255,175,0},{255,178,0},{255,180,0},{255,182,0},
+{255,185,0},{255,188,0},{255,190,0},{255,192,0},{255,195,0},{255,198,0},{255,200,0},{255,202,0},
+{255,205,0},{255,208,0},{255,210,0},{255,212,0},{255,215,0},{255,218,0},{255,220,0},{255,222,0},
+{255,225,0},{255,228,0},{255,230,0},{255,232,0},{255,235,0},{255,238,0},{255,240,0},{255,242,0},
+{255,245,0},{255,248,0},{255,250,0},{255,252,2},{255,253,5},{255,254,8},{255,255,11},{255,255,15},
+{255,255,20},{255,255,25},{255,255,30},{255,255,35},{255,255,40},{255,255,45},{255,255,50},{255,255,55},
+{255,255,60},{255,255,65},{255,255,70},{255,255,75},{255,255,80},{255,255,85},{255,255,90},{255,255,95},
+{255,255,100},{255,255,105},{255,255,110},{255,255,115},{255,255,120},{255,255,125},{255,255,130},{255,255,135},
+{255,255,140},{255,255,145},{255,255,150},{255,255,155},{255,255,160},{255,255,165},{255,255,170},{255,255,175},
+{255,255,180},{255,255,185},{255,255,190},{255,255,195},{255,255,200},{255,255,205},{255,255,210},{255,255,215},
+{255,255,220},{255,255,225},{255,255,230},{255,255,235},{255,255,240},{255,255,245},{255,255,250},{255,255,255},
+};
+static const uint8_t MC_CMAP_GRAY[256][3] = {
+{0,0,0},{1,1,1},{2,2,2},{3,3,3},{4,4,4},{5,5,5},{6,6,6},{7,7,7},
+{8,8,8},{9,9,9},{10,10,10},{11,11,11},{12,12,12},{13,13,13},{14,14,14},{15,15,15},
+{16,16,16},{17,17,17},{18,18,18},{19,19,19},{20,20,20},{21,21,21},{22,22,22},{23,23,23},
+{24,24,24},{25,25,25},{26,26,26},{27,27,27},{28,28,28},{29,29,29},{30,30,30},{31,31,31},
+{32,32,32},{33,33,33},{34,34,34},{35,35,35},{36,36,36},{37,37,37},{38,38,38},{39,39,39},
+{40,40,40},{41,41,41},{42,42,42},{43,43,43},{44,44,44},{45,45,45},{46,46,46},{47,47,47},
+{48,48,48},{49,49,49},{50,50,50},{51,51,51},{52,52,52},{53,53,53},{54,54,54},{55,55,55},
+{56,56,56},{57,57,57},{58,58,58},{59,59,59},{60,60,60},{61,61,61},{62,62,62},{63,63,63},
+{64,64,64},{65,65,65},{66,66,66},{67,67,67},{68,68,68},{69,69,69},{70,70,70},{71,71,71},
+{72,72,72},{73,73,73},{74,74,74},{75,75,75},{76,76,76},{77,77,77},{78,78,78},{79,79,79},
+{80,80,80},{81,81,81},{82,82,82},{83,83,83},{84,84,84},{85,85,85},{86,86,86},{87,87,87},
+{88,88,88},{89,89,89},{90,90,90},{91,91,91},{92,92,92},{93,93,93},{94,94,94},{95,95,95},
+{96,96,96},{97,97,97},{98,98,98},{99,99,99},{100,100,100},{101,101,101},{102,102,102},{103,103,103},
+{104,104,104},{105,105,105},{106,106,106},{107,107,107},{108,108,108},{109,109,109},{110,110,110},{111,111,111},
+{112,112,112},{113,113,113},{114,114,114},{115,115,115},{116,116,116},{117,117,117},{118,118,118},{119,119,119},
+{120,120,120},{121,121,121},{122,122,122},{123,123,123},{124,124,124},{125,125,125},{126,126,126},{127,127,127},
+{128,128,128},{129,129,129},{130,130,130},{131,131,131},{132,132,132},{133,133,133},{134,134,134},{135,135,135},
+{136,136,136},{137,137,137},{138,138,138},{139,139,139},{140,140,140},{141,141,141},{142,142,142},{143,143,143},
+{144,144,144},{145,145,145},{146,146,146},{147,147,147},{148,148,148},{149,149,149},{150,150,150},{151,151,151},
+{152,152,152},{153,153,153},{154,154,154},{155,155,155},{156,156,156},{157,157,157},{158,158,158},{159,159,159},
+{160,160,160},{161,161,161},{162,162,162},{163,163,163},{164,164,164},{165,165,165},{166,166,166},{167,167,167},
+{168,168,168},{169,169,169},{170,170,170},{171,171,171},{172,172,172},{173,173,173},{174,174,174},{175,175,175},
+{176,176,176},{177,177,177},{178,178,178},{179,179,179},{180,180,180},{181,181,181},{182,182,182},{183,183,183},
+{184,184,184},{185,185,185},{186,186,186},{187,187,187},{188,188,188},{189,189,189},{190,190,190},{191,191,191},
+{192,192,192},{193,193,193},{194,194,194},{195,195,195},{196,196,196},{197,197,197},{198,198,198},{199,199,199},
+{200,200,200},{201,201,201},{202,202,202},{203,203,203},{204,204,204},{205,205,205},{206,206,206},{207,207,207},
+{208,208,208},{209,209,209},{210,210,210},{211,211,211},{212,212,212},{213,213,213},{214,214,214},{215,215,215},
+{216,216,216},{217,217,217},{218,218,218},{219,219,219},{220,220,220},{221,221,221},{222,222,222},{223,223,223},
+{224,224,224},{225,225,225},{226,226,226},{227,227,227},{228,228,228},{229,229,229},{230,230,230},{231,231,231},
+{232,232,232},{233,233,233},{234,234,234},{235,235,235},{236,236,236},{237,237,237},{238,238,238},{239,239,239},
+{240,240,240},{241,241,241},{242,242,242},{243,243,243},{244,244,244},{245,245,245},{246,246,246},{247,247,247},
+{248,248,248},{249,249,249},{250,250,250},{251,251,251},{252,252,252},{253,253,253},{254,254,254},{255,255,255},
+};
+static const uint8_t MC_CMAP_RED[256][3] = {
+{0,0,0},{1,0,0},{2,0,0},{3,0,0},{4,0,0},{5,0,0},{6,0,0},{7,0,0},
+{8,0,0},{9,0,0},{10,0,0},{11,0,0},{12,0,0},{13,0,0},{14,0,0},{15,0,0},
+{16,0,0},{17,0,0},{18,0,0},{19,0,0},{20,0,0},{21,0,0},{22,0,0},{23,0,0},
+{24,0,0},{25,0,0},{26,0,0},{27,0,0},{28,0,0},{29,0,0},{30,0,0},{31,0,0},
+{32,0,0},{33,0,0},{34,0,0},{35,0,0},{36,0,0},{37,0,0},{38,0,0},{39,0,0},
+{40,0,0},{41,0,0},{42,0,0},{43,0,0},{44,0,0},{45,0,0},{46,0,0},{47,0,0},
+{48,0,0},{49,0,0},{50,0,0},{51,0,0},{52,0,0},{53,0,0},{54,0,0},{55,0,0},
+{56,0,0},{57,0,0},{58,0,0},{59,0,0},{60,0,0},{61,0,0},{62,0,0},{63,0,0},
+{64,0,0},{65,0,0},{66,0,0},{67,0,0},{68,0,0},{69,0,0},{70,0,0},{71,0,0},
+{72,0,0},{73,0,0},{74,0,0},{75,0,0},{76,0,0},{77,0,0},{78,0,0},{79,0,0},
+{80,0,0},{81,0,0},{82,0,0},{83,0,0},{84,0,0},{85,0,0},{86,0,0},{87,0,0},
+{88,0,0},{89,0,0},{90,0,0},{91,0,0},{92,0,0},{93,0,0},{94,0,0},{95,0,0},
+{96,0,0},{97,0,0},{98,0,0},{99,0,0},{100,0,0},{101,0,0},{102,0,0},{103,0,0},
+{104,0,0},{105,0,0},{106,0,0},{107,0,0},{108,0,0},{109,0,0},{110,0,0},{111,0,0},
+{112,0,0},{113,0,0},{114,0,0},{115,0,0},{116,0,0},{117,0,0},{118,0,0},{119,0,0},
+{120,0,0},{121,0,0},{122,0,0},{123,0,0},{124,0,0},{125,0,0},{126,0,0},{127,0,0},
+{128,0,0},{129,0,0},{130,0,0},{131,0,0},{132,0,0},{133,0,0},{134,0,0},{135,0,0},
+{136,0,0},{137,0,0},{138,0,0},{139,0,0},{140,0,0},{141,0,0},{142,0,0},{143,0,0},
+{144,0,0},{145,0,0},{146,0,0},{147,0,0},{148,0,0},{149,0,0},{150,0,0},{151,0,0},
+{152,0,0},{153,0,0},{154,0,0},{155,0,0},{156,0,0},{157,0,0},{158,0,0},{159,0,0},
+{160,0,0},{161,0,0},{162,0,0},{163,0,0},{164,0,0},{165,0,0},{166,0,0},{167,0,0},
+{168,0,0},{169,0,0},{170,0,0},{171,0,0},{172,0,0},{173,0,0},{174,0,0},{175,0,0},
+{176,0,0},{177,0,0},{178,0,0},{179,0,0},{180,0,0},{181,0,0},{182,0,0},{183,0,0},
+{184,0,0},{185,0,0},{186,0,0},{187,0,0},{188,0,0},{189,0,0},{190,0,0},{191,0,0},
+{192,0,0},{193,0,0},{194,0,0},{195,0,0},{196,0,0},{197,0,0},{198,0,0},{199,0,0},
+{200,0,0},{201,0,0},{202,0,0},{203,0,0},{204,0,0},{205,0,0},{206,0,0},{207,0,0},
+{208,0,0},{209,0,0},{210,0,0},{211,0,0},{212,0,0},{213,0,0},{214,0,0},{215,0,0},
+{216,0,0},{217,0,0},{218,0,0},{219,0,0},{220,0,0},{221,0,0},{222,0,0},{223,0,0},
+{224,0,0},{225,0,0},{226,0,0},{227,0,0},{228,0,0},{229,0,0},{230,0,0},{231,0,0},
+{232,0,0},{233,0,0},{234,0,0},{235,0,0},{236,0,0},{237,0,0},{238,0,0},{239,0,0},
+{240,0,0},{241,0,0},{242,0,0},{243,0,0},{244,0,0},{245,0,0},{246,0,0},{247,0,0},
+{248,0,0},{249,0,0},{250,0,0},{251,0,0},{252,0,0},{253,0,0},{254,0,0},{255,0,0},
+};
+static const uint8_t MC_CMAP_GREEN[256][3] = {
+{0,0,0},{0,1,0},{0,2,0},{0,3,0},{0,4,0},{0,5,0},{0,6,0},{0,7,0},
+{0,8,0},{0,9,0},{0,10,0},{0,11,0},{0,12,0},{0,13,0},{0,14,0},{0,15,0},
+{0,16,0},{0,17,0},{0,18,0},{0,19,0},{0,20,0},{0,21,0},{0,22,0},{0,23,0},
+{0,24,0},{0,25,0},{0,26,0},{0,27,0},{0,28,0},{0,29,0},{0,30,0},{0,31,0},
+{0,32,0},{0,33,0},{0,34,0},{0,35,0},{0,36,0},{0,37,0},{0,38,0},{0,39,0},
+{0,40,0},{0,41,0},{0,42,0},{0,43,0},{0,44,0},{0,45,0},{0,46,0},{0,47,0},
+{0,48,0},{0,49,0},{0,50,0},{0,51,0},{0,52,0},{0,53,0},{0,54,0},{0,55,0},
+{0,56,0},{0,57,0},{0,58,0},{0,59,0},{0,60,0},{0,61,0},{0,62,0},{0,63,0},
+{0,64,0},{0,65,0},{0,66,0},{0,67,0},{0,68,0},{0,69,0},{0,70,0},{0,71,0},
+{0,72,0},{0,73,0},{0,74,0},{0,75,0},{0,76,0},{0,77,0},{0,78,0},{0,79,0},
+{0,80,0},{0,81,0},{0,82,0},{0,83,0},{0,84,0},{0,85,0},{0,86,0},{0,87,0},
+{0,88,0},{0,89,0},{0,90,0},{0,91,0},{0,92,0},{0,93,0},{0,94,0},{0,95,0},
+{0,96,0},{0,97,0},{0,98,0},{0,99,0},{0,100,0},{0,101,0},{0,102,0},{0,103,0},
+{0,104,0},{0,105,0},{0,106,0},{0,107,0},{0,108,0},{0,109,0},{0,110,0},{0,111,0},
+{0,112,0},{0,113,0},{0,114,0},{0,115,0},{0,116,0},{0,117,0},{0,118,0},{0,119,0},
+{0,120,0},{0,121,0},{0,122,0},{0,123,0},{0,124,0},{0,125,0},{0,126,0},{0,127,0},
+{0,128,0},{0,129,0},{0,130,0},{0,131,0},{0,132,0},{0,133,0},{0,134,0},{0,135,0},
+{0,136,0},{0,137,0},{0,138,0},{0,139,0},{0,140,0},{0,141,0},{0,142,0},{0,143,0},
+{0,144,0},{0,145,0},{0,146,0},{0,147,0},{0,148,0},{0,149,0},{0,150,0},{0,151,0},
+{0,152,0},{0,153,0},{0,154,0},{0,155,0},{0,156,0},{0,157,0},{0,158,0},{0,159,0},
+{0,160,0},{0,161,0},{0,162,0},{0,163,0},{0,164,0},{0,165,0},{0,166,0},{0,167,0},
+{0,168,0},{0,169,0},{0,170,0},{0,171,0},{0,172,0},{0,173,0},{0,174,0},{0,175,0},
+{0,176,0},{0,177,0},{0,178,0},{0,179,0},{0,180,0},{0,181,0},{0,182,0},{0,183,0},
+{0,184,0},{0,185,0},{0,186,0},{0,187,0},{0,188,0},{0,189,0},{0,190,0},{0,191,0},
+{0,192,0},{0,193,0},{0,194,0},{0,195,0},{0,196,0},{0,197,0},{0,198,0},{0,199,0},
+{0,200,0},{0,201,0},{0,202,0},{0,203,0},{0,204,0},{0,205,0},{0,206,0},{0,207,0},
+{0,208,0},{0,209,0},{0,210,0},{0,211,0},{0,212,0},{0,213,0},{0,214,0},{0,215,0},
+{0,216,0},{0,217,0},{0,218,0},{0,219,0},{0,220,0},{0,221,0},{0,222,0},{0,223,0},
+{0,224,0},{0,225,0},{0,226,0},{0,227,0},{0,228,0},{0,229,0},{0,230,0},{0,231,0},
+{0,232,0},{0,233,0},{0,234,0},{0,235,0},{0,236,0},{0,237,0},{0,238,0},{0,239,0},
+{0,240,0},{0,241,0},{0,242,0},{0,243,0},{0,244,0},{0,245,0},{0,246,0},{0,247,0},
+{0,248,0},{0,249,0},{0,250,0},{0,251,0},{0,252,0},{0,253,0},{0,254,0},{0,255,0},
+};
+static const uint8_t MC_CMAP_BLUE[256][3] = {
+{0,0,0},{0,0,1},{0,0,2},{0,0,3},{0,0,4},{0,0,5},{0,0,6},{0,0,7},
+{0,0,8},{0,0,9},{0,0,10},{0,0,11},{0,0,12},{0,0,13},{0,0,14},{0,0,15},
+{0,0,16},{0,0,17},{0,0,18},{0,0,19},{0,0,20},{0,0,21},{0,0,22},{0,0,23},
+{0,0,24},{0,0,25},{0,0,26},{0,0,27},{0,0,28},{0,0,29},{0,0,30},{0,0,31},
+{0,0,32},{0,0,33},{0,0,34},{0,0,35},{0,0,36},{0,0,37},{0,0,38},{0,0,39},
+{0,0,40},{0,0,41},{0,0,42},{0,0,43},{0,0,44},{0,0,45},{0,0,46},{0,0,47},
+{0,0,48},{0,0,49},{0,0,50},{0,0,51},{0,0,52},{0,0,53},{0,0,54},{0,0,55},
+{0,0,56},{0,0,57},{0,0,58},{0,0,59},{0,0,60},{0,0,61},{0,0,62},{0,0,63},
+{0,0,64},{0,0,65},{0,0,66},{0,0,67},{0,0,68},{0,0,69},{0,0,70},{0,0,71},
+{0,0,72},{0,0,73},{0,0,74},{0,0,75},{0,0,76},{0,0,77},{0,0,78},{0,0,79},
+{0,0,80},{0,0,81},{0,0,82},{0,0,83},{0,0,84},{0,0,85},{0,0,86},{0,0,87},
+{0,0,88},{0,0,89},{0,0,90},{0,0,91},{0,0,92},{0,0,93},{0,0,94},{0,0,95},
+{0,0,96},{0,0,97},{0,0,98},{0,0,99},{0,0,100},{0,0,101},{0,0,102},{0,0,103},
+{0,0,104},{0,0,105},{0,0,106},{0,0,107},{0,0,108},{0,0,109},{0,0,110},{0,0,111},
+{0,0,112},{0,0,113},{0,0,114},{0,0,115},{0,0,116},{0,0,117},{0,0,118},{0,0,119},
+{0,0,120},{0,0,121},{0,0,122},{0,0,123},{0,0,124},{0,0,125},{0,0,126},{0,0,127},
+{0,0,128},{0,0,129},{0,0,130},{0,0,131},{0,0,132},{0,0,133},{0,0,134},{0,0,135},
+{0,0,136},{0,0,137},{0,0,138},{0,0,139},{0,0,140},{0,0,141},{0,0,142},{0,0,143},
+{0,0,144},{0,0,145},{0,0,146},{0,0,147},{0,0,148},{0,0,149},{0,0,150},{0,0,151},
+{0,0,152},{0,0,153},{0,0,154},{0,0,155},{0,0,156},{0,0,157},{0,0,158},{0,0,159},
+{0,0,160},{0,0,161},{0,0,162},{0,0,163},{0,0,164},{0,0,165},{0,0,166},{0,0,167},
+{0,0,168},{0,0,169},{0,0,170},{0,0,171},{0,0,172},{0,0,173},{0,0,174},{0,0,175},
+{0,0,176},{0,0,177},{0,0,178},{0,0,179},{0,0,180},{0,0,181},{0,0,182},{0,0,183},
+{0,0,184},{0,0,185},{0,0,186},{0,0,187},{0,0,188},{0,0,189},{0,0,190},{0,0,191},
+{0,0,192},{0,0,193},{0,0,194},{0,0,195},{0,0,196},{0,0,197},{0,0,198},{0,0,199},
+{0,0,200},{0,0,201},{0,0,202},{0,0,203},{0,0,204},{0,0,205},{0,0,206},{0,0,207},
+{0,0,208},{0,0,209},{0,0,210},{0,0,211},{0,0,212},{0,0,213},{0,0,214},{0,0,215},
+{0,0,216},{0,0,217},{0,0,218},{0,0,219},{0,0,220},{0,0,221},{0,0,222},{0,0,223},
+{0,0,224},{0,0,225},{0,0,226},{0,0,227},{0,0,228},{0,0,229},{0,0,230},{0,0,231},
+{0,0,232},{0,0,233},{0,0,234},{0,0,235},{0,0,236},{0,0,237},{0,0,238},{0,0,239},
+{0,0,240},{0,0,241},{0,0,242},{0,0,243},{0,0,244},{0,0,245},{0,0,246},{0,0,247},
+{0,0,248},{0,0,249},{0,0,250},{0,0,251},{0,0,252},{0,0,253},{0,0,254},{0,0,255},
+};
+static const uint8_t MC_CMAP_CYAN[256][3] = {
+{0,0,0},{0,1,1},{0,2,2},{0,3,3},{0,4,4},{0,5,5},{0,6,6},{0,7,7},
+{0,8,8},{0,9,9},{0,10,10},{0,11,11},{0,12,12},{0,13,13},{0,14,14},{0,15,15},
+{0,16,16},{0,17,17},{0,18,18},{0,19,19},{0,20,20},{0,21,21},{0,22,22},{0,23,23},
+{0,24,24},{0,25,25},{0,26,26},{0,27,27},{0,28,28},{0,29,29},{0,30,30},{0,31,31},
+{0,32,32},{0,33,33},{0,34,34},{0,35,35},{0,36,36},{0,37,37},{0,38,38},{0,39,39},
+{0,40,40},{0,41,41},{0,42,42},{0,43,43},{0,44,44},{0,45,45},{0,46,46},{0,47,47},
+{0,48,48},{0,49,49},{0,50,50},{0,51,51},{0,52,52},{0,53,53},{0,54,54},{0,55,55},
+{0,56,56},{0,57,57},{0,58,58},{0,59,59},{0,60,60},{0,61,61},{0,62,62},{0,63,63},
+{0,64,64},{0,65,65},{0,66,66},{0,67,67},{0,68,68},{0,69,69},{0,70,70},{0,71,71},
+{0,72,72},{0,73,73},{0,74,74},{0,75,75},{0,76,76},{0,77,77},{0,78,78},{0,79,79},
+{0,80,80},{0,81,81},{0,82,82},{0,83,83},{0,84,84},{0,85,85},{0,86,86},{0,87,87},
+{0,88,88},{0,89,89},{0,90,90},{0,91,91},{0,92,92},{0,93,93},{0,94,94},{0,95,95},
+{0,96,96},{0,97,97},{0,98,98},{0,99,99},{0,100,100},{0,101,101},{0,102,102},{0,103,103},
+{0,104,104},{0,105,105},{0,106,106},{0,107,107},{0,108,108},{0,109,109},{0,110,110},{0,111,111},
+{0,112,112},{0,113,113},{0,114,114},{0,115,115},{0,116,116},{0,117,117},{0,118,118},{0,119,119},
+{0,120,120},{0,121,121},{0,122,122},{0,123,123},{0,124,124},{0,125,125},{0,126,126},{0,127,127},
+{0,128,128},{0,129,129},{0,130,130},{0,131,131},{0,132,132},{0,133,133},{0,134,134},{0,135,135},
+{0,136,136},{0,137,137},{0,138,138},{0,139,139},{0,140,140},{0,141,141},{0,142,142},{0,143,143},
+{0,144,144},{0,145,145},{0,146,146},{0,147,147},{0,148,148},{0,149,149},{0,150,150},{0,151,151},
+{0,152,152},{0,153,153},{0,154,154},{0,155,155},{0,156,156},{0,157,157},{0,158,158},{0,159,159},
+{0,160,160},{0,161,161},{0,162,162},{0,163,163},{0,164,164},{0,165,165},{0,166,166},{0,167,167},
+{0,168,168},{0,169,169},{0,170,170},{0,171,171},{0,172,172},{0,173,173},{0,174,174},{0,175,175},
+{0,176,176},{0,177,177},{0,178,178},{0,179,179},{0,180,180},{0,181,181},{0,182,182},{0,183,183},
+{0,184,184},{0,185,185},{0,186,186},{0,187,187},{0,188,188},{0,189,189},{0,190,190},{0,191,191},
+{0,192,192},{0,193,193},{0,194,194},{0,195,195},{0,196,196},{0,197,197},{0,198,198},{0,199,199},
+{0,200,200},{0,201,201},{0,202,202},{0,203,203},{0,204,204},{0,205,205},{0,206,206},{0,207,207},
+{0,208,208},{0,209,209},{0,210,210},{0,211,211},{0,212,212},{0,213,213},{0,214,214},{0,215,215},
+{0,216,216},{0,217,217},{0,218,218},{0,219,219},{0,220,220},{0,221,221},{0,222,222},{0,223,223},
+{0,224,224},{0,225,225},{0,226,226},{0,227,227},{0,228,228},{0,229,229},{0,230,230},{0,231,231},
+{0,232,232},{0,233,233},{0,234,234},{0,235,235},{0,236,236},{0,237,237},{0,238,238},{0,239,239},
+{0,240,240},{0,241,241},{0,242,242},{0,243,243},{0,244,244},{0,245,245},{0,246,246},{0,247,247},
+{0,248,248},{0,249,249},{0,250,250},{0,251,251},{0,252,252},{0,253,253},{0,254,254},{0,255,255},
+};
+static const uint8_t MC_CMAP_MAGENTA[256][3] = {
+{0,0,0},{1,0,1},{2,0,2},{3,0,3},{4,0,4},{5,0,5},{6,0,6},{7,0,7},
+{8,0,8},{9,0,9},{10,0,10},{11,0,11},{12,0,12},{13,0,13},{14,0,14},{15,0,15},
+{16,0,16},{17,0,17},{18,0,18},{19,0,19},{20,0,20},{21,0,21},{22,0,22},{23,0,23},
+{24,0,24},{25,0,25},{26,0,26},{27,0,27},{28,0,28},{29,0,29},{30,0,30},{31,0,31},
+{32,0,32},{33,0,33},{34,0,34},{35,0,35},{36,0,36},{37,0,37},{38,0,38},{39,0,39},
+{40,0,40},{41,0,41},{42,0,42},{43,0,43},{44,0,44},{45,0,45},{46,0,46},{47,0,47},
+{48,0,48},{49,0,49},{50,0,50},{51,0,51},{52,0,52},{53,0,53},{54,0,54},{55,0,55},
+{56,0,56},{57,0,57},{58,0,58},{59,0,59},{60,0,60},{61,0,61},{62,0,62},{63,0,63},
+{64,0,64},{65,0,65},{66,0,66},{67,0,67},{68,0,68},{69,0,69},{70,0,70},{71,0,71},
+{72,0,72},{73,0,73},{74,0,74},{75,0,75},{76,0,76},{77,0,77},{78,0,78},{79,0,79},
+{80,0,80},{81,0,81},{82,0,82},{83,0,83},{84,0,84},{85,0,85},{86,0,86},{87,0,87},
+{88,0,88},{89,0,89},{90,0,90},{91,0,91},{92,0,92},{93,0,93},{94,0,94},{95,0,95},
+{96,0,96},{97,0,97},{98,0,98},{99,0,99},{100,0,100},{101,0,101},{102,0,102},{103,0,103},
+{104,0,104},{105,0,105},{106,0,106},{107,0,107},{108,0,108},{109,0,109},{110,0,110},{111,0,111},
+{112,0,112},{113,0,113},{114,0,114},{115,0,115},{116,0,116},{117,0,117},{118,0,118},{119,0,119},
+{120,0,120},{121,0,121},{122,0,122},{123,0,123},{124,0,124},{125,0,125},{126,0,126},{127,0,127},
+{128,0,128},{129,0,129},{130,0,130},{131,0,131},{132,0,132},{133,0,133},{134,0,134},{135,0,135},
+{136,0,136},{137,0,137},{138,0,138},{139,0,139},{140,0,140},{141,0,141},{142,0,142},{143,0,143},
+{144,0,144},{145,0,145},{146,0,146},{147,0,147},{148,0,148},{149,0,149},{150,0,150},{151,0,151},
+{152,0,152},{153,0,153},{154,0,154},{155,0,155},{156,0,156},{157,0,157},{158,0,158},{159,0,159},
+{160,0,160},{161,0,161},{162,0,162},{163,0,163},{164,0,164},{165,0,165},{166,0,166},{167,0,167},
+{168,0,168},{169,0,169},{170,0,170},{171,0,171},{172,0,172},{173,0,173},{174,0,174},{175,0,175},
+{176,0,176},{177,0,177},{178,0,178},{179,0,179},{180,0,180},{181,0,181},{182,0,182},{183,0,183},
+{184,0,184},{185,0,185},{186,0,186},{187,0,187},{188,0,188},{189,0,189},{190,0,190},{191,0,191},
+{192,0,192},{193,0,193},{194,0,194},{195,0,195},{196,0,196},{197,0,197},{198,0,198},{199,0,199},
+{200,0,200},{201,0,201},{202,0,202},{203,0,203},{204,0,204},{205,0,205},{206,0,206},{207,0,207},
+{208,0,208},{209,0,209},{210,0,210},{211,0,211},{212,0,212},{213,0,213},{214,0,214},{215,0,215},
+{216,0,216},{217,0,217},{218,0,218},{219,0,219},{220,0,220},{221,0,221},{222,0,222},{223,0,223},
+{224,0,224},{225,0,225},{226,0,226},{227,0,227},{228,0,228},{229,0,229},{230,0,230},{231,0,231},
+{232,0,232},{233,0,233},{234,0,234},{235,0,235},{236,0,236},{237,0,237},{238,0,238},{239,0,239},
+{240,0,240},{241,0,241},{242,0,242},{243,0,243},{244,0,244},{245,0,245},{246,0,246},{247,0,247},
+{248,0,248},{249,0,249},{250,0,250},{251,0,251},{252,0,252},{253,0,253},{254,0,254},{255,0,255},
+};
+
+// id -> the static palette table. All maps are a uniform [256][3] lookup.
+static const uint8_t (*mc_cmap_table(int id))[3] {
+    switch(id){
+        case 1: return MC_CMAP_VIRIDIS;
+        case 2: return MC_CMAP_MAGMA;
+        case 3: return MC_CMAP_FIRE;
+        case 4: return MC_CMAP_RED;
+        case 5: return MC_CMAP_GREEN;
+        case 6: return MC_CMAP_BLUE;
+        case 7: return MC_CMAP_CYAN;
+        case 8: return MC_CMAP_MAGENTA;
+        default: return MC_CMAP_GRAY;
+    }
+}
+int mc_colormap_id(const char *name){
+    if(!name||!*name) return 0;
+    if(!strcmp(name,"viridis")) return 1;
+    if(!strcmp(name,"magma"))   return 2;
+    if(!strcmp(name,"fire"))    return 3;
+    if(!strcmp(name,"red"))     return 4;
+    if(!strcmp(name,"green"))   return 5;
+    if(!strcmp(name,"blue"))    return 6;
+    if(!strcmp(name,"cyan"))    return 7;
+    if(!strcmp(name,"magenta")) return 8;
+    return 0;
+}
+// 256-entry ARGB32 LUT: window/level ramp then the colormap table. Matches VC3D's
+// old buildWindowLevelColormapLut (lut[0]=opaque black for non-gray maps).
+void mc_colormap_lut(uint32_t lut[256], float win_low, float win_high, int cmap_id){
+    int lo=(int)(win_low<0?0:win_low>255?255:win_low);
+    int hi=(int)(win_high<lo+1?lo+1:win_high>255?255:win_high);
+    float span=(hi-lo)>1?(float)(hi-lo):1.0f;
+    const uint8_t (*pal)[3]=mc_cmap_table(cmap_id);
+    for(int i=0;i<256;++i){
+        float g=((float)i-(float)lo)/span*255.0f;
+        uint8_t v=(uint8_t)(g<0?0:g>255?255:g);
+        lut[i]=0xFF000000u|((uint32_t)pal[v][0]<<16)|((uint32_t)pal[v][1]<<8)|(uint32_t)pal[v][2];
+    }
+    if(cmap_id!=0) lut[0]=0xFF000000u;
+}
+// Apply a 256-ARGB LUT to a w*h u8 image -> ARGB32 (out_stride in pixels).
+void mc_colormap_apply(const uint8_t *vals, int w, int h, const uint32_t lut[256],
+                       uint32_t *out, int out_stride){
+    for(int y=0;y<h;++y){
+        const uint8_t *s=vals+(size_t)y*w; uint32_t *d=out+(size_t)y*out_stride;
+        for(int x=0;x<w;++x) d[x]=lut[s[x]];
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // plane surface
@@ -5387,6 +6063,7 @@ struct mc_s3 {
     s3_client *cl;
     char *url;
     mc_reader *r;
+    _Atomic uint64_t net_bytes;   // bytes pulled over S3 (for the volume's rate readout)
 };
 
 static int s3_read_cb(void *ud, uint64_t off, uint32_t len, uint8_t *dst){
@@ -5402,15 +6079,25 @@ static int s3_read_cb(void *ud, uint64_t off, uint32_t len, uint8_t *dst){
     } else if(resp.status==200 && resp.body_len>=off+len){
         memcpy(dst,resp.body+off,len); rc=0;      // server ignored Range and
     }                                             // sent the whole object
+    if(rc==0) atomic_fetch_add_explicit(&s->net_bytes,len,memory_order_relaxed);
     s3_response_free(&resp);
     return rc;
+}
+
+uint64_t mc_s3_net_bytes(mc_s3 *s){
+    return s ? atomic_load_explicit(&s->net_bytes,memory_order_relaxed) : 0;
 }
 
 mc_s3 *mc_s3_open(const char *url){
     if(!url) return NULL;
     mc_s3 *s=calloc(1,sizeof *s);
+    // Full credential resolution (profile/IMDS/SSO/env), else anonymous -- same as
+    // the zarr transcode path, so a private bucket (philodemos) authenticates.
     s3_config cfg={0};
+    s3_credentials creds={0};
+    if(s3_credentials_load(NULL,&creds)==S3_OK) cfg.creds=creds;
     s->cl=s3_client_new(&cfg);
+    s3_credentials_free(&creds);
     if(!s->cl){ free(s); return NULL; }
     s->url=strdup(url);
     s3_response head={0};
@@ -5500,6 +6187,22 @@ struct mc_volume {
     mc_cache *cache;
     float quality;
 
+    // Streaming mode: the source is an ALREADY-BUILT .mca. The download thread
+    // resolves a region's offset in the source reader and copies its compressed blob
+    // VERBATIM onto the LOCAL archive (v->arc) -- no decode, no re-encode. Everything
+    // else is the normal local-archive path: coverage, THAW decode-from-local, cache,
+    // the LIFO request stack. lv[] / decode pool are unused; one dl thread owns the
+    // (non-reentrant) source reader.
+    int streaming;             // 1 => source is a pre-built .mca, copied verbatim
+    mc_s3 *s3mca;              // remote source reader handle (s3/https), or NULL
+    struct mc_reader *rd;      // source reader: chunk offsets + verbatim blob bytes
+    uint8_t *s_map;            // local-file source: whole .mca mmap'd read-only
+    size_t s_map_len;
+    size_t s_blob_ema;         // EMA of blob sizes -> adaptive round-A GET length
+                               // (dl thread only; fixed over-read either wastes
+                               // bandwidth on small blobs or two-trips big ones)
+    int s_nz[MAXLOD], s_ny[MAXLOD], s_nx[MAXLOD];   // per-LOD voxel dims (n0>>lod)
+
     atomic_uint_fast64_t net_bytes;
 
     pthread_mutex_t mu;        // guards the decode queue + request stack
@@ -5519,10 +6222,15 @@ struct mc_volume {
     pthread_cond_t dq_nf;      // not-full  (wake a blocked producer)
     int stop;
 
-    // Interactive download-request stack (LIFO): a render miss pushes "fetch the
-    // shard around region R". Download threads pop the NEWEST request (current
-    // view) first; when full, the OLDEST (stalest, camera moved on) is dropped.
-    uint64_t *reqstk;          // region keys
+    // Interactive download-request stack (LIFO): a render miss / prefetch pushes
+    // "fetch region R". Download threads pop the NEWEST (current view) first; when
+    // full, the OLDEST (stalest, camera moved on) is dropped. DEDUPING: an open-
+    // addressing membership set (rs_set) gives O(1) push-dedup instead of an O(n)
+    // stack scan -- the prefetch blasts the predicted set every tick, so the stack
+    // absorbs duplicates natively without the caller deduping.
+    uint64_t *reqstk;          // region keys (the LIFO order)
+    uint64_t *rs_set;          // membership set, power-of-two, 0 = empty slot
+    int rs_set_mask;           // rs_set capacity - 1
     int rs_cap, rs_n;
     pthread_t dlthreads[16];
     int ndl;
@@ -5538,6 +6246,17 @@ struct mc_volume {
 
     mc_volume_ready_fn ready_cb;   // fired when a region becomes serveable
     void *ready_ud;
+
+    // Two frozen snapshots, collated once per THAW, read during the frozen render.
+    // Same tick thread writes + reads -> plain fields, no atomic, no lock.
+    //  net_inflight: ACTUAL download/decode pipeline work = queued downloads +
+    //    downloading + decode-queue depth. This is the user-facing "downloading N"
+    //    -- stable, reflects real network/transcode work.
+    //  work_pending: net_inflight + this frame's undrained misses. The render gate
+    //    keys off this ("keep ticking while anything is still settling"). The miss
+    //    term swings 0..thousands per frame, so it must NOT leak into the status bar.
+    uint64_t net_inflight;
+    uint64_t work_pending;
 };
 
 // One unit of decode work: the sub^3 cube of source chunks covering one 256^3
@@ -5715,8 +6434,13 @@ static void *decoder_main(void *ud) {
         pthread_mutex_lock(&v->mu);
         while (v->dq_head == v->dq_tail && !v->stop) pthread_cond_wait(&v->dq_ne, &v->mu);
         if (v->stop && v->dq_head == v->dq_tail) { pthread_mutex_unlock(&v->mu); break; }
-        decode_item it = v->dq[v->dq_head];
-        v->dq_head = (v->dq_head + 1) % v->dq_cap;
+        // LIFO: decode the NEWEST queued region first (pop from the producer's end).
+        // Like the download stack, interactive coords go stale as the user moves --
+        // the freshest region is what's on screen now, so decode it before the
+        // backlog. The ring is used as a deque: producer pushes at dq_tail, we pop
+        // dq_tail-1.
+        v->dq_tail = (v->dq_tail + v->dq_cap - 1) % v->dq_cap;
+        decode_item it = v->dq[v->dq_tail];
         v->dq_bytes -= decode_item_bytes(&it);         // free staging budget
         pthread_cond_signal(&v->dq_nf);                // wake a blocked producer
         pthread_mutex_unlock(&v->mu);
@@ -5789,20 +6513,205 @@ static void inflight_del(mc_volume *v, uint64_t key) {
         }
 }
 
+// Deduping-stack membership set (open addressing, linear probe). key != 0 always
+// (rkey packs lod in the high nibble; region 0,0,0 at lod>0 is fine, and lod0
+// 0,0,0 -> key 0 would alias empty; guard below treats key 0 specially -- but
+// rkey for (0,0,0,0) is 0, which never occurs as a real interactive request).
+static int rs_set_has(mc_volume *v, uint64_t key) {
+    uint32_t i = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 40) & (uint32_t)v->rs_set_mask;
+    for (int p = 0; p <= v->rs_set_mask; ++p) {
+        uint64_t cur = v->rs_set[i];
+        if (cur == 0) return 0;
+        if (cur == key) return 1;
+        i = (i + 1) & (uint32_t)v->rs_set_mask;
+    }
+    return 0;
+}
+static void rs_set_add(mc_volume *v, uint64_t key) {
+    uint32_t i = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 40) & (uint32_t)v->rs_set_mask;
+    for (int p = 0; p <= v->rs_set_mask; ++p) {
+        if (v->rs_set[i] == 0 || v->rs_set[i] == key) { v->rs_set[i] = key; return; }
+        i = (i + 1) & (uint32_t)v->rs_set_mask;
+    }
+}
+// Rebuild the set from the stack (after a removal leaves probe-chain holes).
+static void rs_set_rebuild(mc_volume *v) {
+    memset(v->rs_set, 0, ((size_t)v->rs_set_mask + 1) * sizeof(uint64_t));
+    for (int i = 0; i < v->rs_n; ++i) rs_set_add(v, v->reqstk[i]);
+}
+
 static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
     uint64_t key = rkey(lod, cz, cy, cx);
     pthread_mutex_lock(&v->mu);
     if (inflight_has(v, key)) { pthread_mutex_unlock(&v->mu); return; }  // already fetching/decoding
-    for (int i = 0; i < v->rs_n; ++i)
-        if (v->reqstk[i] == key) { pthread_mutex_unlock(&v->mu); return; }   // already queued
-    if (v->rs_n == v->rs_cap) {                         // full -> drop bottom
+    if (rs_set_has(v, key)) { pthread_mutex_unlock(&v->mu); return; }    // already queued (O(1))
+    if (v->rs_n == v->rs_cap) {                         // full -> drop bottom (stalest)
         memmove(&v->reqstk[0], &v->reqstk[1], (size_t)(v->rs_cap - 1) * sizeof(uint64_t));
         v->rs_n--;
+        rs_set_rebuild(v);                              // membership shifted; rebuild
     }
     v->reqstk[v->rs_n++] = key;                         // push on top
+    rs_set_add(v, key);
     MCVLOG("req_push  lod%d region(%d,%d,%d) stack_depth=%d", lod, cz, cy, cx, v->rs_n);
     pthread_cond_signal(&v->cv);
     pthread_mutex_unlock(&v->mu);
+}
+
+enum { DL_BATCH = 64 };   // per-batch regions; streaming GETs run this deep
+
+// Streaming fetch of ONE 256^3 region via the reader (serial; the local-file
+// source path and the fallback for a header window too small to parse).
+static void mc_stream_fetch_region(mc_volume *v, int lod, int rz, int ry, int rx) {
+    if (mc_archive_chunk_coverage(v->arc, lod, rz, ry, rx) != MC_ABSENT) return;  // already have it
+    uint64_t off = mc_chunk_offset(v->rd, lod, rz, ry, rx);
+    if (off == 0) {                                    // remote air -> local ZERO region
+        mc_archive_append_chunk_raw(v->arc, lod, rz, ry, rx, zero256());
+        return;
+    }
+    uint64_t blen = mc_reader_chunk_blob_len(v->rd, off);
+    if (blen == 0) return;                             // transient: leave ABSENT, retry
+    uint8_t *blob = malloc((size_t)blen);
+    if (!blob) return;
+    if (mc_reader_read_blob(v->rd, off, (size_t)blen, blob) != 0) { free(blob); return; }
+    atomic_fetch_add_explicit(&v->net_bytes, blen, memory_order_relaxed);
+    mc_archive_append_chunk_compressed(v->arc, lod, rz, ry, rx, blob, (size_t)blen);
+    free(blob);
+}
+
+// Blob total length parsed from its LEADING bytes (header + fmap + bitmap + len
+// table must all be inside `buf`). 0 = window too short (caller falls back to the
+// exact serial path). Mirrors mc_reader_chunk_blob_len, but over one buffer.
+static uint64_t mc_blob_len_parse(const uint8_t *buf, size_t len) {
+    if (len < MC_BLOB_HDR) return 0;
+    uint16_t fml; memcpy(&fml, buf + MC_BLOB_HDR - 2, 2);
+    uint64_t bm_off = (uint64_t)MC_BLOB_HDR + fml;
+    if (len < bm_off + MC_BITMAP_BYTES) return 0;
+    int np = 0;
+    for (int i = 0; i < MC_BITMAP_BYTES; ++i) np += __builtin_popcount(buf[bm_off + i]);
+    if (!np) return bm_off + MC_BITMAP_BYTES;
+    if (len < bm_off + MC_BITMAP_BYTES + (size_t)np * 2) return 0;
+    uint64_t pay = 0;
+    for (int i = 0; i < np; ++i) {
+        uint16_t l; memcpy(&l, buf + bm_off + MC_BITMAP_BYTES + (size_t)i * 2, 2);
+        pay += l;
+    }
+    return bm_off + MC_BITMAP_BYTES + (uint64_t)np * 2 + pay;
+}
+
+// Streaming fetch of a BATCH of regions -- the throughput path. The serial
+// per-chunk flow (resolve, header probe, length probe, blob read) is 3-4 S3
+// round-trips each; one thread doing that tops out ~2MB/s. Instead: resolve all
+// offsets via the reader (node tables memoized, cheap), then TWO rounds of
+// s3_get_batch (32-way concurrent ranged GETs, like the zarr path): round A pulls
+// each blob's leading bytes -- sized at ~2x the running average blob size, so most
+// blobs complete in this single GET (exact length parsed from the leading bytes)
+// without over-reading small ones; round B pulls the occasional tail.
+#define MC_STREAM_HDR_MIN (64u << 10)
+#define MC_STREAM_HDR_MAX (2u << 20)
+static void mc_stream_fetch_batch(mc_volume *v, int m, const int *lods,
+                                  const int *rz, const int *ry, const int *rx) {
+    uint64_t off[DL_BATCH];
+    int act[DL_BATCH], na = 0;                 // regions that still need bytes
+    for (int i = 0; i < m; ++i) {
+        if (mc_archive_chunk_coverage(v->arc, lods[i], rz[i], ry[i], rx[i]) != MC_ABSENT)
+            continue;                                          // already resident
+        uint64_t o = mc_chunk_offset(v->rd, lods[i], rz[i], ry[i], rx[i]);
+        if (o == 0) {                                          // air -> ZERO region
+            mc_archive_append_chunk_raw(v->arc, lods[i], rz[i], ry[i], rx[i], zero256());
+            continue;
+        }
+        off[i] = o; act[na++] = i;
+    }
+    if (!na) return;
+
+    if (v->local || !v->s3mca) {               // local-file source: disk is fast, go serial
+        for (int k = 0; k < na; ++k)
+            mc_stream_fetch_region(v, lods[act[k]], rz[act[k]], ry[act[k]], rx[act[k]]);
+        return;
+    }
+
+    // Chunks are appended contiguously in the source archive, and the requested
+    // regions are spatially coherent (a viewport) -- so their blobs cluster.
+    // Sort by offset and COALESCE into a few LARGE sequential ranges (read through
+    // small gaps), then carve each blob out of the run buffer. A handful of
+    // multi-MB GETs reaches S3 large-object throughput where per-chunk ~200KB
+    // GETs stall in TCP slow-start. Interior blob lengths are exact (next_off -
+    // off bounds it; the parse is authoritative); each run's last blob gets an
+    // EMA-sized margin, with a (rare) follow-up GET if the parse says longer.
+    if (!v->s_blob_ema) v->s_blob_ema = 256u << 10;          // first batch: 256KB guess
+    uint64_t margin = v->s_blob_ema * 2;
+    if (margin < MC_STREAM_HDR_MIN) margin = MC_STREAM_HDR_MIN;
+    if (margin > MC_STREAM_HDR_MAX) margin = MC_STREAM_HDR_MAX;
+
+    // sort act[] by offset (insertion sort; na <= DL_BATCH).
+    for (int a = 1; a < na; ++a) {
+        int t = act[a]; int b = a - 1;
+        while (b >= 0 && off[act[b]] > off[t]) { act[b + 1] = act[b]; --b; }
+        act[b + 1] = t;
+    }
+
+    enum { RUN_GAP = 512 << 10, RUN_MAX = 64 << 20 };  // read-through gap / run size cap:
+    // merge only near-adjacent blobs (raster archives put y/z neighbors MBs apart;
+    // reading through those gaps wasted ~3x the useful bytes)
+    s3_range_req runq[DL_BATCH]; s3_response runr[DL_BATCH];
+    int rs[DL_BATCH], re[DL_BATCH], nrun = 0;          // act[] index span of each run
+    for (int k = 0; k < na;) {
+        int s = k, e = k;
+        uint64_t end = off[act[k]] + margin;
+        while (e + 1 < na &&
+               off[act[e + 1]] <= end + RUN_GAP &&
+               off[act[e + 1]] + margin - off[act[s]] <= RUN_MAX) {
+            ++e;
+            end = off[act[e]] + margin;
+        }
+        runq[nrun] = (s3_range_req){v->s3mca->url, off[act[s]], end - off[act[s]]};
+        rs[nrun] = s; re[nrun] = e; ++nrun;
+        k = e + 1;
+    }
+
+    memset(runr, 0, sizeof(s3_response) * (size_t)nrun);
+    s3_get_batch(v->s3mca->cl, runq, (size_t)nrun, 16, runr);
+
+    for (int r = 0; r < nrun; ++r) {
+        if (!s3_response_ok(&runr[r]) || !runr[r].body_len) {  // transient: retry later
+            s3_response_free(&runr[r]);
+            continue;
+        }
+        atomic_fetch_add_explicit(&v->net_bytes, runr[r].body_len, memory_order_relaxed);
+        for (int k = rs[r]; k <= re[r]; ++k) {
+            int i = act[k];
+            uint64_t rel = off[i] - runq[r].offset;
+            if (rel >= runr[r].body_len) continue;             // run came back short
+            size_t avail = runr[r].body_len - (size_t)rel;
+            uint64_t bl = mc_blob_len_parse(runr[r].body + rel, avail);
+            if (!bl) {                                         // window short of the header
+                mc_stream_fetch_region(v, lods[i], rz[i], ry[i], rx[i]);
+                continue;
+            }
+            v->s_blob_ema = (v->s_blob_ema * 7 + (size_t)bl) / 8;   // dl thread only
+            if (bl <= avail) {                                 // whole blob in the run
+                mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
+                                                   runr[r].body + rel, (size_t)bl);
+            } else {                                           // run-edge tail: one follow-up GET
+                s3_response tail = {0};
+                if (s3_get_range(v->s3mca->cl, v->s3mca->url, off[i] + avail, bl - avail,
+                                 &tail) == S3_OK &&
+                    s3_response_ok(&tail) && tail.body_len >= bl - avail) {
+                    atomic_fetch_add_explicit(&v->net_bytes, tail.body_len, memory_order_relaxed);
+                    uint8_t *blob = malloc((size_t)bl);
+                    if (blob) {
+                        memcpy(blob, runr[r].body + rel, avail);
+                        memcpy(blob + avail, tail.body, (size_t)(bl - avail));
+                        mc_archive_append_chunk_compressed(v->arc, lods[i], rz[i], ry[i], rx[i],
+                                                           blob, (size_t)bl);
+                        free(blob);
+                    }
+                }
+                s3_response_free(&tail);
+            }
+        }
+        s3_response_free(&runr[r]);
+    }
 }
 
 // Download thread: pop the newest request, download its shard (-> decode queue).
@@ -5810,8 +6719,8 @@ static void req_push(mc_volume *v, int lod, int cz, int cy, int cx) {
 // fetch their source chunks in ONE s3_get_batch — per-region precision (no
 // whole-shard pull) AND high concurrency (32 GETs over the pooled connections),
 // which is what saturates the link. c3d (sub=1) = one chunk per region; v2
-// regions fall back to the per-chunk cube path.
-enum { DL_BATCH = 32 };
+// regions fall back to the per-chunk cube path. STREAMING: one thread drives
+// batched concurrent GETs (mc_stream_fetch_batch) -- verbatim copy, no decode pool.
 static void *dl_main(void *ud) {
     mc_volume *v = ud;
     mc_thread_setname("mc-download");      // distinguish in profilers
@@ -5821,14 +6730,28 @@ static void *dl_main(void *ud) {
         pthread_mutex_lock(&v->mu);
         while (v->rs_n == 0 && !v->stop) pthread_cond_wait(&v->cv, &v->mu);
         if (v->stop && v->rs_n == 0) { pthread_mutex_unlock(&v->mu); return NULL; }
+        int popped = 0;
         while (m < DL_BATCH && v->rs_n > 0) {           // grab a batch, newest first
             uint64_t key = v->reqstk[--v->rs_n];
+            popped = 1;
             if (inflight_has(v, key)) continue;          // another dl thread already has it
             inflight_add(v, key);                        // single-flight: claim it
             runpack(key, &lods[m], &rz[m], &ry[m], &rx[m]);
             ++m;
         }
+        if (popped) rs_set_rebuild(v);                  // popped keys leave the set
         pthread_mutex_unlock(&v->mu);
+
+        if (v->streaming) {
+            // Verbatim .mca -> .mca copy, batched (two rounds of 32-way GETs).
+            mc_stream_fetch_batch(v, m, lods, rz, ry, rx);
+            pthread_mutex_lock(&v->mu);
+            for (int i = 0; i < m; ++i)
+                inflight_del(v, rkey(lods[i], rz[i], ry[i], rx[i]));
+            pthread_mutex_unlock(&v->mu);
+            if (m && v->ready_cb) v->ready_cb(v->ready_ud);
+            continue;
+        }
 
         // Locate each region's c3d source chunk via the cached footer; build one
         // batched ranged-GET. v2 (sub>1) and local both use the per-region path.
@@ -5896,9 +6819,13 @@ static void *dl_main(void *ud) {
 static mc_cover ensure_region(mc_volume *v, int lod, int cz, int cy, int cx) {
     mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
     if (cov != MC_ABSENT) return cov;
-    const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
-    mc_volume_prefetch_region(v, lod, cz * sub, cy * sub, cx * sub);  // just this region
-    // wait for the decoders to drain enough that this region is covered.
+    if (v->streaming) {
+        req_push(v, lod, cz, cy, cx);          // dl thread copies the blob verbatim
+    } else {
+        const int sub = CHUNK / mc_zarr_inner_edge(v->lv[lod].z);
+        mc_volume_prefetch_region(v, lod, cz * sub, cy * sub, cx * sub);  // just this region
+    }
+    // wait for the downloaders/decoders to drain enough that this region is covered.
     for (int spin = 0; spin < 100000; ++spin) {
         cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
         if (cov != MC_ABSENT) return cov;
@@ -6019,6 +6946,10 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     v->rs_cap = (cfg && cfg->request_stack > 0) ? cfg->request_stack : 65536;
     if (v->rs_cap < 256) v->rs_cap = 256; if (v->rs_cap > (1<<22)) v->rs_cap = (1<<22);
     v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
+    // Membership set: next pow2 >= 2*rs_cap (load factor <= 0.5 -> short probes).
+    int sc = 1; while (sc < v->rs_cap * 2) sc <<= 1;
+    v->rs_set_mask = sc - 1;
+    v->rs_set = calloc((size_t)sc, sizeof *v->rs_set);
 
     // Decoders default to nproc/2: the c3d/wavelet decode is memory-bandwidth-
     // bound (a 256^3 decode streams ~16MB), so threads past ~half the cores
@@ -6042,8 +6973,154 @@ mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
     return v;
 }
 
+// mmap a local .mca read-only: the flat reader (mc_open) then treats it as one
+// big array -- chunk resolves and blob reads are plain pointer reads, the kernel
+// pages in on demand (nothing is slurped into RAM).
+static uint8_t *mc_map_file_ro(const char *path, size_t *out_len) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { close(fd); return NULL; }
+    uint8_t *base = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);                                   // the mapping keeps the file alive
+    if (base == MAP_FAILED) return NULL;
+    *out_len = (size_t)st.st_size;
+    return base;
+}
+
+// Probe a built .mca's header WITHOUT opening a volume (no local archive, no
+// threads): LOD0 dims, lod count, quality. url = s3://, https://, or a local
+// path. Returns 0 on success.
+int mc_mca_probe(const char *url, int *nx, int *ny, int *nz, int *nlods, float *quality) {
+    if (!url) return -1;
+    mc_s3 *s = NULL; mc_reader *r = NULL;
+    uint8_t *map = NULL; size_t maplen = 0;
+    if (strstr(url, "://")) {
+        s = mc_s3_open(url);
+        if (!s) return -1;
+        r = mc_s3_reader(s);
+    } else {
+        map = mc_map_file_ro(url, &maplen);
+        if (!map) return -1;
+        r = mc_open(map, maplen);
+        if (!r) { munmap(map, maplen); return -1; }
+    }
+    mc_reader_dims(r, nx, ny, nz);
+    if (nlods) *nlods = mc_reader_nlods(r);
+    if (quality) *quality = mc_reader_quality(r);
+    if (s) mc_s3_close(s); else { mc_close(r); munmap(map, maplen); }
+    return 0;
+}
+
+// Open an already-built remote (or local-file) .mca and stream it into a LOCAL
+// .mca on demand. Same machinery as the zarr transcode path -- local archive,
+// download threads, decode-from-local THAW -- but the download step COPIES the
+// remote chunk's compressed blob verbatim onto the local archive (no decode, no
+// re-encode): a 256^3 .mca chunk is already in the exact local format. We never
+// mirror the whole remote; only the chunks the view touches get pulled+appended.
+//   url        : the remote (s3://.../https://...) or local-file source .mca
+//   cache_dir  : holds the local <name>.mca that fetched chunks append into
+//   cache_bytes: resident RAM decoded-block budget
+// Returns NULL on failure.
+mc_volume *mc_volume_open_streaming(const char *url, const char *cache_dir,
+                                    size_t cache_bytes) {
+    if (!url || !cache_dir) return NULL;
+    mc_volume *v = calloc(1, sizeof *v);
+    if (!v) return NULL;
+    v->streaming = 1;
+    atomic_init(&v->net_bytes, 0);
+    pthread_mutex_init(&v->mu, NULL);
+    pthread_cond_init(&v->cv, NULL);
+    snprintf(v->root, sizeof v->root, "%s", url);
+    rstrip_slash(v->root);
+
+    // Open the SOURCE reader (remote ranged GETs, or a local file mmap'd read-only
+    // and read like one big array) for chunk-offset resolves + verbatim blob reads.
+    v->local = (strstr(url, "://") == NULL);
+    if (v->local) {
+        v->s_map = mc_map_file_ro(v->root, &v->s_map_len);
+        if (!v->s_map) { free(v); return NULL; }
+        v->rd = mc_open(v->s_map, v->s_map_len);
+        if (!v->rd) { munmap(v->s_map, v->s_map_len); free(v); return NULL; }
+    } else {
+        v->s3mca = mc_s3_open(url);
+        if (!v->s3mca) { free(v); return NULL; }
+        v->rd = mc_s3_reader(v->s3mca);
+    }
+
+    int n0x, n0y, n0z;
+    mc_reader_dims(v->rd, &n0x, &n0y, &n0z);
+    v->nlods = mc_reader_nlods(v->rd);
+    if (v->nlods > MAXLOD) v->nlods = MAXLOD;
+    if (v->nlods <= 0) {
+        if (v->s3mca) mc_s3_close(v->s3mca); else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
+        free(v); return NULL;
+    }
+    v->quality = mc_reader_quality(v->rd);
+    for (int l = 0; l < v->nlods; ++l) {
+        v->s_nz[l] = n0z >> l < 1 ? 1 : n0z >> l;
+        v->s_ny[l] = n0y >> l < 1 ? 1 : n0y >> l;
+        v->s_nx[l] = n0x >> l < 1 ? 1 : n0x >> l;
+    }
+
+    // Local archive: fetched chunks append here verbatim. Same dims/quality as the
+    // source so chunk coords + blob format line up exactly.
+    char path[2048];
+    const char *base = strrchr(v->root, '/');
+    base = base ? base + 1 : v->root;
+    snprintf(path, sizeof path, "%s/%s.local.mca", cache_dir, base);
+    v->arc = mc_archive_open_dims(path, n0x, n0y, n0z, v->quality);
+    if (!v->arc) {
+        if (v->s3mca) mc_s3_close(v->s3mca); else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
+        free(v); return NULL;
+    }
+    v->cache = mc_cache_new_archive(cache_bytes, v->arc);
+    if (!v->cache) {
+        mc_archive_close(v->arc);
+        if (v->s3mca) mc_s3_close(v->s3mca); else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
+        free(v); return NULL;
+    }
+
+    // Download threads only (no decode pool -- streaming appends compressed blobs
+    // verbatim, there's nothing to decode off-thread). Reuse the LIFO request stack.
+    v->rs_cap = 65536;
+    v->reqstk = calloc((size_t)v->rs_cap, sizeof *v->reqstk);
+    int sc = 1; while (sc < v->rs_cap * 2) sc <<= 1;
+    v->rs_set_mask = sc - 1;
+    v->rs_set = calloc((size_t)sc, sizeof *v->rs_set);
+    // ONE download thread: the source reader (cbuf + node-table cache + codec ctx)
+    // is non-reentrant, so a single owner avoids any sharing. Chunks are large and
+    // partial-fetch is efficient; this runs off the UI thread, which is the point.
+    v->ndl = 1;
+    for (int i = 0; i < v->ndl; ++i)
+        pthread_create(&v->dlthreads[i], NULL, dl_main, v);
+    MCVLOG("open(stream) %s -> %s  nlods=%d dims=%dx%dx%d q=%.1f dl=%d",
+           url, path, v->nlods, n0x, n0y, n0z, v->quality, v->ndl);
+    return v;
+}
+
 void mc_volume_free(mc_volume *v) {
     if (!v) return;
+    if (v->streaming) {
+        // Stop the download threads, then tear down cache + local archive + source
+        // reader. No decode pool / zarr levels exist in streaming.
+        pthread_mutex_lock(&v->mu);
+        v->stop = 1;
+        pthread_cond_broadcast(&v->cv);
+        pthread_mutex_unlock(&v->mu);
+        for (int i = 0; i < v->ndl; ++i) pthread_join(v->dlthreads[i], NULL);
+        if (v->cache) mc_cache_free(v->cache);
+        if (v->arc) mc_archive_close(v->arc);
+        if (v->s3mca) mc_s3_close(v->s3mca);   // owns the remote reader
+        else { mc_close(v->rd); if (v->s_map) munmap(v->s_map, v->s_map_len); }
+        free(v->reqstk);
+        free(v->rs_set);
+        free(v->inflight);
+        pthread_mutex_destroy(&v->mu);
+        pthread_cond_destroy(&v->cv);
+        free(v);
+        return;
+    }
     // stop download + decode threads.
     pthread_mutex_lock(&v->mu);
     v->stop = 1;
@@ -6067,6 +7144,7 @@ void mc_volume_free(mc_volume *v) {
     if (v->s3) s3_client_free(v->s3);
     free(v->dq);
     free(v->reqstk);
+    free(v->rs_set);
     free(v->inflight);
     pthread_mutex_destroy(&v->mu);
     pthread_cond_destroy(&v->cv);
@@ -6075,17 +7153,28 @@ void mc_volume_free(mc_volume *v) {
 
 int  mc_volume_nlods(const mc_volume *v) { return v ? v->nlods : 0; }
 void mc_volume_shape(const mc_volume *v, int lod, int *nz, int *ny, int *nx) {
+    if (v->streaming) {
+        if (lod < 0 || lod >= v->nlods) { if(nz)*nz=0; if(ny)*ny=0; if(nx)*nx=0; return; }
+        if (nz) *nz = v->s_nz[lod]; if (ny) *ny = v->s_ny[lod]; if (nx) *nx = v->s_nx[lod];
+        return;
+    }
     mc_zarr_shape(v->lv[lod].z, nz, ny, nx);
 }
 void mc_volume_block_grid(const mc_volume *v, int lod, int *nz, int *ny, int *nx) {
     int sz, sy, sx;
-    mc_zarr_shape(v->lv[lod].z, &sz, &sy, &sx);
+    mc_volume_shape(v, lod, &sz, &sy, &sx);
     if (nz) *nz = (sz + BLK - 1) / BLK;
     if (ny) *ny = (sy + BLK - 1) / BLK;
     if (nx) *nx = (sx + BLK - 1) / BLK;
 }
 int mc_volume_get_level_meta(const mc_volume *v, int lod, mc_volume_level_meta *out) {
     if (!v || !out || lod < 0 || lod >= v->nlods) return -1;
+    if (v->streaming) {
+        mc_volume_shape(v, lod, &out->shape[0], &out->shape[1], &out->shape[2]);
+        out->inner_edge = CHUNK; out->shard_edge = CHUNK;
+        snprintf(out->codec, sizeof out->codec, "mc");
+        return 0;
+    }
     const mc_zarr *z = v->lv[lod].z;
     mc_zarr_shape(z, &out->shape[0], &out->shape[1], &out->shape[2]);
     out->inner_edge = mc_zarr_inner_edge(z);
@@ -6098,12 +7187,25 @@ int mc_volume_get_level_meta(const mc_volume *v, int lod, mc_volume_level_meta *
 // ---------------------------------------------------------------------------
 // block serving
 // ---------------------------------------------------------------------------
+// Both paths (zarr transcode AND remote-.mca streaming) serve from the LOCAL
+// archive, so coverage is just the local archive's: ABSENT -> the download stack
+// pulls the chunk (re-encode for zarr / verbatim copy for streaming).
+static inline mc_cover vol_coverage(mc_volume *v, int lod, int cz, int cy, int cx) {
+    return mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+}
+
 int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst) {
     if (lod < 0 || lod >= v->nlods) { memset(dst, 0, BLK * BLK * BLK); return 0; }
     int cz = bz / PER, cy = by / PER, cx = bx / PER;
-    mc_cover cov = mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx);
+    mc_cover cov = vol_coverage(v, lod, cz, cy, cx);
     if (cov == MC_ABSENT) {
-        req_push(v, lod, cz, cy, cx);   // LIFO download request; render falls to coarser LOD
+        // Record the absent miss at REGION granularity (the region's corner block),
+        // NOT per 16^3 block. A thin slice touches thousands of blocks across an
+        // absent region but they all dedupe to one region key -- so the per-frame
+        // miss set is ~tens (one per absent region) instead of ~thousands. THAW
+        // drains these region keys and issues one download each. (Per-block absent
+        // recording flooded the 64K miss table every frame -> the ~2ms thaw floor.)
+        mc_cache_miss_mark(v->cache, lod, cz * PER, cy * PER, cx * PER);
         memset(dst, 0, BLK * BLK * BLK);
         return 0;
     }
@@ -6112,10 +7214,47 @@ int mc_volume_try_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *
     return 1;
 }
 
+// Shared 16^3 zero block (air). One static, read-only -- samplers point at it
+// instead of each copying zeros into a per-entry buffer.
+static const uint8_t *mc_zero16(void) {
+    static uint8_t z[BLK * BLK * BLK];   // zero-initialized (BSS)
+    return z;
+}
+
+// Pointer-returning block accessor (NO copy). Returns a STABLE pointer valid for
+// the duration of a frozen frame: into the cache arena (RAM hit), the shared zero
+// block (air), or NULL (absent or present-but-not-cached -> caller falls coarser).
+// This replaces the copy-into-tmp path so the sampler memo can hold pointers, not
+// 4KB buffers -- killing the per-frame 8MB sampler alloc + a per-block memcpy.
+const uint8_t *mc_volume_block_ptr(mc_volume *v, int lod, int bz, int by, int bx) {
+    if (lod < 0 || lod >= v->nlods) return NULL;
+    int cz = bz / PER, cy = by / PER, cx = bx / PER;
+    mc_cover cov = vol_coverage(v, lod, cz, cy, cx);
+    if (cov == MC_ZERO) return mc_zero16();
+    if (cov == MC_ABSENT) {       // build path only; streaming never returns ABSENT
+        mc_cache_miss_mark(v->cache, lod, cz * PER, cy * PER, cx * PER);
+        return NULL;
+    }
+    // present: arena pointer on a RAM hit; NULL (+ recorded miss) otherwise.
+    return mc_cache_get(v->cache, lod, bz, by, bx);
+}
+
+// Predictive prefetch: request the 256^3 REGION (cz,cy,cx) be downloaded +
+// transcoded if it isn't already resident/in-flight. Cheap and non-blocking: a
+// coverage probe (O(1) memo) + a push onto the LIFO download stack (deduped vs
+// in-flight/queued). No decode, no scratch. Present/air -> no-op. Called from the
+// tick BEFORE freeze, from the geometry-predicted working set, so regions stream
+// in ahead of the render instead of being discovered as misses a cycle late.
+void mc_volume_request_region(mc_volume *v, int lod, int cz, int cy, int cx) {
+    if (!v || lod < 0 || lod >= v->nlods) return;
+    if (mc_archive_chunk_coverage(v->arc, lod, cz, cy, cx) != MC_ABSENT) return;
+    req_push(v, lod, cz, cy, cx);   // download thread fetches+appends (zarr or stream)
+}
+
 int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *dst) {
     if (lod < 0 || lod >= v->nlods) { memset(dst, 0, BLK * BLK * BLK); return -1; }
     int cz = bz / PER, cy = by / PER, cx = bx / PER;
-    mc_cover cov = ensure_region(v, lod, cz, cy, cx);
+    mc_cover cov = ensure_region(v, lod, cz, cy, cx);   // pulls the region if ABSENT
     if (cov == MC_ZERO || cov == MC_ABSENT) { memset(dst, 0, BLK * BLK * BLK); return cov == MC_ZERO ? 0 : -1; }
     mc_cache_get_copy(v->cache, lod, bz, by, bx, dst);
     return 1;
@@ -6127,14 +7266,40 @@ int mc_volume_get_block(mc_volume *v, int lod, int bz, int by, int bx, uint8_t *
 static const uint8_t *vol_block(const mc_sample_src *src,
                                 int bz, int by, int bx, uint8_t *tmp) {
     mc_volume *v = src->ud;
-    int r = src->aux2 ? mc_volume_get_block(v, src->aux, bz, by, bx, tmp)
-                      : mc_volume_try_block(v, src->aux, bz, by, bx, tmp);
-    return r == 1 ? tmp : NULL;
+    if (src->aux2) {   // blocking (CLI): keep the copy-into-tmp path
+        int r = mc_volume_get_block(v, src->aux, bz, by, bx, tmp);
+        return r == 1 ? tmp : NULL;
+    }
+    // interactive: return a STABLE arena/zero pointer (no copy). tmp unused.
+    (void)tmp;
+    return mc_volume_block_ptr(v, src->aux, bz, by, bx);
+}
+
+// CHEAP residency for the LOD fallback: sample-able NOW without a decode? Yes iff
+// the region is air (ZERO -> samples 0 trivially) or the 16^3 block is already in
+// the RAM cache. A PRESENT-but-not-cached block returns 0 here so the fallback
+// samples a coarser resident level instead of decoding the fine block on the
+// render thread (also records the miss so THAW fills it -> next frame sharpens).
+static int vol_block_resident(const mc_sample_src *src, int bz, int by, int bx) {
+    mc_volume *v = src->ud;
+    int lod = src->aux;
+    int cz = bz / PER, cy = by / PER, cx = bx / PER;
+    mc_cover cov = vol_coverage(v, lod, cz, cy, cx);
+    if (cov == MC_ZERO) return 1;                        // air: trivially sample-able
+    if (cov != MC_PRESENT) {                             // absent: record + fall coarser
+        mc_cache_miss_mark(v->cache, lod, cz * PER, cy * PER, cx * PER);
+        return 0;
+    }
+    if (mc_cache_contains(v->cache, lod, bz, by, bx)) return 1;   // RAM hit
+    mc_cache_miss_mark(v->cache, lod, bz, by, bx);       // present but uncached -> fill
+    return 0;                                            // fall coarser this frame
 }
 
 mc_sample_src mc_volume_sample_src(mc_volume *v, int lod, int blocking) {
     mc_sample_src s = {0};
     s.ud = v; s.aux = lod; s.aux2 = blocking; s.block = vol_block;
+    s.resident = vol_block_resident;
+    s.owns_ptr = !blocking;   // interactive vol_block returns stable arena pointers
     mc_volume_shape(v, lod, &s.nz, &s.ny, &s.nx);
     return s;
 }
@@ -6218,6 +7383,7 @@ static void mc_volume_prefetch_region(mc_volume *v, int lod, int cz, int cy, int
 // mc_volume_prefetch_region (one region) so navigation never pulls a whole shard.
 void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx) {
     if (lod < 0 || lod >= v->nlods) return;
+    if (v->streaming) return;   // no shard/zarr layer; THAW read-through fills on miss
     level_t *lv = &v->lv[lod];
     mc_zarr *z = lv->z;
     const int edge = mc_zarr_inner_edge(z);            // 256 (c3d) or 128 (v2)
@@ -6351,6 +7517,89 @@ size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes) {
     return (v && v->cache) ? mc_cache_resize(v->cache, bytes) : 0;
 }
 
+// Tick-phase bracket for the render game-loop (see mc_cache_freeze/thaw). The
+// volume owns the resident mc_cache; expose its two-phase clock so a client
+// (volume-cartographer's global render tick) can freeze the cache for the
+// duration of a frame's lock-free reads, then thaw between frames to let newly
+// transcoded regions land and to bump the pin epoch.
+void mc_volume_freeze(mc_volume *v) { if (v && v->cache) mc_cache_freeze(v->cache); }
+
+// Thaw = the single batch-apply step of the render game loop. Between a frame's
+// freeze and the next, the lock-free frozen reads recorded their misses (blocks
+// the render wanted but weren't resident). Here, while UNFROZEN, we:
+//   1. thaw the cache (clears frozen, epoch++) so the fill is permitted,
+//   2. drain the recorded miss set,
+//   3. keep only blocks whose 256^3 source region is MC_PRESENT in the archive
+//      (ABSENT = still downloading -> skip; ZERO = air -> already served),
+//   4. fill those from the archive (decode from disk), TIME-BOUNDED so a big
+//      miss set (a zoom across a LOD that misses the whole viewport) can't stall
+//      the render tick more than ~MC_THAW_BUDGET_MS. Leftover blocks re-record
+//      next frame and fill progressively; meanwhile the render shows coarser
+//      resident LODs (mc_lod_sample fallback).
+// INTERMEDIATE: the fill is synchronous on the caller's thread, but bounded.
+// The end-goal game loop runs this fill async on workers (lock-safe vs frozen
+// reads, deferred eviction); that lands incrementally. This stays race-free
+// because mutation happens only here, while unfrozen, before freeze()+render.
+// No network IO happens here; the decode workers staged the bytes to the archive.
+#define MC_THAW_BUDGET_MS 5.0
+#define MC_THAW_CHUNK 256          // blocks per mc_cache_update slice (time-checked)
+void mc_volume_thaw(mc_volume *v) {
+    if (!v || !v->cache) return;
+    mc_cache_thaw(v->cache);                                  // clears frozen, epoch++
+
+    static _Thread_local mc_block_id *miss = NULL;
+    static _Thread_local size_t miss_cap = 0;
+    if (!miss) { miss_cap = MISSQ_CAP; miss = malloc(miss_cap * sizeof *miss); }
+    if (!miss) return;
+
+    size_t n = mc_cache_misses_drain(v->cache, miss, miss_cap);
+
+    // Collate (thaw = the collator), BEFORE any early-out. net_inflight is the
+    // real pipeline depth (status bar); work_pending adds this frame's undrained
+    // misses so the render gate keeps ticking until everything's resident.
+    int dqn = v->dq_cap ? (v->dq_tail - v->dq_head + v->dq_cap) % v->dq_cap : 0;   // 0 in streaming
+    v->net_inflight = (uint64_t)(v->rs_n + v->inflight_n + dqn);
+    v->work_pending = v->net_inflight + (uint64_t)n;
+
+    if (!n) return;
+
+    // Split the drained misses by local-archive coverage:
+    //  PRESENT -> keep for the cache fill below (decode from local disk -- fast).
+    //  ABSENT  -> issue ONE download request per region (zarr re-encode OR remote-
+    //             .mca verbatim copy, on the download thread -- never here).
+    // The miss set is per-block; many blocks map to one 256^3 region, so collapse
+    // consecutive same-region absent blocks (misses drain roughly in scan order).
+    size_t keep = 0;
+    uint64_t last_rq = ~0ull;
+    for (size_t i = 0; i < n; ++i) {
+        const mc_block_id *b = &miss[i];
+        int cz = b->bz / PER, cy = b->by / PER, cx = b->bx / PER;
+        mc_cover cov = mc_archive_chunk_coverage(v->arc, b->lod, cz, cy, cx);
+        if (cov == MC_PRESENT) { miss[keep++] = *b; }
+        else if (cov == MC_ABSENT) {
+            uint64_t rq = rkey(b->lod, cz, cy, cx);
+            if (rq != last_rq) { req_push(v, b->lod, cz, cy, cx); last_rq = rq; }
+        }
+    }
+    // Fill the PRESENT set in ONE mc_cache_update call: it spawns its worker
+    // threads exactly once (the old per-256-slice loop respawned 16 threads per
+    // slice -- ~2-3ms of pure pthread_create/join overhead per tick, dwarfing the
+    // ~0.01ms/block decode). Small fills run single-threaded (threading <~512
+    // blocks costs more in spawn than it saves). No time-slicing: the fill is the
+    // frame's working set, decode is cheap, and the thread overhead was the cost.
+    double t0 = mcv_now();
+    size_t filled = 0;
+    // Single-threaded fill. The working set per tick is now small (~hundreds of
+    // blocks after region-granular absent dedup) and decode is ~0.02ms/block, so a
+    // fill is a few ms. mc_cache_update's 16-thread spawn+join (~ms of pthread
+    // overhead per call) is NOT worth it at this size -- it made fills slower.
+    // (A persistent fill pool would beat both; that's the next step.)
+    if (keep) filled = mc_cache_update(v->cache, miss, keep, 1);
+    double el = mcv_now() - t0;
+    if (el > 2.0) MCVLOG("thaw fill  drained=%zu present=%zu decoded=%zu in %.1fms (%.3fms/blk)",
+                         n, keep, filled, el, filled ? el/filled : 0.0);
+}
+
 size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes) {
     if (!v) return 0;
     if (bytes < (64ull << 20)) bytes = 64ull << 20;    // floor 64MB
@@ -6375,6 +7624,12 @@ void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out) {
     out->cache_used_blocks = cs.used;
     out->cache_cap_blocks = cs.slots;
     out->disk_bytes = v->arc ? mc_archive_data_len(v->arc) : 0;
-    out->net_bytes = atomic_load_explicit(&v->net_bytes, memory_order_relaxed);
-    out->regions_inflight = (uint64_t)v->rs_n;
+    // Streaming pulls bytes two ways: reader callbacks (node tables / serial-path
+    // blobs) counted by mc_s3, plus the batched GETs counted in v->net_bytes.
+    out->net_bytes = atomic_load_explicit(&v->net_bytes, memory_order_relaxed)
+                   + (v->s3mca ? mc_s3_net_bytes(v->s3mca) : 0);
+    // Frozen snapshots collated at the last thaw. regions_inflight = real pipeline
+    // depth (status bar); work_pending = + undrained misses (render gate).
+    out->regions_inflight = v->net_inflight;
+    out->work_pending = v->work_pending;
 }

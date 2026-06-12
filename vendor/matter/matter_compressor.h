@@ -227,6 +227,14 @@ mc_cover mc_archive_chunk_coverage(mc_archive *a, int lod, int cz,int cy,int cx)
 // archive is being filled.
 uint64_t mc_archive_data_len(mc_archive *a);
 
+// User metadata: every archive reserves a region between the 256B header and the
+// 128KB data start. Set overwrites the whole region's contents (call any time on a
+// live handle; the write is crash-safe like any append — length published last).
+// Returns -1 if `len` exceeds the region capacity (nothing written). Read back via
+// mc_archive_metadata() on a handle, or mc_metadata() on flat archive bytes.
+int mc_archive_set_metadata(mc_archive *a, const void *data, size_t len);
+const char *mc_archive_metadata(mc_archive *a, size_t *out_len);
+
 // Resolve a chunk to its blob offset (0 = absent). Pass to mc_archive_decode_block to
 // decode its 16^3 blocks (resolve once per chunk, decode 4096 blocks).
 uint64_t mc_archive_chunk_offset(mc_archive *a, int lod, int cz,int cy,int cx);
@@ -317,6 +325,12 @@ void mc_reader_set_partial_fetch(mc_reader *r, int on);
 // 0 on error. Pair with mc_chunk_offset to range-copy compressed chunks verbatim
 // into another archive via mc_archive_append_chunk_compressed.
 uint64_t mc_reader_chunk_blob_len(mc_reader *r, uint64_t chunk_off);
+
+// Copy `len` bytes of the chunk blob at `chunk_off` into `dst` (flat or streaming
+// reader). The .mca -> .mca verbatim path: mc_chunk_offset -> mc_reader_chunk_blob_len
+// -> this -> mc_archive_append_chunk_compressed. NOT thread-safe on a streaming
+// reader (single decode scratch) -- the caller serializes. Returns 0 on success.
+int mc_reader_read_blob(mc_reader *r, uint64_t chunk_off, size_t len, uint8_t *dst);
 
 // Raw per-volume prior arrays (plo/phi as u16[8][32]); returns 0 if the archive
 // stores none. Feed into mc_archive_set_priors so a local mirror decodes identically.
@@ -468,8 +482,11 @@ void mc_cache_thaw(mc_cache *c);
 size_t mc_cache_resolve(mc_cache *c, const mc_block_id *ids, size_t n,
                         const mc_u8 **ptrs, int nthreads);
 
+// Record a block into the dedup miss set from outside the frozen read path.
+void mc_cache_miss_mark(mc_cache *c, int lod, int bz, int by, int bx);
+
 // Drain the frozen-phase miss queue (call after thaw; feed into the next
-// update/resolve batch). Duplicates possible — update() handles them.
+// update/resolve batch). The set is deduped; each unique block appears once.
 size_t mc_cache_misses_drain(mc_cache *c, mc_block_id *out, size_t cap);
 
 // Drop everything (e.g. source archive replaced).
@@ -522,6 +539,17 @@ struct mc_sample_src {
     int aux, aux2;                        // binding-private (lod, flags, ...)
     const uint8_t *(*block)(const mc_sample_src *src,
                             int bz, int by, int bx, uint8_t *tmp);
+    // Optional CHEAP residency probe: is block (bz,by,bx) in the RAM cache right
+    // now WITHOUT decoding? Used by the LOD-fallback render to decide "sample this
+    // level vs fall coarser" without triggering a fine-level decode-on-render-
+    // thread (the whole point of the fallback). NULL -> resident defaults to
+    // block()!=NULL (which may decode). 1 = resident, 0 = not.
+    int (*resident)(const mc_sample_src *src, int bz, int by, int bx);
+    // 1 = block() returns a STABLE pointer the sampler can cache directly (e.g. an
+    // mc_cache arena pointer, valid for a frozen frame). 0 = block() synthesizes
+    // into the `tmp` buffer (CLI/dense), so the sampler must give each cache slot
+    // its own scratch. Lets the interactive path drop the per-entry 4KB buffers.
+    int owns_ptr;
     int nz, ny, nx;                       // voxel dims of the sampled level
     // Optional direct path: when set, samplers address voxels straight off
     // this base pointer (voxel (z,y,x) at dense[z*dsy + y*dsx + x]) and
@@ -554,6 +582,9 @@ void        mc_sampler_reset(mc_sampler *s);
 
 // One sample at (z,y,x). Out-of-bounds / NaN -> 0.
 float mc_sample_point(mc_sampler *s, float z, float y, float x, mc_filter f);
+
+// (LOD sampler API — mc_lod_sampler/mc_lod_sample — is declared after
+// mc_sample_lods is defined, below.)
 
 // Batch: n points, zyx[i*3+{0,1,2}] = (z,y,x). Points with any coordinate
 // < 0 (volume-cartographer's invalid marker) or NaN write 0.
@@ -644,6 +675,19 @@ void mc_render_points_par(const mc_sample_src *src,
                           uint8_t *out, int nthreads);
 
 // ---------------------------------------------------------------------------
+// colormap: map mc_render's u8 output -> ARGB32 for display. Every colormap is a
+// baked static [256][3] grayscale->RGB table. ids: ""/"gray"=0, viridis, magma,
+// fire, red, green, blue, cyan, magenta.
+// ---------------------------------------------------------------------------
+int  mc_colormap_id(const char *name);                  // name -> id (0 = gray)
+void mc_colormap_lut(uint32_t lut[256], float win_low, float win_high, int cmap_id);
+void mc_colormap_apply(const uint8_t *vals, int w, int h, const uint32_t lut[256],
+                       uint32_t *out, int out_stride);   // out_stride in pixels
+
+// (mc_render_points_par_lod — LOD-fallback variant — declared after
+// mc_sample_lods is defined, below.)
+
+// ---------------------------------------------------------------------------
 // plane surface (volume-cartographer PlaneSurface)
 // ---------------------------------------------------------------------------
 // A plane through `origin` with unit `normal`; `u` and `v` are the in-plane
@@ -720,6 +764,33 @@ typedef struct {
     mc_sample_src lods[8];      // [0] = finest; dims halve per level
     int nlods;
 } mc_sample_lods;
+
+// ---------------------------------------------------------------------------
+// LOD sampler: owns a per-level sampler over a whole pyramid and resolves a
+// requested level with optional coarser-LOD fallback.
+// ---------------------------------------------------------------------------
+typedef struct mc_lod_sampler mc_lod_sampler;
+mc_lod_sampler *mc_lod_sampler_new(const mc_sample_lods *ls);
+void            mc_lod_sampler_free(mc_lod_sampler *s);
+void            mc_lod_sampler_reset(mc_lod_sampler *s);
+
+// Sample (z,y,x) given in NATIVE level-0 voxel space. The sampler downscales
+// to the requested `lod` internally (c_L = (c_0 + 0.5)*2^-L - 0.5).
+//   lod_fallback == 0: sample only `lod`; an absent block reads 0.
+//   lod_fallback != 0: if `lod`'s block is absent, walk coarser levels
+//     (lod+1 .. coarsest) and sample the FINEST level whose block is resident;
+//     0 only if none are. Each coarser step halves the coords again.
+float mc_lod_sample(mc_lod_sampler *s, int lod, int lod_fallback,
+                    float z, float y, float x, mc_filter f);
+
+// LOD-fallback batch render: points are NATIVE level-0 voxel coords; sample the
+// requested `lod` and, where that level's block is absent (not yet streamed in),
+// fall back to the finest resident coarser level so newly-entered LODs show
+// coarse data immediately instead of going black. Slice path (comp==NONE).
+void mc_render_points_par_lod(const mc_sample_lods *ls, int lod,
+                              const float *ptsL0, int w, int h,
+                              const mc_render_params *p,
+                              uint8_t *out, int nthreads);
 
 // ---------------------------------------------------------------------------
 // 3D resampling (surface-aligned volumes)
@@ -861,6 +932,8 @@ typedef struct mc_s3 mc_s3;
 mc_s3 *mc_s3_open(const char *url);
 // The reader for all decode calls (mc_chunk_offset / mc_decode_block / ...).
 mc_reader *mc_s3_reader(mc_s3 *s);
+// Total bytes pulled over S3 so far (for a download-rate readout).
+uint64_t mc_s3_net_bytes(mc_s3 *s);
 void mc_s3_close(mc_s3 *s);
 
 // ===========================================================================
@@ -905,6 +978,22 @@ typedef struct {
 mc_volume *mc_volume_open_ex(const char *url, const char *cache_dir,
                              size_t cache_bytes, float quality,
                              const mc_volume_config *cfg);
+
+// Open an ALREADY-BUILT .mca (remote s3://... / https://..., or a local file path)
+// and stream it into a LOCAL .mca on demand. Same machinery as mc_volume_open's
+// transcode path -- local archive in `cache_dir`, download threads, decode-from-
+// local THAW -- except the download step copies each fetched 256^3 chunk's
+// compressed blob VERBATIM (no decode/re-encode: a built .mca chunk is already in
+// the local format). Only the chunks the view touches are pulled. `cache_bytes` is
+// the resident RAM budget. Returns NULL on failure. Use this (not mc_volume_open)
+// when the URL is a built .mca rather than an NGFF zarr root.
+mc_volume *mc_volume_open_streaming(const char *url, const char *cache_dir,
+                                    size_t cache_bytes);
+
+// Probe a built .mca's header WITHOUT opening a volume (no local archive, no
+// threads): LOD0 dims (x,y,z), lod count, build quality. `url` = s3://, https://,
+// or a local file path. Any out-param may be NULL. Returns 0 on success.
+int mc_mca_probe(const char *url, int *nx, int *ny, int *nz, int *nlods, float *quality);
 void       mc_volume_free(mc_volume *v);
 
 int  mc_volume_nlods(const mc_volume *v);
@@ -942,6 +1031,12 @@ void mc_volume_prefetch_shard(mc_volume *v, int lod, int cz, int cy, int cx);
 // polled to abort early.
 void mc_volume_prefetch_level(mc_volume *v, int lod, int nthreads, volatile int *cancel);
 
+// Predictive prefetch: request the 256^3 region (cz,cy,cx) at `lod` be downloaded
+// + transcoded if absent. Cheap, non-blocking, deduped (LIFO download stack). A
+// no-op if the region is already present/air/in-flight. Feed it the geometry-
+// predicted working set at the start of a tick so data front-runs the render.
+void mc_volume_request_region(mc_volume *v, int lod, int cz, int cy, int cx);
+
 // Register a callback fired (from a worker thread) each time a background
 // transcode completes a region — lets an interactive client schedule a repaint.
 // `cb` must be cheap and thread-safe (e.g. set a flag / post to the UI loop).
@@ -963,7 +1058,12 @@ typedef struct {
     uint64_t cache_cap_blocks;           // decoded-block capacity (budget/4096)
     uint64_t disk_bytes;                 // .mca append cursor
     uint64_t net_bytes;                  // bytes pulled from the source
-    uint64_t regions_inflight;           // single-flight depth right now
+    uint64_t regions_inflight;           // real pipeline depth: queued downloads +
+                                         // downloading + decode queue (the user-
+                                         // facing "downloading N"). Stable.
+    uint64_t work_pending;               // regions_inflight + this frame's undrained
+                                         // cache-fill misses; the render gate keys
+                                         // off this. Swings per frame -- NOT for UI.
 } mc_volume_stats;
 void mc_volume_get_stats(const mc_volume *v, mc_volume_stats *out);
 
@@ -976,6 +1076,13 @@ size_t mc_volume_set_cache_bytes(mc_volume *v, size_t bytes);
 // threads block. Bigger = network saturates further ahead of CPU-bound decode.
 // Default 2 GB. Returns the installed budget.
 size_t mc_volume_set_staging_bytes(mc_volume *v, size_t bytes);
+
+// Tick-phase bracket for a render game-loop (see mc_cache_freeze/thaw). freeze()
+// makes the resident cache immutable for the frame — get/get_copy then read
+// LOCK-FREE — and thaw() reopens the write phase (new regions land) + bumps the
+// pin epoch. A client clocks: thaw -> (regions arrive) -> freeze -> render -> repeat.
+void mc_volume_freeze(mc_volume *v);
+void mc_volume_thaw(mc_volume *v);
 
 #ifdef __cplusplus
 }
