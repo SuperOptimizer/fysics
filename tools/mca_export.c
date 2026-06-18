@@ -24,8 +24,8 @@
  */
 #define _GNU_SOURCE
 #include "fysics.h"
-#include "../vendor/matter/mc_archive_api.h"
-#include "../vendor/libs3/libs3.h"
+#include "matter_compressor.h"
+#include "libs3.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +39,18 @@
 #include <malloc.h>
 #include <limits.h>
 #include <time.h>
+#include <signal.h>
+#include <execinfo.h>
+
+/* crash diagnostic: dump a backtrace on fatal signals (the streaming pipeline
+ * runs many threads; a silent SIGSEGV otherwise leaves no trace). async-signal
+ * unsafe in the strict sense, but acceptable for a post-mortem stderr dump. */
+static void fy_crash_handler(int sig){
+    void *bt[64]; int n=backtrace(bt,64);
+    fprintf(stderr,"\n==== FATAL SIGNAL %d (%s) ====\n",sig,strsignal(sig));
+    backtrace_symbols_fd(bt,n,2);
+    signal(sig,SIG_DFL); raise(sig);
+}
 
 typedef uint8_t u8;
 #define MCC 256                 /* mc chunk edge */
@@ -46,17 +58,19 @@ typedef uint8_t u8;
 /* ------------------------------------------------------------------ source I/O */
 static s3_client *g_s3 = NULL;
 static int is_s3(const char *p){ return strncmp(p,"s3://",5)==0; }
-static s3_status cred_provider(void *ud, s3_credentials *out){ (void)ud; return s3_credentials_load(NULL,out); }
+/* per-batch connection count (env MCA_BATCH, default 16). Total in-flight S3
+ * connections ~= io_threads * this; keep it modest so connections are REUSED
+ * (keep-alive) rather than churned -- churn triggers handshake resets. */
+static int mca_batch_conc(void){ static int v=0; if(!v){const char*e=getenv("MCA_BATCH"); v=e?atoi(e):16; if(v<1)v=16;} return v; }
 static void s3_init_once(void){
     if(g_s3) return;
     s3_config cfg; memset(&cfg,0,sizeof cfg);
     cfg.max_retries=5;
-    s3_credentials probe; memset(&probe,0,sizeof probe);
-    if(s3_credentials_load(NULL,&probe)==S3_OK){
-        cfg.cred_provider=cred_provider;
-        if(probe.region&&probe.region[0]) cfg.region=strdup(probe.region);
-        s3_credentials_free(&probe);
-    }
+    /* Vesuvius open-data buckets are PUBLIC: use ANONYMOUS (unsigned) requests --
+     * no cred_provider, so libs3 issues unsigned GETs (avoids SSO / expired-cred
+     * signing failures on a public bucket). Just pin the region. */
+    const char *reg = getenv("AWS_REGION"); if(!reg||!reg[0]) reg = getenv("AWS_DEFAULT_REGION");
+    cfg.region = (reg && reg[0]) ? reg : "us-east-1";
     g_s3=s3_client_new(&cfg);
     if(!g_s3){ fprintf(stderr,"s3_client_new failed\n"); exit(1); }
 }
@@ -431,7 +445,7 @@ static void *download_worker(void *arg){
                     }
                 }
                 int use_batch = is_s3(z0->dir) && nown>1;
-                if(use_batch && s3_get_batch(g_s3,reqs,nown,16,rsp)!=S3_OK){
+                if(use_batch && s3_get_batch(g_s3,reqs,nown,mca_batch_conc(),rsp)!=S3_OK){
                     for(long i=0;i<nown;++i) s3_response_free(&rsp[i]);
                     use_batch=0;                      /* transport failure -> serial (retries) */
                 }
@@ -823,6 +837,8 @@ static void stamp_provenance(mc_archive *arc, const char *in, const char *out,
 }
 
 int main(int argc, char **argv){
+    signal(SIGSEGV,fy_crash_handler); signal(SIGABRT,fy_crash_handler);
+    signal(SIGBUS,fy_crash_handler);  signal(SIGFPE,fy_crash_handler);
     if(argc<3){
         fprintf(stderr,"usage: %s <in_zarr|s3://...> <out.mc> [--profile P] [--quality Q]"
                        " [--meta PATH] [--threads N] [--io-threads M] [--queue C]"
@@ -836,7 +852,7 @@ int main(int argc, char **argv){
                               * under the fetch budget (SB=1024 bands serialized the
                               * downloaders through the progress token) and shrink
                               * worker buffers so compute can run FULL-WIDTH */
-    int nthreads=0, niothreads=0, qcap=0, process=1; double cache_gb=12.0, mem_gb=24.0;
+    int nthreads=0, niothreads=0, qcap=0, process=1; double cache_gb=12.0, mem_gb=24.0, calib_gb=10.0;
     char meta_path[PATH_MAX]; meta_path[0]=0;
     for(int i=3;i<argc;i++){
         if      (!strcmp(argv[i],"--profile")&&i+1<argc)   profile=argv[++i];
@@ -851,6 +867,7 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--downscale")&&i+1<argc) g_ds=strcmp(argv[++i],"box")?FY_DS_CBOX:FY_DS_BOX;
         else if (!strcmp(argv[i],"--alpha")&&i+1<argc)     g_alpha=(float)atof(argv[++i]);
         else if (!strcmp(argv[i],"--cache-gb")&&i+1<argc)  cache_gb=atof(argv[++i]);
+        else if (!strcmp(argv[i],"--calib-gb")&&i+1<argc)  calib_gb=atof(argv[++i]);
         else if (!strcmp(argv[i],"--mem-gb")&&i+1<argc)    mem_gb=atof(argv[++i]);
         else { fprintf(stderr,"unknown arg: %s\n",argv[i]); return 2; }
     }
@@ -866,10 +883,11 @@ int main(int argc, char **argv){
     cfg.do_deconv=0; cfg.use_matched_deconv=1; cfg.psf_sigma_vox=1.0; cfg.deconv_tikhonov=0.05;
     cfg.do_air_zero=1; cfg.air_cut_u8=-1; cfg.air_cut_band=8; cfg.air_thresh=0.05;
     cfg.scratch_passes=5;
-    cfg.do_normalize=1; cfg.norm_lo=-1; cfg.norm_hi=-1;
+    cfg.do_normalize=0; cfg.norm_lo=-1; cfg.norm_hi=-1;   /* no recenter/stretch by default */
+    cfg.calib_budget_gb=calib_gb;   /* S3 calibration sample budget (default 10 GB; was 200) */
     cfg.do_zdrift=1; cfg.do_dering=1; cfg.dering_cy=-1; cfg.dering_cx=-1;
     if      (!strcmp(profile,"conservative")) { cfg.air_cut_aggr=0.0; cfg.denoise_k=3.0; }
-    else if (!strcmp(profile,"aggressive"))   { cfg.air_cut_aggr=1.0; cfg.denoise_k=4.2; }
+    else if (!strcmp(profile,"aggressive"))   { cfg.air_cut_aggr=1.0; cfg.denoise_k=3.0; }   /* conservative's gentler denoise */
     else { fprintf(stderr,"unknown profile %s\n",profile); return 2; }
     /* metadata via the python reader (same locator as fysics_process) */
     {
@@ -897,6 +915,11 @@ int main(int argc, char **argv){
     fprintf(stderr,"input %ldx%ldx%ld chunks %ldx%ldx%ld\n",z0.sz,z0.sy,z0.sx,z0.cz,z0.cy,z0.cx);
     chunkmap cm;
     if(cm_build(&cm,in,&z0)!=0){fprintf(stderr,"occupancy build failed\n");return 1;}
+
+    /* hand the occupancy map to calibration so its sweep skips known-empty ptiles
+     * (no 404 GETs) and concentrates its sample budget on the occupied volume. */
+    cfg.occ=cm.present; cfg.occ_ncz=cm.ncz; cfg.occ_ncy=cm.ncy; cfg.occ_ncx=cm.ncx;
+    cfg.occ_cz=z0.cz;   cfg.occ_cy=z0.cy;  cfg.occ_cx=z0.cx;
 
     /* ---- calibrate (reads the zarr through the fysics library) ---- */
     if(process){

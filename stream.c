@@ -98,6 +98,17 @@ int fy_hist_percentile_u8(const fy_hist_state *s, double pct) {
     for (int i = 0; i < L; i++) { acc += s->hist[i]; if (acc >= target) return i; }
     return L - 1;
 }
+/* percentile over the INNER bins [1,254] only -- excludes masked (0) and clipped
+ * (255) voxels so contrast/normalization stats reflect real material, not the mask
+ * spike or the clip pile. */
+int fy_hist_percentile_u8_inner(const fy_hist_state *s, double pct) {
+    long total = 0; for (int i = 1; i <= 254; i++) total += s->hist[i];
+    if (total <= 0) return 0;
+    long target = (long)(pct / 100.0 * (double)total);
+    long acc = 0;
+    for (int i = 1; i <= 254; i++) { acc += s->hist[i]; if (acc >= target) return i; }
+    return 254;
+}
 
 /* ---- GLOBAL normalization (consistent across the whole volume) ---- */
 /* finalize: compute lo/hi (u8) from global percentiles; pass 2 applies per chunk */

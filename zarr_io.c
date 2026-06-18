@@ -18,18 +18,19 @@
 #include <errno.h>
 #include <time.h>
 #ifdef FYSICS_S3
-#include "vendor/libs3/libs3.h"
+#include "libs3.h"
 static s3_client *g_fy_s3 = NULL;
-static s3_status fy_s3_cred(void *ud, s3_credentials *out){ (void)ud; return s3_credentials_load(NULL,out); }
+/* per-batch connection count (env MCA_BATCH, default 16). Calibration runs
+ * sweep_threads of these, so total S3 conns ~= sweep_threads * this; keep modest
+ * so connections are reused (keep-alive), not churned (churn -> handshake resets). */
+static int fy_batch_conc(void){ static int v=0; if(!v){const char*e=getenv("MCA_BATCH"); v=e?atoi(e):16; if(v<1)v=16;} return v; }
 static void fy_s3_ensure(void){
     if(g_fy_s3) return;
     s3_config cfg; memset(&cfg,0,sizeof cfg);
-    s3_credentials probe; memset(&probe,0,sizeof probe);
-    if(s3_credentials_load(NULL,&probe)==S3_OK){
-        cfg.cred_provider=fy_s3_cred;
-        if(probe.region&&probe.region[0]) cfg.region=strdup(probe.region);
-        s3_credentials_free(&probe);
-    }
+    /* Vesuvius open-data buckets are PUBLIC: ANONYMOUS (unsigned) requests -- no
+     * cred_provider (avoids SSO / expired-cred signing failures). Pin the region. */
+    const char *reg = getenv("AWS_REGION"); if(!reg||!reg[0]) reg = getenv("AWS_DEFAULT_REGION");
+    cfg.region = (reg && reg[0]) ? reg : "us-east-1";
     g_fy_s3=s3_client_new(&cfg);
 }
 #endif
@@ -255,7 +256,7 @@ int fy_zarr_read(const fy_zarr *z, long z0, long y0, long x0, long dz, long dy, 
                     snprintf(bpaths + i*2048, 2048, "%s/0/%ld/%ld/%ld", z->root, qz, qy, qx);
                     reqs[i].url = bpaths + i*2048; reqs[i].offset = 0; reqs[i].length = 0;
                 }
-                if (s3_get_batch(g_fy_s3, reqs, nb, 32, batch) != S3_OK) {
+                if (s3_get_batch(g_fy_s3, reqs, nb, fy_batch_conc(), batch) != S3_OK) {
                     for (long i = 0; i < nb; i++) s3_response_free(&batch[i]);
                     free(batch); batch = NULL;   /* transport failure -> serial fallback (retries) */
                 }

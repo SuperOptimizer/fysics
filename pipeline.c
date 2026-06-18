@@ -221,6 +221,8 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
                          int have_dec_range, double dec_lo, double dec_hi,
                          float *b1, float *b2, float *ws, double guided_eps_tile) {
     size_t N = (size_t)nz * ny * nx;
+    const float MUS_R = 0.375f;   /* MUSICA headroom: (d.5) recenters material to
+                                   * [0.5-R,0.5+R]; (f) stretches it back to [0,1]. */
 
     /* (b) DECONV (STORED off for BM18; matched Wiener when requested else plain auto-reg).
      * The physics inverse must run on PHYSICAL ATTENUATION mu, not u8/255 -- our u8 is a clipped
@@ -343,6 +345,22 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
         }
     }
 
+    /* (d.5) RECENTER + RESAMPLE around 127, WITH MUSICA HEADROOM: map the real
+     * material's global span [norm_lo,norm_hi] (pass1 inner percentiles) so its
+     * midpoint -> 0.5 (127) and [lo,hi] -> [0.5-R, 0.5+R], leaving R of headroom each
+     * side so the following MUSICA gain has room before clipping. Stage (f) stretches
+     * back to full range afterwards. Air (f==0) stays 0. Global => seam-free.
+     * (With MUSICA off, (d.5) then (f) compose to a plain centered full-range stretch.) */
+    if (cfg->have_norm && cfg->norm_hi > cfg->norm_lo) {
+        float midf = 0.5f * (float)(cfg->norm_lo + cfg->norm_hi) / 255.0f;
+        float k = (2.0f * MUS_R) * 255.0f / (float)(cfg->norm_hi - cfg->norm_lo);
+        for (size_t i = 0; i < N; i++) {
+            if (f[i] <= 0.0f) { f[i] = 0.0f; continue; }   /* air stays 0 */
+            float v = 0.5f + (f[i] - midf) * k;
+            f[i] = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+        }
+    }
+
     /* (e) MUSICA viewing enhancement (per-slice, clip-aware via the export rails). */
     if (cfg->do_musica) {
         for (int z = 0; z < nz; z++) {
@@ -352,12 +370,17 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
             for (size_t i = 0; i < (size_t)ny * nx; i++) {
                 size_t gi = (size_t)z * ny * nx + i;
                 unsigned char rr = u8orig[gi];
-                if (rr >= 254 || rr == 0) o[i] = sl[i];
+                if (rr == 255 || rr == 0) o[i] = sl[i];   /* pass masked/clipped through; modify 1..254 */
                 else { float v = o[i]; o[i] = v < 0 ? 0 : (v > 1 ? 1 : v); }
             }
         }
         memcpy(f, b1, sizeof(float) * N);
     }
+    /* (f) FINAL full-range stretch is a GLOBAL post-pass (fy_restretch / integrated
+     * pass3) that maps the MUSICA-output percentiles [p0.5,p99.5] -> full range, so
+     * the clip is controlled regardless of how much MUSICA brightened. A fixed
+     * band-expansion here would just re-amplify the brightening (measured: worse
+     * clip), so process_tile leaves the recentered band for the post-pass. */
 }
 
 /* per-tile guided eps from the radial fn(r) fit (tile center vs rotation axis);
@@ -407,10 +430,8 @@ int fy_process_buffer(const fy_pipeline_cfg *cfg, const unsigned char *u8buf,
     float *f = tls_buf, *orig = tls_buf + hn;
     float *b1 = tls_buf + 2*hn, *b2 = tls_buf + 3*hn;
     float *ws = tls_buf + 4*hn;
-    if (cfg->have_norm) fy_norm_apply_u8(u8buf, f, hn, (unsigned char)cfg->norm_lo, (unsigned char)cfg->norm_hi);
-    else u8_to_f01(u8buf, f, hn);
-    if (cfg->have_dering && cfg->dering) fy_dering_apply(cfg->dering, f, rz0, ry0, rx0, hz, hy, hx,
-        cfg->have_norm ? 1.0 / (cfg->norm_hi - cfg->norm_lo) : 1.0 / 255.0);
+    u8_to_f01(u8buf, f, hn);   /* input stays u8/255; recenter+stretch runs post-air-zero (stage d.5) */
+    if (cfg->have_dering && cfg->dering) fy_dering_apply(cfg->dering, f, rz0, ry0, rx0, hz, hy, hx, 1.0 / 255.0);
     if (cfg->have_zdrift && cfg->zdrift_factor) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, cfg->zdrift_factor);
     memcpy(orig, f, sizeof(float) * hn);   /* (fused conversions tried; the dering/zdrift
                                             * paths need f finalized first, so the copy stays) */
@@ -464,6 +485,26 @@ int fy_calibrate(const char *in_root, fy_pipeline_cfg *cfg, int tile, int verbos
     return fy_run_pipeline(in_root, NULL, cfg, tile, verbose);
 }
 
+/* occupancy guide: does any L0 chunk overlapping the box [z0..z0+dz) x ... carry
+ * material per the coarse-derived presence bitmap? Out-of-grid cells count absent. */
+static int fy_ptile_occupied(const fy_pipeline_cfg *c,
+                             long z0, long y0, long x0, long dz, long dy, long dx) {
+    long cza = z0 / c->occ_cz, czb = (z0 + dz - 1) / c->occ_cz;
+    long cya = y0 / c->occ_cy, cyb = (y0 + dy - 1) / c->occ_cy;
+    long cxa = x0 / c->occ_cx, cxb = (x0 + dx - 1) / c->occ_cx;
+    for (long cz = cza; cz <= czb; cz++) {
+        if (cz < 0 || cz >= c->occ_ncz) continue;
+        for (long cy = cya; cy <= cyb; cy++) {
+            if (cy < 0 || cy >= c->occ_ncy) continue;
+            for (long cx = cxa; cx <= cxb; cx++) {
+                if (cx < 0 || cx >= c->occ_ncx) continue;
+                if (c->occ[((size_t)cz * c->occ_ncy + cy) * c->occ_ncx + cx]) return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 /* ============================================================================
  * fy_run_pipeline -- the public 2-pass entry point.
  * ========================================================================== */
@@ -509,6 +550,16 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     long ptile = tile > 256 ? tile : 256;
     long pnz = ceil_div(Z, ptile), pny = ceil_div(Y, ptile), pnx = ceil_div(X, ptile);
     long pntiles = pnz * pny * pnx;
+    /* occupied volume (GB) from the occupancy guide, if present: lets the sampling
+     * budget concentrate on the ~25% of a masked scroll that actually holds data. */
+    double occ_gb = 0;
+    if (cfg->occ) {
+        size_t npres = 0, ncells = (size_t)cfg->occ_ncz * cfg->occ_ncy * cfg->occ_ncx;
+        for (size_t i = 0; i < ncells; i++) if (cfg->occ[i]) npres++;
+        occ_gb = (double)npres * cfg->occ_cz * cfg->occ_cy * cfg->occ_cx / 1e9;
+        if (verbose) fprintf(stderr, "calib: occupancy guide -> %.1f GB occupied of %.1f GB dense\n",
+                             occ_gb, (double)Z * Y * X / 1e9);
+    }
     if (cfg->do_dering) {
         der = (fy_dering *)malloc(sizeof(fy_dering));
         /* slab = 2 sweep z-tiles, so each tile lands in exactly ONE slab (lock-free merge) */
@@ -537,14 +588,22 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         #pragma omp for schedule(dynamic)
         for (long t = 0; t < pntiles; t++) {
             long iz = t / (pny * pnx), r = t % (pny * pnx), iy = r / pnx, ix = r % pnx;
+            long z0 = iz * ptile, y0 = iy * ptile, x0 = ix * ptile;
+            long dz = lmin(ptile, Z - z0), dy = lmin(ptile, Y - y0), dx = lmin(ptile, X - x0);
+            size_t n = (size_t)dz * dy * dx;
+            /* OCCUPANCY SKIP: a masked scroll is ~75% empty. If the coarse guide says
+             * every chunk under this ptile is absent, there is nothing to read -- skip
+             * before issuing any GET (the bulk of the old sparse-404 round trips). */
+            if (cfg->occ && !fy_ptile_occupied(cfg, z0, y0, x0, dz, dy, dx)) continue;
             /* SAMPLE: read EVERY z-slab (the z-drift trend needs full z-coverage) but only
              * a hash-selected fraction of (y,x) tiles, sized by a CALIBRATION I/O BUDGET
              * (default 200 GB, cfg->calib_budget_gb) -- on a 27 TB volume the old strided
              * 25% sweep was ~7 TB of reads before processing could start. The stats
              * (norm histogram, per-z papyrus mean, ring profiles) converge on samples;
-             * a floor keeps >=~32 tiles expected per z-slab for the z-drift profile. */
+             * a floor keeps >=~32 tiles expected per z-slab for the z-drift profile.
+             * Budget is spread over the OCCUPIED volume when the guide is available. */
             if (pny >= 4 || pnx >= 4) {
-                double total_gb = (double)Z * Y * X / 1e9;
+                double total_gb = occ_gb > 0 ? occ_gb : (double)Z * Y * X / 1e9;
                 double budget = cfg->calib_budget_gb > 0 ? cfg->calib_budget_gb : 200.0;
                 double frac = total_gb > budget ? budget / total_gb : 1.0;
                 double floorf_ = 32.0 / ((double)pny * pnx);
@@ -556,9 +615,6 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
                     if (hsh > (unsigned int)(frac * 4294967295.0)) continue;
                 }
             }
-            long z0 = iz * ptile, y0 = iy * ptile, x0 = ix * ptile;
-            long dz = lmin(ptile, Z - z0), dy = lmin(ptile, Y - y0), dx = lmin(ptile, X - x0);
-            size_t n = (size_t)dz * dy * dx;
             if (fy_zarr_read(&zin, z0, y0, x0, dz, dy, dx, pb) != 0) continue;
             if (!any_nonzero(pb, n)) continue;
             if (cfg->do_normalize) fy_hist_accumulate_u8(&lh, pb, n);
@@ -813,9 +869,9 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     }
     /* norm gate: only if (hi-lo)/255 < 0.40 */
     if (cfg->do_normalize && nhist.total > 0) {
-        int lo = fy_hist_percentile_u8(&nhist, 0.5);
-        int hi = fy_hist_percentile_u8(&nhist, 99.5);
-        if ((hi - lo) / 255.0 < 0.40 && hi > lo) { cfg->norm_lo = lo; cfg->norm_hi = hi; have_norm = 1; }
+        int lo = fy_hist_percentile_u8_inner(&nhist, 0.5);   /* exclude masked-0 + clipped-255 */
+        int hi = fy_hist_percentile_u8_inner(&nhist, 99.5);
+        if (hi > lo) { cfg->norm_lo = lo; cfg->norm_hi = hi; have_norm = 1; }   /* always on: recenter+stretch, applied post-air-zero (stage d.5) */
     }
     /* z-drift gate: coherence>=0.5 AND slope_frac>=0.05 AND beam_drift>=0.05 */
     if (cfg->do_zdrift) {
@@ -910,10 +966,8 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
             if (!any_nonzero(u8, hn)) continue;
 
             /* (a) INTENSITY CORRECTIONS FIRST: normalize, dering, then z-drift (gated). */
-            if (have_norm) fy_norm_apply_u8(u8, f, hn, (unsigned char)cfg->norm_lo, (unsigned char)cfg->norm_hi);
-            else u8_to_f01(u8, f, hn);
-            if (have_dering) fy_dering_apply(der, f, rz0, ry0, rx0, hz, hy, hx,
-                have_norm ? 1.0 / (cfg->norm_hi - cfg->norm_lo) : 1.0 / 255.0);
+            u8_to_f01(u8, f, hn);   /* input stays u8/255; recenter+stretch runs post-air-zero (stage d.5) */
+            if (have_dering) fy_dering_apply(der, f, rz0, ry0, rx0, hz, hy, hx, 1.0 / 255.0);
             if (have_zdrift) fy_zdrift_apply(f, (int)hz, (int)hy, (int)hx, (int)rz0, zfactor);
             memcpy(orig, f, sizeof(float) * hn);
 

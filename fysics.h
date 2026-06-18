@@ -79,6 +79,7 @@ void fy_hist_init(fy_hist_state *s);
 void fy_hist_accumulate_u8(fy_hist_state *s, const unsigned char *chunk, size_t n);
 void fy_hist_merge(fy_hist_state *dst, const fy_hist_state *src);  /* parallel accum */
 int  fy_hist_percentile_u8(const fy_hist_state *s, double pct);
+int  fy_hist_percentile_u8_inner(const fy_hist_state *s, double pct); /* excludes bins 0 (masked) + 255 (clipped) */
 
 /* global normalization (consistent intensity across the whole volume) */
 void fy_norm_finalize(const fy_hist_state *s, double lo_pct, double hi_pct,
@@ -469,6 +470,14 @@ typedef struct {
     int    have_eps_r; double eps_fn_a, eps_fn_b, eps_fn_med;
     double dec_lo, dec_hi;    /* global deconv-output rescale range */
     long   vol_z;             /* full-volume Z (for zdrift_apply absolute-z indexing) */
+    /* OCCUPANCY GUIDE (optional): a per-L0-chunk presence bitmap derived from the
+     * coarse pyramid. When set, the calibration sweep skips ptiles whose chunks are
+     * all absent -- no GET is issued for known-empty regions (a masked scroll is
+     * ~75% empty, so this removes the bulk of the sparse-404 round trips), and the
+     * sampling budget is spread over the OCCUPIED volume instead of the dense box. */
+    const unsigned char *occ; /* occ[(cz*occ_ncy+cy)*occ_ncx+cx] != 0 -> chunk present */
+    long occ_ncz, occ_ncy, occ_ncx;   /* chunk-grid dims */
+    long occ_cz, occ_cy, occ_cx;      /* voxels per chunk cell (L0 chunk size) */
 } fy_pipeline_cfg;
 
 /* ----- FUSED export support: calibrate once, then process arbitrary chunks on demand -----

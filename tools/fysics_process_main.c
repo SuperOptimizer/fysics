@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
         if (!strcmp(profile, "conservative")) {        /* FIDELITY: keep faint material */
             air_cut_aggr = 0.0; denoise_k = 3.0;
         } else if (!strcmp(profile, "aggressive")) {   /* READABILITY: cut faint material */
-            air_cut_aggr = 1.0; denoise_k = 4.2;
+            air_cut_aggr = 1.0; denoise_k = 3.0;   /* conservative's gentler denoise */
         } else { fprintf(stderr, "unknown profile: %s (conservative|aggressive)\n", profile); return 2; }
     }
     if (!meta_path[0]) snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", in_zarr);
@@ -97,10 +97,10 @@ int main(int argc, char **argv) {
     cfg.do_air_zero = do_air_zero; cfg.air_cut_u8 = -1; cfg.air_cut_band = 8; cfg.air_thresh = 0.05;
     cfg.air_cut_aggr = air_cut_aggr; cfg.denoise_k = denoise_k;
     cfg.scratch_passes = scratch_passes;
-    cfg.do_normalize = 1; cfg.norm_lo = -1; cfg.norm_hi = -1;
+    cfg.do_normalize = 0; cfg.norm_lo = -1; cfg.norm_hi = -1;   /* no recenter/stretch by default */
     cfg.do_zdrift = 1; cfg.zdrift_factor = NULL;
     cfg.do_dering = do_dering; cfg.dering_cy = dering_cy; cfg.dering_cx = dering_cx;
-    cfg.do_musica = do_musica; cfg.musica_p = 0.6; cfg.musica_levels = 4; cfg.musica_core = 0.0;
+    cfg.do_musica = do_musica; cfg.musica_p = 0.7; cfg.musica_levels = 4; cfg.musica_core = 0.0;  /* 0.7: gentler gain (less brightening) */
 
     /* ---- locate read_meta.py: next to the binary, an installed ../share or the source
      * tools/ tree, then $FYSICS_READMETA, then PATH-relative fallback. ---- */

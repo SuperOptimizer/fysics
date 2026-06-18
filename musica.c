@@ -48,43 +48,56 @@ static inline float musica_gain(float x, float a, float p, float core) {
 }
 
 /* MUSICA on a single [0,1] slice. levels = pyramid depth, p = gain exponent (<1
- * boosts faint detail; ~0.7), core = noise coring threshold (0 disables). */
+ * boosts faint detail; ~0.7), core = noise coring threshold (0 disables).
+ *
+ * MASK/CLIP AWARE: only voxels strictly in (0,1) are "real". Masked (==0) and
+ * clipped (==1, i.e. u8 255) voxels are EXCLUDED from the pyramid blur via
+ * NORMALIZED CONVOLUTION -- each blurred base is sum(value*weight)/sum(weight)
+ * over valid neighbours only -- so black/white never bleeds into real pixels near
+ * a mask/clip boundary (no edge halos). Those voxels pass through UNMODIFIED.
+ * Net: the enhancement counts and modifies only the 1..254 range. */
 int fy_musica2d(const float *in, float *out, int ny, int nx,
                 int levels, float p, float core) {
     if (levels < 1) levels = 4;
     if (p <= 0) p = 0.7f;
     size_t n = (size_t)ny * nx;
-    /* We do a same-size (non-decimated) Laplacian pyramid for simplicity and to
-     * avoid resampling artifacts: residual at each scale = img - blur(img), then
-     * blur becomes the next coarser base. Gain each residual, sum back. */
-    float *cur  = malloc(sizeof(float) * n);   /* current (finer) base */
-    float *next = malloc(sizeof(float) * n);   /* blurred (coarser) base */
-    float *acc  = malloc(sizeof(float) * n);   /* sum of gained details */
-    if (!cur || !next || !acc) { free(cur); free(next); free(acc); return 1; }
-    memcpy(cur, in, sizeof(float) * n);
-    memset(acc, 0, sizeof(float) * n);
+    float *V    = malloc(sizeof(float) * n);   /* value  (0 where invalid)        */
+    float *W    = malloc(sizeof(float) * n);   /* weight (1 valid, 0 masked/clip) */
+    float *base = malloc(sizeof(float) * n);   /* current normalized base         */
+    float *Vn   = malloc(sizeof(float) * n);
+    float *Wn   = malloc(sizeof(float) * n);
+    float *tmp  = malloc(sizeof(float) * n);
+    float *acc  = malloc(sizeof(float) * n);   /* sum of gained details           */
+    if (!V||!W||!base||!Vn||!Wn||!tmp||!acc) { free(V);free(W);free(base);free(Vn);free(Wn);free(tmp);free(acc); return 1; }
+    for (size_t i = 0; i < n; i++) {
+        int valid = (in[i] > 0.0f && in[i] < 1.0f);
+        W[i] = valid ? 1.0f : 0.0f;
+        V[i] = valid ? in[i] : 0.0f;
+        base[i] = in[i];
+        acc[i] = 0.0f;
+    }
+    memcpy(Vn, V, sizeof(float) * n);
+    memcpy(Wn, W, sizeof(float) * n);
     float a = 0.5f;  /* gain normalization point */
     for (int l = 0; l < levels; l++) {
-        /* coarser base = cur blurred 2^l times (octave-ish scale increase) */
-        memcpy(next, cur, sizeof(float) * n);
-        float *tmp = malloc(sizeof(float) * n);
-        int iters = 1 << l;                     /* 1,2,4,8,... blur passes */
-        for (int it = 0; it < iters; it++) { blur5(next, tmp, ny, nx); memcpy(next, tmp, sizeof(float)*n); }
-        free(tmp);
-        /* detail at this scale = cur - next; gain and accumulate */
-        for (size_t i = 0; i < n; i++)
-            acc[i] += musica_gain(cur[i] - next[i], a, p, core);
-        /* descend: coarser base becomes the next level's input */
-        memcpy(cur, next, sizeof(float) * n);
+        int iters = 1 << l;                     /* cumulative octave blur (1,3,7,15 passes) */
+        for (int it = 0; it < iters; it++) {
+            blur5(Vn, tmp, ny, nx); memcpy(Vn, tmp, sizeof(float) * n);
+            blur5(Wn, tmp, ny, nx); memcpy(Wn, tmp, sizeof(float) * n);
+        }
+        /* coarser base = blur(value)/blur(weight): mask-aware, 0/255 contribute nothing */
+        for (size_t i = 0; i < n; i++) {
+            float nb = (Wn[i] > 1e-6f) ? Vn[i] / Wn[i] : base[i];
+            acc[i] += musica_gain(base[i] - nb, a, p, core);
+            base[i] = nb;
+        }
     }
-    /* result = coarsest residual base (low-freq, untouched) + gained details.
-     * ZERO-AWARE: pixels that were exactly 0 in the input (masked air) stay 0 --
-     * we never contrast-enhance the air, and the black gaps are preserved. */
+    /* masked (0) and clipped (1) pass through unmodified; real pixels rebuilt */
     for (size_t i = 0; i < n; i++) {
-        if (in[i] == 0.0f) { out[i] = 0.0f; continue; }
-        float v = cur[i] + acc[i];
+        if (!(in[i] > 0.0f && in[i] < 1.0f)) { out[i] = in[i]; continue; }
+        float v = base[i] + acc[i];
         out[i] = v < 0 ? 0 : (v > 1 ? 1 : v);
     }
-    free(cur); free(next); free(acc);
+    free(V); free(W); free(base); free(Vn); free(Wn); free(tmp); free(acc);
     return 0;
 }
