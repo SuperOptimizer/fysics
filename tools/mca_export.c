@@ -1044,7 +1044,7 @@ int main(int argc, char **argv){
     int ni_=niothreads>0?niothreads:(is_s3(in)?(int)(ncpu*2):(nc_<4?nc_:4));
     /* downloaders' worst-case in-flight band footprints must fit the budget
      * (gated otherwise -> token-serialized crawl): clamp the io pool to it */
-    { long capb=(long)((mem_gb==24.0?ncpu/4.0:mem_gb)+(cache_gb==12.0?ncpu/8.0:cache_gb))*1000000000L;
+    { long capb=(long)((mem_gb==24.0?ncpu/2.0:mem_gb)+(cache_gb==12.0?ncpu/4.0:cache_gb))*1000000000L;
       int maxio=(int)(capb*7/10/band_max);
       if(niothreads<=0 && ni_>maxio && maxio>=4) ni_=maxio; }
     /* queue depth from the PINNING INVARIANT: bands held by queue+workers pin
@@ -1052,11 +1052,11 @@ int main(int argc, char **argv){
      * downloaders all gate and fetches serialize through the progress token
      * (observed: 58/64 downloaders cond-waiting, 6 fetching). Keep worst-case
      * pinned bytes <= half the budget so fetch headroom always exists. */
-    long cap_b=(long)((mem_gb==24.0?ncpu/4.0:mem_gb)*1e9)+(long)((cache_gb==12.0?ncpu/8.0:cache_gb)*1e9);
+    long cap_b=(long)((mem_gb==24.0?ncpu/2.0:mem_gb)*1e9)+(long)((cache_gb==12.0?ncpu/4.0:cache_gb)*1e9);
     int qc_=qcap>0?qcap:(int)(cap_b/2/band_max-nc_);
     if(qcap<=0){ if(qc_<4)qc_=4; if(qc_>nc_*2)qc_=nc_*2; }
-    if(mem_gb==24.0)  mem_gb=ncpu/4.0;   /* resident budget shares RAM with ~1.3GB/worker */     /* defaults only when not user-set */
-    if(cache_gb==12.0) cache_gb=ncpu/8.0;
+    if(mem_gb==24.0)  mem_gb=ncpu/2.0;   /* resident budget shares RAM with ~1.3GB/worker */     /* defaults only when not user-set */
+    if(cache_gb==12.0) cache_gb=ncpu/4.0;
     /* ONE resident-bytes budget covers in-flight bands AND cached reuse */
     cc_init((size_t)((mem_gb+cache_gb)*1e9));
     bq_init(&sc.q,qc_,ni_);
