@@ -836,6 +836,62 @@ static void stamp_provenance(mc_archive *arc, const char *in, const char *out,
     free(j);
 }
 
+/* ---- calibration persistence: stash the resolved calibration into <out>.calib
+ * so a resume skips the (deterministic but ~minutes-long) recalibration. Keyed on
+ * geometry + profile; pointer members (zdrift_factor[Z], dering rings) are
+ * serialized inline. ---- */
+#define CALIB_MAGIC 0x424C4143u   /* "CALB" */
+static int resume_has_progress(const char *out, long SB, long BAND, const zlvl *z0){
+    char pp[2200]; snprintf(pp,sizeof pp,"%s.progress",out);
+    FILE *f=fopen(pp,"rb"); if(!f) return 0;
+    long h[6]={0}, want[6]={0x4d435052,SB,BAND,z0->sz,z0->sy,z0->sx};
+    int ok = fread(h,sizeof h,1,f)==1 && memcmp(h,want,sizeof h)==0;
+    if(ok){ fseek(f,0,SEEK_END); ok = ftell(f) > 48; }   /* header + >=1 unit */
+    fclose(f); return ok;
+}
+static void calib_save(const char *out, const fy_pipeline_cfg *c, long SB, long BAND,
+                       const zlvl *z0, const char *profile){
+    char p[PATH_MAX]; snprintf(p,sizeof p,"%s.calib",out);
+    FILE *f=fopen(p,"wb"); if(!f) return;
+    uint32_t magic=CALIB_MAGIC, ver=1;
+    long hdr[6]={SB,BAND,z0->sz,z0->sy,z0->sx,(long)profile[0]};
+    fwrite(&magic,4,1,f); fwrite(&ver,4,1,f); fwrite(hdr,sizeof hdr,1,f);
+    fwrite(c,sizeof *c,1,f);
+    int hz = c->have_zdrift && c->zdrift_factor;
+    fwrite(&hz,sizeof hz,1,f);
+    if(hz) fwrite(c->zdrift_factor,sizeof(float),(size_t)z0->sz,f);
+    int hd = c->have_dering && c->dering && c->dering->ring;
+    fwrite(&hd,sizeof hd,1,f);
+    if(hd){ const fy_dering *d=c->dering; fwrite(d,sizeof *d,1,f);
+            fwrite(d->ring,sizeof(float),(size_t)d->nslab*d->nr,f); }
+    fclose(f);
+}
+static int calib_load(const char *out, fy_pipeline_cfg *c, long SB, long BAND,
+                      const zlvl *z0, const char *profile){
+    char p[PATH_MAX]; snprintf(p,sizeof p,"%s.calib",out);
+    FILE *f=fopen(p,"rb"); if(!f) return -1;
+    uint32_t magic=0,ver=0; long hdr[6]={0};
+    long want[6]={SB,BAND,z0->sz,z0->sy,z0->sx,(long)profile[0]};
+    if(fread(&magic,4,1,f)!=1||fread(&ver,4,1,f)!=1||fread(hdr,sizeof hdr,1,f)!=1||
+       magic!=CALIB_MAGIC||ver!=1||memcmp(hdr,want,sizeof hdr)!=0){ fclose(f); return -1; }
+    if(fread(c,sizeof *c,1,f)!=1){ fclose(f); return -1; }
+    c->occ=NULL; c->zdrift_factor=NULL; c->dering=NULL;   /* re-bound below / unused */
+    int hz=0; if(fread(&hz,sizeof hz,1,f)!=1){ fclose(f); return -1; }
+    if(hz){ float *zf=malloc((size_t)z0->sz*sizeof(float));
+        if(!zf||fread(zf,sizeof(float),(size_t)z0->sz,f)!=(size_t)z0->sz){ free(zf); fclose(f); return -1; }
+        c->zdrift_factor=zf; c->have_zdrift=1; }
+    int hd=0; if(fread(&hd,sizeof hd,1,f)!=1){ fclose(f); return -1; }
+    if(hd){ fy_dering *d=malloc(sizeof *d);
+        if(!d||fread(d,sizeof *d,1,f)!=1){ free(d); fclose(f); return -1; }
+        d->sum=NULL; d->cnt=NULL; d->ring=NULL;
+        size_t rn=(size_t)d->nslab*d->nr;
+        d->ring=malloc(rn*sizeof(float));
+        if(!d->ring||fread(d->ring,sizeof(float),rn,f)!=rn){ free(d->ring); free(d); fclose(f); return -1; }
+        c->dering=d; c->have_dering=1; }
+    fclose(f);
+    return 0;
+}
+
 int main(int argc, char **argv){
     signal(SIGSEGV,fy_crash_handler); signal(SIGABRT,fy_crash_handler);
     signal(SIGBUS,fy_crash_handler);  signal(SIGFPE,fy_crash_handler);
@@ -923,7 +979,12 @@ int main(int argc, char **argv){
 
     /* ---- calibrate (reads the zarr through the fysics library) ---- */
     if(process){
-        if(fy_calibrate(in,&cfg,128,1)!=0){fprintf(stderr,"calibrate failed\n");return 1;}
+        if(resume_has_progress(out,SB,BAND,&z0) && calib_load(out,&cfg,SB,BAND,&z0,profile)==0){
+            fprintf(stderr,"resume: loaded calibration from %s.calib (skipping recalibration)\n",out);
+        } else {
+            if(fy_calibrate(in,&cfg,128,1)!=0){fprintf(stderr,"calibrate failed\n");return 1;}
+            calib_save(out,&cfg,SB,BAND,&z0,profile);
+        }
     }
 
     /* ---- archive + schedule ---- */
