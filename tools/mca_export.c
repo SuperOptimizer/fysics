@@ -147,7 +147,9 @@ static void *occ_fetch_worker(void *arg){
     }
     return NULL;
 }
-static int cm_from_coarse(chunkmap *cm,const char *zarr,const zlvl *z0){
+/* content bbox (world LOD0, hi EXCLUSIVE) into bb[6]={zlo,zhi,ylo,yhi,xlo,xhi};
+ * filled by cm_from_coarse from the coarse-level nonzero extent. NULL = don't compute. */
+static int cm_from_coarse(chunkmap *cm,const char *zarr,const zlvl *z0,long *bb){
     int bestL=-1; zlvl cl; long f=1;
     for(int L=5;L>=1;--L){
         long ff=1L<<L;
@@ -177,17 +179,34 @@ static int cm_from_coarse(chunkmap *cm,const char *zarr,const zlvl *z0){
               if(buf[((size_t)z*cl.sy+y)*cl.sx+x]){nz=1;break;}
         if(nz) cm->present[((size_t)cz*cm->ncy+cy)*cm->ncx+cx]=1;
     }
+    if(bb){
+        /* tight nonzero bbox in coarse voxels, scaled to LOD0 (1 coarse voxel = f LOD0). */
+        long czmin=cl.sz,czmax=-1,cymin=cl.sy,cymax=-1,cxmin=cl.sx,cxmax=-1;
+        for(long z=0;z<cl.sz;++z)for(long y=0;y<cl.sy;++y)for(long x=0;x<cl.sx;++x)
+            if(buf[((size_t)z*cl.sy+y)*cl.sx+x]){
+                if(z<czmin)czmin=z; if(z>czmax)czmax=z;
+                if(y<cymin)cymin=y; if(y>cymax)cymax=y;
+                if(x<cxmin)cxmin=x; if(x>cxmax)cxmax=x;
+            }
+        if(czmax<0){ bb[0]=bb[1]=bb[2]=bb[3]=bb[4]=bb[5]=0; }   /* empty volume */
+        else {
+            bb[0]=czmin*f; bb[1]=(czmax+1)*f>z0->sz?z0->sz:(czmax+1)*f;
+            bb[2]=cymin*f; bb[3]=(cymax+1)*f>z0->sy?z0->sy:(cymax+1)*f;
+            bb[4]=cxmin*f; bb[5]=(cxmax+1)*f>z0->sx?z0->sx:(cxmax+1)*f;
+        }
+    }
     free(buf);
     fprintf(stderr,"occupancy from coarse level %d/ (factor %ld)\n",bestL,f);
     return 0;
 }
-static int cm_build(chunkmap *cm,const char *zarr,const zlvl *z0){
+static int cm_build(chunkmap *cm,const char *zarr,const zlvl *z0,long *bb){
     cm->ncz=(z0->sz+z0->cz-1)/z0->cz; cm->ncy=(z0->sy+z0->cy-1)/z0->cy; cm->ncx=(z0->sx+z0->cx-1)/z0->cx;
     cm->present=calloc((size_t)cm->ncz*cm->ncy*cm->ncx,1);
     if(!cm->present) return -1;
-    if(cm_from_coarse(cm,zarr,z0)==0) return 0;
-    fprintf(stderr,"no coarse level; assuming all chunks present\n");
+    if(cm_from_coarse(cm,zarr,z0,bb)==0) return 0;
+    fprintf(stderr,"no coarse level; assuming all chunks present (no ROI trim)\n");
     memset(cm->present,1,(size_t)cm->ncz*cm->ncy*cm->ncx);
+    if(bb){ bb[0]=0;bb[1]=z0->sz; bb[2]=0;bb[3]=z0->sy; bb[4]=0;bb[5]=z0->sx; }  /* full volume = no trim */
     return 0;
 }
 
@@ -372,6 +391,9 @@ typedef struct {
     long SB,BAND,halo;
     long ntx,nty,nbz,nunits;
     long pz,py,px;              /* padded dims (multiples of 2*MCC for L1 alignment) */
+    long roz,roy,rox;          /* ROI origin in WORLD voxels (512-aligned): the archive's
+                                * (0,0,0) maps to world (roz,roy,rox). Reads add it back;
+                                * archive chunk coords are world-minus-origin. 0 = no trim. */
     atomic_long next, fail, skipped, l0app, l1app;
     atomic_long dl_fetch, dl_gate, wk_busy, units_done;   /* live telemetry gauges */
     unsigned char *done_bm; int prog_fd; atomic_long resumed;   /* resume journal */
@@ -392,7 +414,8 @@ static void *download_worker(void *arg){
                               * downloaders overshoot the cap N-fold before any
                               * accounting); band_bytes>0 guarantees progress */
         long bz=ti%sc->nbz, txy=ti/sc->nbz, ty=txy/sc->ntx, tx=txy%sc->ntx;
-        long vx0=tx*sc->SB, vy0=ty*sc->SB, vz0=bz*sc->BAND;
+        /* WORLD read position = trimmed band position + ROI origin */
+        long vx0=tx*sc->SB+sc->rox, vy0=ty*sc->SB+sc->roy, vz0=bz*sc->BAND+sc->roz;
         long vx1=vx0+sc->SB, vy1=vy0+sc->SB, vz1=vz0+sc->BAND;
         /* halo-expanded chunk footprint, clamped to the true volume */
         long h=sc->halo;
@@ -545,19 +568,20 @@ static void *compute_worker(void *arg){
     size_t rawcap=(size_t)(SB+2*h)*(SB+2*h)*(BAND+2*h);
     u8 *raw=malloc(rawcap);                                   /* halo'd input band */
     u8 *proc=malloc((size_t)SB*SB*BAND);                      /* processed band    */
-    u8 *l1=malloc((size_t)(SB/2)*(SB/2)*(BAND/2));            /* downscaled        */
     u8 *cbuf=malloc((size_t)MCC*MCC*MCC);                     /* chunk gather      */
     u8 *tin=malloc((size_t)(128+2*h)*(128+2*h)*(128+2*h));    /* fysics tile in    */
     u8 *tout=malloc((size_t)128*128*128);                     /* fysics tile out   */
-    if(!raw||!proc||!l1||!cbuf||!tin||!tout){ fprintf(stderr,"compute alloc failed\n"); exit(1); }
+    if(!raw||!proc||!cbuf||!tin||!tout){ fprintf(stderr,"compute alloc failed\n"); exit(1); }
     mc_codec_ctx *mctx=mc_codec_ctx_new();                    /* one encoder ctx per worker */
     if(!mctx){ fprintf(stderr,"compute ctx alloc failed\n"); exit(1); }
     mc_codec_ctx_set_quality(mctx,sc->quality);
+    mc_codec_ctx_set_max_error(mctx,(int)(2.0f*sc->quality+0.5f)); /* tau = 2q (locked rule: clips the heavy DCT tail ~free) */
     bandbuf bb;
     while(bq_pop(&sc->q,&bb)){
         long ti=bb.ti;
         long bz=ti%sc->nbz, txy=ti/sc->nbz, ty=txy/sc->ntx, tx=txy%sc->ntx;
-        long vx0=tx*SB, vy0=ty*SB, vz0=bz*BAND;
+        /* WORLD band position (reads/assembly); archive coords subtract the ROI origin */
+        long vx0=tx*SB+sc->rox, vy0=ty*SB+sc->roy, vz0=bz*BAND+sc->roz;
         if(bb.empty){ atomic_fetch_add(&sc->skipped,1); atomic_fetch_add(&sc->units_done,1);
             if(sc->prog_fd>=0){ long v=ti; if(write(sc->prog_fd,&v,8)!=8){} }
             goto release; }
@@ -622,24 +646,19 @@ static void *compute_worker(void *arg){
                 memcpy(proc+((size_t)(tz0-vz0+z)*SB+(ty0-vy0+y))*SB+(tx0-vx0),
                        tout+((size_t)z*tyn+y)*txn, txn);
         }
-        /* append L0 chunks */
+        /* append L0 chunks (LOD1+ are built independently in the tail). Clamp to the
+         * archive's L0 chunk grid: BAND=512 over a 256-padded dim can overshoot by one
+         * chunk at the edge, and that chunk is all-zero -> just skip it. */
+        long ncz=(sc->pz+MCC-1)/MCC, ncy=(sc->py+MCC-1)/MCC, ncx=(sc->px+MCC-1)/MCC;
         for(long az=0;az<BAND/MCC;++az)for(long ay=0;ay<SB/MCC;++ay)for(long ax=0;ax<SB/MCC;++ax){
+            long cz=(vz0-sc->roz)/MCC+az, cy=(vy0-sc->roy)/MCC+ay, cx=(vx0-sc->rox)/MCC+ax;
+            if(cz>=ncz||cy>=ncy||cx>=ncx) continue;   /* edge overshoot (all-zero) */
             for(long z=0;z<MCC;++z)for(long y=0;y<MCC;++y)
                 memcpy(cbuf+((size_t)z*MCC+y)*MCC,
                        proc+((size_t)(az*MCC+z)*SB+(ay*MCC+y))*SB+ax*MCC, MCC);
-            if(mc_archive_append_chunk_ctx(sc->arc,mctx,0,vz0/MCC+az,vy0/MCC+ay,vx0/MCC+ax,cbuf)!=0)
+            if(mc_archive_append_chunk_ctx(sc->arc,mctx,0,cz,cy,cx,cbuf)!=0)
                 atomic_fetch_add(&sc->fail,1);
             else atomic_fetch_add(&sc->l0app,1);
-        }
-        /* L1: 2x downscale the processed band, append */
-        down2x(proc,BAND,SB,SB,l1,BAND/2,SB/2,SB/2);
-        for(long ay=0;ay<SB/2/MCC;++ay)for(long ax=0;ax<SB/2/MCC;++ax){
-            for(long z=0;z<MCC;++z)for(long y=0;y<MCC;++y)
-                memcpy(cbuf+((size_t)z*MCC+y)*MCC,
-                       l1+((size_t)z*(SB/2)+(ay*MCC+y))*(SB/2)+ax*MCC, MCC);
-            if(mc_archive_append_chunk_ctx(sc->arc,mctx,1,vz0/2/MCC,vy0/2/MCC+ay,vx0/2/MCC+ax,cbuf)!=0)
-                atomic_fetch_add(&sc->fail,1);
-            else atomic_fetch_add(&sc->l1app,1);
         }
         }
         atomic_fetch_sub(&sc->wk_busy,1);
@@ -655,7 +674,7 @@ release:
         }
         free(bb.chunks);
     }
-    free(raw);free(proc);free(l1);free(cbuf);free(tin);free(tout);
+    free(raw);free(proc);free(cbuf);free(tin);free(tout);
     mc_codec_ctx_free(mctx);
     return NULL;
 }
@@ -689,6 +708,7 @@ static void *tail_worker(void *arg){
     mc_codec_ctx *mctx=mc_codec_ctx_new();
     if(!mctx){ fprintf(stderr,"tail ctx alloc failed\n"); exit(1); }
     mc_codec_ctx_set_quality(mctx,t->quality);
+    mc_codec_ctx_set_max_error(mctx,(int)(2.0f*t->quality+0.5f)); /* tau = 2q (locked rule) */
     long n=t->ncz*t->ncy*t->ncx;
     for(;;){
         long i=atomic_fetch_add(&t->next,1);
@@ -738,7 +758,9 @@ static void stamp_provenance(mc_archive *arc, const char *in, const char *out,
                              const char *profile, float quality, int process,
                              const char *meta_path, const fy_pipeline_cfg *c,
                              long SB, long BAND, int nthreads, int niothreads, int qcap,
-                             double mem_gb, double cache_gb){
+                             double mem_gb, double cache_gb,
+                             long roz, long roy, long rox,            /* ROI origin in source/world voxels */
+                             long wz, long wy, long wx){              /* source (untrimmed) world dims */
     size_t cap=120*1024;
     char *j=malloc(cap); if(!j) return;
     char ein[PATH_MAX*2], eout[PATH_MAX*2], emp[PATH_MAX*2];
@@ -757,9 +779,11 @@ static void stamp_provenance(mc_archive *arc, const char *in, const char *out,
         " \"process\": %d,\n"
         " \"cli\": {\"sb\": %ld, \"band\": %ld, \"threads\": %d, \"io_threads\": %d,"
         " \"queue\": %d, \"mem_gb\": %.3g, \"cache_gb\": %.3g,"
-        " \"downscale\": \"%s\", \"alpha\": %.4g},\n",
+        " \"downscale\": \"%s\", \"alpha\": %.4g},\n"
+        " \"roi\": {\"origin\": [%ld, %ld, %ld], \"source_dims\": [%ld, %ld, %ld]},\n",
         ts,ein,eout,profile,(double)quality,process,SB,BAND,nthreads,niothreads,qcap,
-        mem_gb,cache_gb,g_ds==FY_DS_BOX?"box":"cbox",(double)g_alpha);
+        mem_gb,cache_gb,g_ds==FY_DS_BOX?"box":"cbox",(double)g_alpha,
+        roz,roy,rox,wz,wy,wx);
     n+=(size_t)snprintf(j+n,cap-n,
         " \"pipeline\": {\n"
         "  \"delta_beta\": %.6g, \"energy_kev\": %.6g, \"distance_mm\": %.6g,"
@@ -896,10 +920,14 @@ int main(int argc, char **argv){
     signal(SIGSEGV,fy_crash_handler); signal(SIGABRT,fy_crash_handler);
     signal(SIGBUS,fy_crash_handler);  signal(SIGFPE,fy_crash_handler);
     if(argc<3){
-        fprintf(stderr,"usage: %s <in_zarr|s3://...> <out.mc> [--profile P] [--quality Q]"
+        fprintf(stderr,"usage: %s <in_zarr|s3://...> <out.mc> [--profile P] [--quality Q|auto]"
                        " [--meta PATH] [--threads N] [--io-threads M] [--queue C]"
-                       " [--sb SB] [--band B] [--no-process]\n"
-                       "       [--downscale box|cbox] [--alpha A]   (LOD kernel; default cbox 0.5)\n",argv[0]);
+                       " [--sb SB] [--band B] [--no-process] [--no-dither]\n"
+                       "       (--quality auto sets the DC quant step to the calibrated noise floor)\n"
+                       "       [--downscale box|cbox] [--alpha A]   (LOD kernel; default cbox 0.5)\n"
+                       "       [--air-cut]        (enable the value air-cut; OFF by default -- masked input zeros are kept by the codec)\n"
+                       "       [--air-min-comp N] (despeckle when --air-cut: drop interior material islands < N voxels; default 64)\n"
+                       "       [--air-aggr A]     (air-cut dial: 0=physics floor, 1=histogram valley, >1=past valley; overrides --profile)\n",argv[0]);
         return 2;
     }
     const char *in=argv[1], *out=argv[2], *profile="conservative";
@@ -908,11 +936,15 @@ int main(int argc, char **argv){
                               * under the fetch budget (SB=1024 bands serialized the
                               * downloaders through the progress token) and shrink
                               * worker buffers so compute can run FULL-WIDTH */
-    int nthreads=0, niothreads=0, qcap=0, process=1; double cache_gb=12.0, mem_gb=24.0, calib_gb=10.0;
+    int nthreads=0, niothreads=0, qcap=0, process=1, no_dither=0, auto_q=0; double cache_gb=12.0, mem_gb=24.0, calib_gb=10.0;
+    int air_min_comp=64;       /* despeckle: drop interior material islands < N voxels */
+    double air_aggr=-1.0;      /* air-cut dial override: 0=floor,1=valley,>1=past valley; <0 = use profile */
+    int do_air=0;              /* air-cut OFF by default (--air-cut to enable); the masked
+                                * input zeros are preserved by the codec, no value-cut needed */
     char meta_path[PATH_MAX]; meta_path[0]=0;
     for(int i=3;i<argc;i++){
         if      (!strcmp(argv[i],"--profile")&&i+1<argc)   profile=argv[++i];
-        else if (!strcmp(argv[i],"--quality")&&i+1<argc)   quality=(float)atof(argv[++i]);
+        else if (!strcmp(argv[i],"--quality")&&i+1<argc)   { const char*qa=argv[++i]; if(!strcmp(qa,"auto")) auto_q=1; else quality=(float)atof(qa); }
         else if (!strcmp(argv[i],"--meta")&&i+1<argc)      snprintf(meta_path,sizeof meta_path,"%s",argv[++i]);
         else if (!strcmp(argv[i],"--threads")&&i+1<argc)   nthreads=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--io-threads")&&i+1<argc)niothreads=atoi(argv[++i]);
@@ -920,10 +952,14 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--sb")&&i+1<argc)        SB=atol(argv[++i]);
         else if (!strcmp(argv[i],"--band")&&i+1<argc)      BAND=atol(argv[++i]);
         else if (!strcmp(argv[i],"--no-process"))          process=0;
+        else if (!strcmp(argv[i],"--no-dither"))           no_dither=1;
         else if (!strcmp(argv[i],"--downscale")&&i+1<argc) g_ds=strcmp(argv[++i],"box")?FY_DS_CBOX:FY_DS_BOX;
         else if (!strcmp(argv[i],"--alpha")&&i+1<argc)     g_alpha=(float)atof(argv[++i]);
         else if (!strcmp(argv[i],"--cache-gb")&&i+1<argc)  cache_gb=atof(argv[++i]);
         else if (!strcmp(argv[i],"--calib-gb")&&i+1<argc)  calib_gb=atof(argv[++i]);
+        else if (!strcmp(argv[i],"--air-min-comp")&&i+1<argc) air_min_comp=atoi(argv[++i]);
+        else if (!strcmp(argv[i],"--air-aggr")&&i+1<argc)     air_aggr=atof(argv[++i]);
+        else if (!strcmp(argv[i],"--air-cut"))                do_air=1;
         else if (!strcmp(argv[i],"--mem-gb")&&i+1<argc)    mem_gb=atof(argv[++i]);
         else { fprintf(stderr,"unknown arg: %s\n",argv[i]); return 2; }
     }
@@ -937,14 +973,20 @@ int main(int argc, char **argv){
     cfg.delta_beta=1000.0; cfg.energy_kev=78.0; cfg.distance_mm=220.0; cfg.pixel_um=2.4;
     cfg.unsharp_sigma=1.2; cfg.unsharp_coeff=4.0;
     cfg.do_deconv=0; cfg.use_matched_deconv=1; cfg.psf_sigma_vox=1.0; cfg.deconv_tikhonov=0.05;
-    cfg.do_air_zero=1; cfg.air_cut_u8=-1; cfg.air_cut_band=8; cfg.air_thresh=0.05;
+    cfg.do_air_zero=do_air; cfg.air_cut_u8=-1; cfg.air_cut_band=8; cfg.air_thresh=0.05;
+    cfg.air_min_component=air_min_comp;
     cfg.scratch_passes=5;
+    cfg.no_dither=no_dither;   /* --no-dither: round-to-nearest (dither is redundant under the noise floor) */
     cfg.do_normalize=0; cfg.norm_lo=-1; cfg.norm_hi=-1;   /* no recenter/stretch by default */
     cfg.calib_budget_gb=calib_gb;   /* S3 calibration sample budget (default 10 GB; was 200) */
     cfg.do_zdrift=1; cfg.do_dering=1; cfg.dering_cy=-1; cfg.dering_cx=-1;
-    if      (!strcmp(profile,"conservative")) { cfg.air_cut_aggr=0.0; cfg.denoise_k=3.0; }
-    else if (!strcmp(profile,"aggressive"))   { cfg.air_cut_aggr=1.0; cfg.denoise_k=3.0; }   /* conservative's gentler denoise */
+    /* denoise_k=-1 => guided denoise OFF in all profiles (white noise floor ~1 u8: nothing
+     * to remove, and smoothing risks fine sheet detail). Profiles now differ only in air_cut.
+     * dering+zdrift stay on. Re-enable with --denoise N if ever needed. */
+    if      (!strcmp(profile,"conservative")) { cfg.air_cut_aggr=0.0; cfg.denoise_k=-1.0f; }
+    else if (!strcmp(profile,"aggressive"))   { cfg.air_cut_aggr=1.0; cfg.denoise_k=-1.0f; }
     else { fprintf(stderr,"unknown profile %s\n",profile); return 2; }
+    if (air_aggr >= 0) cfg.air_cut_aggr = air_aggr;   /* --air-aggr overrides the profile dial */
     /* metadata via the python reader (same locator as fysics_process) */
     {
         char script[PATH_MAX]={0}, exe[PATH_MAX]; ssize_t en=readlink("/proc/self/exe",exe,sizeof exe-1);
@@ -969,8 +1011,21 @@ int main(int argc, char **argv){
     zlvl z0;
     if(parse_lvl(in,0,&z0)!=0){fprintf(stderr,"cannot parse %s/0/.zarray\n",in);return 1;}
     fprintf(stderr,"input %ldx%ldx%ld chunks %ldx%ldx%ld\n",z0.sz,z0.sy,z0.sx,z0.cz,z0.cy,z0.cx);
-    chunkmap cm;
-    if(cm_build(&cm,in,&z0)!=0){fprintf(stderr,"occupancy build failed\n");return 1;}
+    chunkmap cm; long bb[6]={0};
+    if(cm_build(&cm,in,&z0,bb)!=0){fprintf(stderr,"occupancy build failed\n");return 1;}
+    /* ROI TRIM: crop to the content bbox, translate to (0,0,0), pad to MCC (256).
+     * Origin snaps DOWN to 256 and the end UP to 256 -> LOD0 is chunk-tight. Each
+     * coarser LOD is built independently in the tail (its own dims = L0>>L, storage
+     * rounded to 256), so L0 need NOT be a 512 multiple. Origin is 256-aligned, which
+     * keeps every LOD's 2x downscale phase-consistent with the source pyramid. */
+    long ROIA=MCC;
+    long roz=(bb[0]/ROIA)*ROIA, roy=(bb[2]/ROIA)*ROIA, rox=(bb[4]/ROIA)*ROIA;
+    long rez=((bb[1]+ROIA-1)/ROIA)*ROIA, rey=((bb[3]+ROIA-1)/ROIA)*ROIA, rex=((bb[5]+ROIA-1)/ROIA)*ROIA;
+    long tsz=rez-roz, tsy=rey-roy, tsx=rex-rox;
+    if(tsz<=0||tsy<=0||tsx<=0){ roz=roy=rox=0; tsz=((z0.sz+ROIA-1)/ROIA)*ROIA; tsy=((z0.sy+ROIA-1)/ROIA)*ROIA; tsx=((z0.sx+ROIA-1)/ROIA)*ROIA; }
+    if(roz||roy||rox||tsz!=z0.sz||tsy!=z0.sy||tsx!=z0.sx)
+        fprintf(stderr,"ROI trim: world bbox z[%ld,%ld) y[%ld,%ld) x[%ld,%ld) -> origin(%ld,%ld,%ld) dims %ldx%ldx%ld (was %ldx%ldx%ld)\n",
+                bb[0],bb[1],bb[2],bb[3],bb[4],bb[5],roz,roy,rox,tsz,tsy,tsx,z0.sz,z0.sy,z0.sx);
 
     /* hand the occupancy map to calibration so its sweep skips known-empty ptiles
      * (no 404 GETs) and concentrates its sample budget on the occupied volume. */
@@ -987,17 +1042,35 @@ int main(int argc, char **argv){
         }
     }
 
+    /* ---- --quality auto: set DC quant step to the measured white-noise floor, so
+     * quantization discards noise but keeps signal (q3 ~ noise floor on BM18). Needs
+     * calibration (the noise floor); refuse to guess without it. Clamp to the archival
+     * step floor 0.5 and a sane cap. ---- */
+    if(auto_q){
+        if(!process){ fprintf(stderr,"--quality auto requires processing (drop --no-process)\n"); return 2; }
+        double nf=cfg.noise_floor;
+        if(!(nf>0)){ fprintf(stderr,"--quality auto: no noise floor from calibration; falling back to q3\n"); nf=3.0; }
+        /* q = noise_floor: cfg.noise_floor measures the WHITE (decorrelated) noise floor,
+         * which on unsharp BM18 data is ~1-3 u8 -> q~3. Do NOT scale it up by 2.8: a
+         * naive flat-region/block-std reads ~18 because the unsharp content is SMOOTH
+         * SIGNAL (lag-1 autocorr +0.92, a 4th-order signal-blind estimator sees ~1), and
+         * scaling to q~40 would quantize away the sharpening (real signal we keep -- see
+         * [[unsharp-reversal-dominated]]). tau=2q is applied at encode (a fidelity bound). */
+        quality=(float)(nf<0.5?0.5:nf>16.0?16.0:nf);
+        fprintf(stderr,"[auto-q] white noise_floor=%.3f u8 -> quality=%.3f tau=2q=%.0f\n",
+                cfg.noise_floor,quality,2.0f*quality);
+    }
+
     /* ---- archive + schedule ---- */
     mc_codec_init();
-    mc_archive *arc=mc_archive_open_dims(out,(int)z0.sx,(int)z0.sy,(int)z0.sz,quality);
+    mc_archive *arc=mc_archive_open_dims(out,(int)tsx,(int)tsy,(int)tsz,quality);
     if(!arc){fprintf(stderr,"cannot open %s\n",out);return 1;}
     sched sc; memset(&sc,0,sizeof sc);
     sc.prog_fd=-1;
     sc.z0=&z0; sc.cm=&cm; sc.cfg=&cfg; sc.process=process; sc.arc=arc; sc.quality=quality;
     sc.SB=SB; sc.BAND=BAND; sc.halo=cfg.halo>0?cfg.halo:8;
-    sc.px=((z0.sx+2*MCC-1)/(2*MCC))*(2*MCC);
-    sc.py=((z0.sy+2*MCC-1)/(2*MCC))*(2*MCC);
-    sc.pz=((z0.sz+2*MCC-1)/(2*MCC))*(2*MCC);
+    sc.roz=roz; sc.roy=roy; sc.rox=rox;
+    sc.px=tsx; sc.py=tsy; sc.pz=tsz;   /* trimmed extents, already 2*MCC multiples */
     sc.ntx=(sc.px+SB-1)/SB; sc.nty=(sc.py+SB-1)/SB; sc.nbz=(sc.pz+BAND-1)/BAND;
     sc.nunits=sc.ntx*sc.nty*sc.nbz;
     /* ---- RESUME journal: <out>.progress holds 8-byte completed-unit ids after a
@@ -1005,7 +1078,7 @@ int main(int argc, char **argv){
      * are skipped without any I/O. Geometry mismatch -> start fresh. ---- */
     {
         char pp[2200]; snprintf(pp,sizeof pp,"%s.progress",out);
-        long hdr[6]={0x4d435052,SB,BAND,(long)z0.sz,(long)z0.sy,(long)z0.sx};
+        long hdr[6]={0x4d435052,SB,BAND,(long)tsz,(long)tsy,(long)tsx};   /* trimmed dims: ROI change invalidates a stale journal */
         int fd=open(pp,O_RDWR,0644);
         long nresume=0;
         if(fd>=0){
@@ -1067,7 +1140,8 @@ int main(int argc, char **argv){
     /* stamp provenance now that every parameter is RESOLVED (post-calibration,
      * post auto-sizing) -- the archive records what actually ran, not the CLI */
     stamp_provenance(arc,in,out,profile,quality,process,meta_path,&cfg,
-                     SB,BAND,nc_,ni_,qc_,mem_gb,cache_gb);
+                     SB,BAND,nc_,ni_,qc_,mem_gb,cache_gb,
+                     roz,roy,rox,z0.sz,z0.sy,z0.sx);
 
     pthread_t stat_t; pthread_create(&stat_t,NULL,stats_worker,&sc); pthread_detach(stat_t);
     pthread_t *iot=malloc(ni_*sizeof *iot), *cot=malloc(nc_*sizeof *cot);
@@ -1087,9 +1161,10 @@ int main(int argc, char **argv){
         mc_archive_close(arc); return 1;
     }
 
-    /* ---- coarse tail L2.. from the archive ---- */
-    for(int L=2;L<8;L++){
-        long dz=(z0.sz>>L), dy=(z0.sy>>L), dx=(z0.sx>>L);
+    /* ---- coarse tail L1.. from the archive (each LOD built from L-1, padded to its
+     * own 256 multiple -- LOD0 stays chunk-tight, no 512 coupling) ---- */
+    for(int L=1;L<8;L++){
+        long dz=(tsz>>L), dy=(tsy>>L), dx=(tsx>>L);   /* tail grid over the TRIMMED archive dims */
         if(dz<1&&dy<1&&dx<1) break;
         tailctx t={arc,quality,L,(dz+MCC-1)/MCC?:(long)1,(dy+MCC-1)/MCC?:(long)1,(dx+MCC-1)/MCC?:(long)1,0,0};
         long n=t.ncz*t.ncy*t.ncx;

@@ -444,7 +444,12 @@ typedef struct {
     double psf_sigma_vox, deconv_tikhonov;
     double guided_eps;                    /* from (3*flat_nf)^2 */
     int    do_air_zero; int air_cut_u8, air_cut_band; double air_thresh;
-    double air_cut_aggr;   /* 0 conservative (void-peak) .. 1 aggressive (valley) */
+    double air_cut_aggr;   /* value air-cut dial: 0 -> physics floor, 1 -> histogram
+                            * valley, >1 -> past the valley toward the material peak
+                            * (e.g. 1.1 cuts a touch into low material). Clamped [0,2]. */
+    int    air_min_component;  /* >0: zero material islands smaller than this many
+                                * voxels that don't touch the tile/halo boundary
+                                * (connected-component despeckle after the air-cut) */
     double denoise_k;      /* eps = (denoise_k*flat_nf)^2; 0 -> default 4.2 */
     int    scratch_passes;
     int    do_normalize; int norm_lo, norm_hi;
@@ -470,6 +475,11 @@ typedef struct {
     int    have_eps_r; double eps_fn_a, eps_fn_b, eps_fn_med;
     double dec_lo, dec_hi;    /* global deconv-output rescale range */
     long   vol_z;             /* full-volume Z (for zdrift_apply absolute-z indexing) */
+    /* NOISE FLOOR (set by fy_calibrate): the white-noise std of the material, in u8
+     * units, measured as the spatially-uncorrelated part of the local high-pass
+     * residual. Encoders can set the quantization quality to this (quantize away
+     * the noise, keep the signal) instead of hardcoding q. 0 if not measured. */
+    double noise_floor;
     /* OCCUPANCY GUIDE (optional): a per-L0-chunk presence bitmap derived from the
      * coarse pyramid. When set, the calibration sweep skips ptiles whose chunks are
      * all absent -- no GET is issued for known-empty regions (a masked scroll is

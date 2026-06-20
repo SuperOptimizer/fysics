@@ -56,13 +56,16 @@ int main(int argc, char **argv) {
     const char *in_zarr = argv[1], *out_zarr = argv[2];
     int tile = 128, do_deconv = 0, do_musica = 0, do_air_zero = 1, scratch_passes = 5, do_dering = 1;
     double dering_cy = -1, dering_cx = -1;
-    double air_cut_aggr = 0.0, denoise_k = 0.0;   /* 0 -> default 4.2 inside */
+    double air_cut_aggr = 0.0, denoise_k = -1.0;   /* <0 => denoise OFF (default); 0 -> 4.2, >0 -> that k; --denoise N to enable */
+    double cli_denoise = -1.0, cli_unsharp = -1.0;  /* CLI overrides (tuning) */
     const char *profile = NULL;
     char meta_path[PATH_MAX]; meta_path[0] = 0;
 
     for (int i = 3; i < argc; i++) {
         if      (!strcmp(argv[i], "--tile") && i+1 < argc)  tile = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--air-cut-aggr") && i+1 < argc) air_cut_aggr = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--denoise-k") && i+1 < argc) cli_denoise = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--unsharp-coeff") && i+1 < argc) cli_unsharp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--profile") && i+1 < argc) profile = argv[++i];
         else if (!strcmp(argv[i], "--deconv"))              do_deconv = 1;
         else if (!strcmp(argv[i], "--musica"))              do_musica = 1;
@@ -79,9 +82,9 @@ int main(int argc, char **argv) {
          * (Downsampling was removed entirely -- the volume is not meaningfully oversampled and the
          * auto-factor rested on an unreliable PSF sigma.) */
         if (!strcmp(profile, "conservative")) {        /* FIDELITY: keep faint material */
-            air_cut_aggr = 0.0; denoise_k = 3.0;
+            air_cut_aggr = 0.0; denoise_k = -1.0;   /* denoise OFF (white floor ~1 u8) */
         } else if (!strcmp(profile, "aggressive")) {   /* READABILITY: cut faint material */
-            air_cut_aggr = 1.0; denoise_k = 3.0;   /* conservative's gentler denoise */
+            air_cut_aggr = 1.0; denoise_k = -1.0;   /* denoise OFF */
         } else { fprintf(stderr, "unknown profile: %s (conservative|aggressive)\n", profile); return 2; }
     }
     if (!meta_path[0]) snprintf(meta_path, sizeof(meta_path), "%s/metadata.json", in_zarr);
@@ -147,6 +150,10 @@ int main(int argc, char **argv) {
         if (air_frac < 0) air_frac = 0; if (air_frac > 1) air_frac = 1;
         cfg.air_thresh = air_frac;   /* e.g. window [-0.04,0.22] -> mu=0 at u8 ~39 -> 0.154 */
     }
+    /* CLI tuning overrides (after meta so they win): denoise strength + unsharp gain.
+     * --unsharp-coeff 0 disables sharpening (keep it as a view-time op). */
+    if (cli_denoise >= 0) cfg.denoise_k = cli_denoise;
+    if (cli_unsharp >= 0) cfg.unsharp_coeff = cli_unsharp;
 
     printf("fysics_process\n");
     printf("  in       : %s\n", in_zarr);

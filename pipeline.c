@@ -216,6 +216,39 @@ static void scratch_denoise(float *buf, int nz, int ny, int nx, int passes, floa
  * owned per-thread scratch. u8orig = the haloed source (MUSICA rails). */
 /* guided_eps_tile <= 0 -> use cfg->guided_eps (the global calibration); a positive
  * value overrides it (the radially-varying eps from the fn(r) fit). */
+/* Connected-component despeckle after the value air-cut. The per-voxel cut leaves
+ * small isolated MATERIAL islands (noise blobs / partial-volume flecks that passed
+ * the value test but aren't attached to a sheet). 6-connected flood-fill the nonzero
+ * voxels; any component that does NOT touch the tile/halo boundary (so it cannot
+ * extend into a neighbouring tile) and is smaller than min_size voxels is zeroed.
+ * The scroll body spans the buffer and touches the boundary -> always kept; real
+ * sheets are large/connected and survive. O(N): each voxel is enqueued once.
+ *   labels: N ints (reuse a freed float scratch); queue: >= N ints. */
+static void air_cc_despeckle(float *f, int nz, int ny, int nx, int min_size,
+                             int *labels, int *queue) {
+    size_t N = (size_t)nz * ny * nx;
+    for (size_t i = 0; i < N; i++) labels[i] = (f[i] > 0.0f) ? -1 : 0;  /* -1=material unvisited */
+    int plane = ny * nx;
+    for (size_t s = 0; s < N; s++) {
+        if (labels[s] != -1) continue;
+        int head = 0, tail = 0, boundary = 0;
+        queue[tail++] = (int)s; labels[s] = 1;
+        while (head < tail) {
+            int p = queue[head++];
+            int z = p / plane, r = p - z * plane, y = r / nx, x = r - y * nx;
+            if (z == 0 || z == nz - 1 || y == 0 || y == ny - 1 || x == 0 || x == nx - 1) boundary = 1;
+            if (z > 0      && labels[p - plane] == -1) { labels[p - plane] = 1; queue[tail++] = p - plane; }
+            if (z < nz - 1 && labels[p + plane] == -1) { labels[p + plane] = 1; queue[tail++] = p + plane; }
+            if (y > 0      && labels[p - nx]    == -1) { labels[p - nx]    = 1; queue[tail++] = p - nx; }
+            if (y < ny - 1 && labels[p + nx]    == -1) { labels[p + nx]    = 1; queue[tail++] = p + nx; }
+            if (x > 0      && labels[p - 1]     == -1) { labels[p - 1]     = 1; queue[tail++] = p - 1; }
+            if (x < nx - 1 && labels[p + 1]     == -1) { labels[p + 1]     = 1; queue[tail++] = p + 1; }
+        }
+        if (!boundary && tail < min_size)
+            for (int k = 0; k < tail; k++) f[queue[k]] = 0.0f;   /* zero the whole island */
+    }
+}
+
 static void process_tile(float *f, const float *orig, const unsigned char *u8orig,
                          int nz, int ny, int nx, const fy_pipeline_cfg *cfg,
                          int have_dec_range, double dec_lo, double dec_hi,
@@ -303,8 +336,14 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
                 /* local estimate: same PHYSICS-FLOOR -> valley interpolation as the global cut,
                  * clamped to the global +-band so it tracks the profile but can't run away. */
                 int pf = (cfg->air_thresh > 0) ? (int)(cfg->air_thresh * 255 + 0.5) : 39;
-                double a = cfg->air_cut_aggr; if (a < 0) a = 0; if (a > 1) a = 1;
-                int local = (valley > pf) ? (int)(pf + a * (valley - pf) + 0.5) : pf;
+                /* aggr knob: 0 -> physics floor, 1 -> valley, >1 -> past the valley
+                 * toward the material peak `light` (e.g. 1.1 cuts a touch into the
+                 * low material). Single dial; replaces the old separate boost. */
+                double a = cfg->air_cut_aggr; if (a < 0) a = 0; if (a > 2) a = 2;
+                int local;
+                if (valley <= pf) local = pf;
+                else if (a <= 1.0) local = (int)(pf + a * (valley - pf) + 0.5);
+                else local = (int)(valley + (a - 1.0) * (light > valley ? light - valley : 0) + 0.5);
                 cut = local; if (cut < gg - band) cut = gg - band; if (cut > gg + band) cut = gg + band;
             } else cut = gg;
         } else if (d >= 0) {
@@ -313,6 +352,16 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
             cut = (int)((cfg->air_thresh > 0 ? cfg->air_thresh : 0.05) * 255);
         }
         float cutf = cut / 255.0f;
+        /* TEXTURE-SPLIT air-cut (≈free: |orig-scratch| reuses the smooth we already have).
+         * Uniform regions (low texture = void/solid interior) cut HARDER toward the valley;
+         * textured regions (sheet edges / fibers) protected toward the physics floor. Cuts more
+         * confident void AND rescues faint sheet boundaries vs one global threshold. */
+        int pf2 = (cfg->air_thresh > 0) ? (int)(cfg->air_thresh * 255 + 0.5) : 39;
+        int spread = (valley > pf2) ? (valley - pf2) / 2 : 8;
+        int cu = cut + spread; if (valley > cut && cu > valley) cu = valley;
+        int ct = cut - spread; if (ct < pf2) ct = pf2;
+        float cutf_uni = cu / 255.0f, cutf_tex = ct / 255.0f;
+        const float AIR_TEX = 0.03f;   /* |orig-smooth| below this = uniform */
         if (lowres) {
             /* compare against the trilinearly upsampled low-res smooth (4 low rows
              * blended once per output row; b2's decimated copy is dead -> row scratch) */
@@ -332,17 +381,27 @@ static void process_tile(float *f, const float *orig, const unsigned char *u8ori
                         rowbuf[k] = w00 * sl[r00 + k] + w01 * sl[r01 + k] +
                                     w10 * sl[r10 + k] + w11 * sl[r11 + k];
                     float *frow = f + ((size_t)z * ny + y) * nx;
+                    const float *orow = orig + ((size_t)z * ny + y) * nx;
                     for (int x = 0; x < nx; x++) {
                         int x0 = x >> 1; if (x0 > lx - 2) x0 = lx - 2;
                         float fx = 0.5f * x - x0; if (fx > 1.0f) fx = 1.0f;
                         float v = rowbuf[x0] + (rowbuf[x0 + 1] - rowbuf[x0]) * fx;
-                        if (v < cutf) frow[x] = 0.0f;
+                        float tex = orow[x] - v; if (tex < 0) tex = -tex;
+                        if (v < (tex < AIR_TEX ? cutf_uni : cutf_tex)) frow[x] = 0.0f;
                     }
                 }
             }
         } else {
-            for (size_t i = 0; i < N; i++) if (b2[i] < cutf) f[i] = 0.0f;
+            for (size_t i = 0; i < N; i++) {
+                float tex = orig[i] - b2[i]; if (tex < 0) tex = -tex;
+                if (b2[i] < (tex < AIR_TEX ? cutf_uni : cutf_tex)) f[i] = 0.0f;
+            }
         }
+        /* CONNECTED-COMPONENT DESPECKLE: drop small isolated material islands the
+         * value cut left behind. b1 (smooth scratch, dead now) -> labels; ws (guided
+         * workspace, 4*N floats) -> BFS queue. Both are >= N ints. */
+        if (cfg->air_min_component > 0)
+            air_cc_despeckle(f, nz, ny, nx, cfg->air_min_component, (int *)b1, (int *)ws);
     }
 
     /* (d.5) RECENTER + RESAMPLE around 127, WITH MUSICA HEADROOM: map the real
@@ -818,7 +877,15 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
     }
     double flat_nf_med = nfloor ? median_sorted(floors, nfloor) : 0.015;
     cfg->eps_fn_med = flat_nf_med;
-    if (cfg->guided_eps <= 0) {
+    /* white-noise floor of the material in u8 units (f01 std -> u8): the encoder's
+     * --quality auto sets the DC quant step to this, so quantization discards noise but
+     * not signal. Measured on the RAW windowed input (pre-denoise). */
+    cfg->noise_floor = flat_nf_med * 255.0;
+    /* denoise_k < 0 => guided denoise DISABLED (the default): the white noise floor is
+     * ~1 u8 (signal-blind measure), so there is essentially no white noise to remove, and
+     * guided smoothing only risks the fine inter-sheet detail the unwrap needs. Ring/zdrift
+     * (targeted, signal-preserving) stay on; re-enable denoise with --denoise N (k>0). */
+    if (cfg->guided_eps <= 0 && cfg->denoise_k >= 0) {
         double k = cfg->denoise_k > 0 ? cfg->denoise_k : 4.2;
         cfg->guided_eps = (k * flat_nf_med) * (k * flat_nf_med);
     }
@@ -847,8 +914,10 @@ int fy_run_pipeline(const char *in_root, const char *out_root, fy_pipeline_cfg *
         double d = (sum > 0) ? fy_valley_depth(air_hist, &dark, &light, &valley) : -1.0;
         int phys_floor = (cfg->air_thresh > 0) ? (int)(cfg->air_thresh * 255 + 0.5) : 39;
         if (d >= 0 && valley > phys_floor) {
-            double a = cfg->air_cut_aggr; if (a < 0) a = 0; if (a > 1) a = 1;
-            cfg->air_cut_u8 = (int)(phys_floor + a * (valley - phys_floor) + 0.5);
+            /* 0 -> floor, 1 -> valley, >1 -> past valley toward the material peak `light`. */
+            double a = cfg->air_cut_aggr; if (a < 0) a = 0; if (a > 2) a = 2;
+            if (a <= 1.0) cfg->air_cut_u8 = (int)(phys_floor + a * (valley - phys_floor) + 0.5);
+            else cfg->air_cut_u8 = (int)(valley + (a - 1.0) * (light > valley ? light - valley : 0) + 0.5);
             int band = (valley - phys_floor) / 4; cfg->air_cut_band = band > 4 ? band : 4;
         } else {
             cfg->air_cut_u8 = phys_floor; cfg->air_cut_band = 4;
