@@ -149,10 +149,12 @@ static void *occ_fetch_worker(void *arg){
 }
 /* content bbox (world LOD0, hi EXCLUSIVE) into bb[6]={zlo,zhi,ylo,yhi,xlo,xhi};
  * filled by cm_from_coarse from the coarse-level nonzero extent. NULL = don't compute. */
-static int cm_from_coarse(chunkmap *cm,const char *zarr,const zlvl *z0,long *bb){
+static int cm_from_coarse(chunkmap *cm,const char *zarr,const zlvl *z0,long *bb,int base){
     int bestL=-1; zlvl cl; long f=1;
-    for(int L=5;L>=1;--L){
-        long ff=1L<<L;
+    /* search ABSOLUTE pyramid levels COARSER than the base (base+1..base+5); the
+     * occupancy/ROI factor is RELATIVE to the base level. */
+    for(int L=base+5;L>base;--L){
+        long ff=1L<<(L-base);
         if(z0->cz%ff||z0->cy%ff||z0->cx%ff) continue;
         zlvl t; if(parse_lvl(zarr,L,&t)!=0) continue;
         cl=t; f=ff; bestL=L; break;
@@ -199,11 +201,11 @@ static int cm_from_coarse(chunkmap *cm,const char *zarr,const zlvl *z0,long *bb)
     fprintf(stderr,"occupancy from coarse level %d/ (factor %ld)\n",bestL,f);
     return 0;
 }
-static int cm_build(chunkmap *cm,const char *zarr,const zlvl *z0,long *bb){
+static int cm_build(chunkmap *cm,const char *zarr,const zlvl *z0,long *bb,int base){
     cm->ncz=(z0->sz+z0->cz-1)/z0->cz; cm->ncy=(z0->sy+z0->cy-1)/z0->cy; cm->ncx=(z0->sx+z0->cx-1)/z0->cx;
     cm->present=calloc((size_t)cm->ncz*cm->ncy*cm->ncx,1);
     if(!cm->present) return -1;
-    if(cm_from_coarse(cm,zarr,z0,bb)==0) return 0;
+    if(cm_from_coarse(cm,zarr,z0,bb,base)==0) return 0;
     fprintf(stderr,"no coarse level; assuming all chunks present (no ROI trim)\n");
     memset(cm->present,1,(size_t)cm->ncz*cm->ncy*cm->ncx);
     if(bb){ bb[0]=0;bb[1]=z0->sz; bb[2]=0;bb[3]=z0->sy; bb[4]=0;bb[5]=z0->sx; }  /* full volume = no trim */
@@ -941,6 +943,9 @@ int main(int argc, char **argv){
     double air_aggr=-1.0;      /* air-cut dial override: 0=floor,1=valley,>1=past valley; <0 = use profile */
     int do_air=0;              /* air-cut OFF by default (--air-cut to enable); the masked
                                 * input zeros are preserved by the codec, no value-cut needed */
+    int base_level=0;          /* source pyramid level to treat as this archive's LOD0
+                                * (--level 5 streams the 32x scroll for a small coarse archive;
+                                * progressively 5->4->3->2->1 for finer detail) */
     char meta_path[PATH_MAX]; meta_path[0]=0;
     for(int i=3;i<argc;i++){
         if      (!strcmp(argv[i],"--profile")&&i+1<argc)   profile=argv[++i];
@@ -960,6 +965,7 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--air-min-comp")&&i+1<argc) air_min_comp=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--air-aggr")&&i+1<argc)     air_aggr=atof(argv[++i]);
         else if (!strcmp(argv[i],"--air-cut"))                do_air=1;
+        else if (!strcmp(argv[i],"--level")&&i+1<argc)     base_level=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--mem-gb")&&i+1<argc)    mem_gb=atof(argv[++i]);
         else { fprintf(stderr,"unknown arg: %s\n",argv[i]); return 2; }
     }
@@ -1007,12 +1013,12 @@ int main(int argc, char **argv){
         fprintf(stderr,"mca_export: %d meta keys from %s\n",nmeta,meta_path);
     }
 
-    /* ---- parse level 0 + occupancy ---- */
+    /* ---- parse the base source level + occupancy ---- */
     zlvl z0;
-    if(parse_lvl(in,0,&z0)!=0){fprintf(stderr,"cannot parse %s/0/.zarray\n",in);return 1;}
-    fprintf(stderr,"input %ldx%ldx%ld chunks %ldx%ldx%ld\n",z0.sz,z0.sy,z0.sx,z0.cz,z0.cy,z0.cx);
+    if(parse_lvl(in,base_level,&z0)!=0){fprintf(stderr,"cannot parse %s/%d/.zarray\n",in,base_level);return 1;}
+    fprintf(stderr,"source level %d/: input %ldx%ldx%ld chunks %ldx%ldx%ld\n",base_level,z0.sz,z0.sy,z0.sx,z0.cz,z0.cy,z0.cx);
     chunkmap cm; long bb[6]={0};
-    if(cm_build(&cm,in,&z0,bb)!=0){fprintf(stderr,"occupancy build failed\n");return 1;}
+    if(cm_build(&cm,in,&z0,bb,base_level)!=0){fprintf(stderr,"occupancy build failed\n");return 1;}
     /* ROI TRIM: crop to the content bbox, translate to (0,0,0), pad to MCC (256).
      * Origin snaps DOWN to 256 and the end UP to 256 -> LOD0 is chunk-tight. Each
      * coarser LOD is built independently in the tail (its own dims = L0>>L, storage
