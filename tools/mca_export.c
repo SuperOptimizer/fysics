@@ -74,21 +74,30 @@ static void s3_init_once(void){
     g_s3=s3_client_new(&cfg);
     if(!g_s3){ fprintf(stderr,"s3_client_new failed\n"); exit(1); }
 }
-/* GET whole object/file into a malloc'd buffer; NULL on absent. *err=1 on HARD error
- * (S3 failure that is not a 404) so absent-vs-failed is never conflated. */
+/* GET whole object/file into a malloc'd buffer; NULL on absent. *err=1 on HARD error.
+ * CRITICAL distinction (S3): a 404 is the request SUCCEEDING and telling us the object
+ * does not exist -> definitively absent (decodes to zero air), return immediately, no
+ * retry. Any OTHER outcome (transport failure, 5xx, throttle, status 0) means the request
+ * FAILED -- we do NOT know whether the object exists -- so we must RETRY before deciding,
+ * or a transient error silently becomes a zeroed hole journaled as complete. */
 static u8 *src_get(const char *path, size_t *len, int *err){
     if(err)*err=0;
     if(is_s3(path)){
-        s3_response r; memset(&r,0,sizeof r);
-        s3_status st=s3_get(g_s3,path,&r);
-        u8 *out=NULL;
-        if(st==S3_OK && r.status==200 && r.body){
-            /* steal the response body (libs3 frees it with plain free()) -- the
-             * stream fetches ~TBs through here; no copy. */
-            out=(u8*)r.body; if(len)*len=r.body_len; r.body=NULL;
-        } else if(r.status!=404) { if(err)*err=1; }   /* 404 = absent chunk, not an error */
-        s3_response_free(&r);
-        return out;
+        const int MAXTRY=6;
+        for(int tries=0;;tries++){
+            s3_response r; memset(&r,0,sizeof r);
+            s3_status st=s3_get(g_s3,path,&r);
+            if(st==S3_OK && r.status==200 && r.body){
+                /* steal the response body (libs3 frees it with plain free()) -- the
+                 * stream fetches ~TBs through here; no copy. */
+                u8 *out=(u8*)r.body; if(len)*len=r.body_len; r.body=NULL; s3_response_free(&r); return out;
+            }
+            if(r.status==404){ s3_response_free(&r); return NULL; }   /* definitively absent: zero, no retry */
+            s3_response_free(&r);
+            if(tries+1>=MAXTRY){ if(err)*err=1; return NULL; }        /* request failed MAXTRY times: give up */
+            long ms=100L<<tries;                                      /* 100,200,400,800,1600,3200 ms backoff */
+            struct timespec ts={ms/1000,(ms%1000)*1000000L}; nanosleep(&ts,NULL);
+        }
     }
     int fd=open(path,O_RDONLY);
     if(fd<0) return NULL;
@@ -218,6 +227,7 @@ static int cm_build(chunkmap *cm,const char *zarr,const zlvl *z0,long *bb,int ba
  * later, so a modest cache turns the ~1.4x halo re-fetch into ~1.05x. */
 typedef struct centry { long key; u8 *bytes; size_t len; int refs; long lru;
                         int ready;          /* 0 = fetch in flight (single-flight) */
+                        int err;            /* bytes==NULL: 1 = fetch FAILED (uncertain, retry), 0 = real 404 (absent) */
                         struct centry *next; } centry;
 typedef struct {
     centry **bk; long nbk; size_t bytes, cap; long tick;   /* cap = RESIDENT budget:
@@ -273,7 +283,7 @@ static centry *cc_reserve(long z,long y,long x,int *owner){
     if(e){
         e->refs++; e->lru=++g_cc.tick; g_cc.hits++; *owner=0;
     } else {
-        e=malloc(sizeof *e); e->key=k; e->bytes=NULL; e->len=0; e->refs=1; e->ready=0;
+        e=malloc(sizeof *e); e->key=k; e->bytes=NULL; e->len=0; e->refs=1; e->ready=0; e->err=0;
         e->lru=++g_cc.tick;
         unsigned long b=(unsigned long)k%g_cc.nbk; e->next=g_cc.bk[b]; g_cc.bk[b]=e;
         g_cc.misses++; *owner=1;
@@ -283,9 +293,9 @@ static centry *cc_reserve(long z,long y,long x,int *owner){
 }
 /* owner publishes the fetch result (takes ownership of bytes; bytes==NULL marks
  * the chunk absent/failed) and wakes every waiter */
-static void cc_fill(centry *e,u8 *bytes,size_t len){
+static void cc_fill(centry *e,u8 *bytes,size_t len,int err){
     pthread_mutex_lock(&g_cc.m);
-    e->bytes=bytes; e->len=len; e->ready=1; e->lru=++g_cc.tick;
+    e->bytes=bytes; e->len=len; e->ready=1; e->err=err; e->lru=++g_cc.tick;
     g_cc.bytes+=len; cc_evict_locked();
     pthread_cond_broadcast(&g_cc.cv);
     pthread_mutex_unlock(&g_cc.m);
@@ -355,7 +365,7 @@ static void cc_tok_release(void){
 
 /* ------------------------------------------------------------ band queue */
 typedef struct { long ccz,ccy,ccx; u8 *bytes; size_t len; centry *ce; int fetched; } cchunk;
-typedef struct { long ti; cchunk *chunks; int nch; int empty; } bandbuf;
+typedef struct { long ti; cchunk *chunks; int nch; int empty; int err; } bandbuf;
 typedef struct {
     bandbuf *slot; int cap,head,tail,count,closed,active_prod;
     pthread_mutex_t m; pthread_cond_t not_full,not_empty;
@@ -423,7 +433,7 @@ static void *download_worker(void *arg){
         long h=sc->halo;
         long fx0=vx0-h<0?0:vx0-h, fy0=vy0-h<0?0:vy0-h, fz0=vz0-h<0?0:vz0-h;
         long fx1=vx1+h>z0->sx?z0->sx:vx1+h, fy1=vy1+h>z0->sy?z0->sy:vy1+h, fz1=vz1+h>z0->sz?z0->sz:vz1+h;
-        cchunk *chunks=NULL; int nch=0,cap=0,any=0;
+        cchunk *chunks=NULL; int nch=0,cap=0,any=0,band_err=0;   /* band_err: a CORE chunk fetch failed (uncertain) -> do not journal this unit */
         if(fx0<fx1&&fy0<fy1&&fz0<fz1){
             long cxa=fx0/z0->cx,cxb=(fx1-1)/z0->cx, cya=fy0/z0->cy,cyb=(fy1-1)/z0->cy;
             long cza=fz0/z0->cz,czb=(fz1-1)/z0->cz;
@@ -436,7 +446,7 @@ static void *download_worker(void *arg){
                             && qx>=vx0/z0->cx && qx*z0->cx<vx1);
                 centry *ce=cc_get(qz,qy,qx);
                 if(ce){
-                    if(!ce->bytes){ cc_release(ce); continue; }  /* negative-cached: chunk absent */
+                    if(!ce->bytes){ if(ce->err && core) band_err=1; cc_release(ce); continue; }  /* negative-cached: 404 absent, or a cached failed fetch (err) -> retry the unit */
                     if(core) any=1;
                     if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
                     chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
@@ -481,29 +491,33 @@ static void *download_worker(void *arg){
                     long qz=needq[(g0+i)*3],qy=needq[(g0+i)*3+1],qx=needq[(g0+i)*3+2];
                     int core = (qz>=vz0/z0->cz && qz*z0->cz<vz1 && qy>=vy0/z0->cy && qy*z0->cy<vy1
                                 && qx>=vx0/z0->cx && qx*z0->cx<vx1);
-                    u8 *got=NULL; size_t gn=0;
+                    u8 *got=NULL; size_t gn=0; int cherr=0;
                     atomic_fetch_add(&sc->io_open,1);
                     if(use_batch){
                         if(rsp[oi].status==200 && rsp[oi].body){
                             got=(u8*)rsp[oi].body; gn=rsp[oi].body_len; rsp[oi].body=NULL;
-                        } else if(rsp[oi].status!=404 && rsp[oi].status!=0){
-                            atomic_fetch_add(&sc->fail,1);
+                        } else if(rsp[oi].status!=404){
+                            /* batch did NOT get a definitive 404 -> the fetch is uncertain;
+                             * retry this chunk serially (src_get backs off + retries). Only a
+                             * real 404 falls through as absent (got=NULL, cherr=0). */
+                            got=src_get(paths[i],&gn,&cherr); if(cherr) atomic_fetch_add(&sc->fail,1);
                         }
                         s3_response_free(&rsp[oi]);
                     } else {
-                        int err=0; got=src_get(paths[i],&gn,&err);
-                        if(err) atomic_fetch_add(&sc->fail,1);
+                        got=src_get(paths[i],&gn,&cherr);
+                        if(cherr) atomic_fetch_add(&sc->fail,1);
                     }
                     if(!got){
                         atomic_fetch_add(&sc->io_miss,1);
-                        cc_fill(ces[i],NULL,0);       /* publish 'absent' to waiters */
+                        if(cherr && core) band_err=1;   /* uncertain fetch of a CORE chunk -> retry the unit */
+                        cc_fill(ces[i],NULL,0,cherr);    /* publish absent(404)/failed(err) to waiters */
                         cc_release(ces[i]);
                         continue;
                     }
                     if(core) any=1;
                     atomic_fetch_add(&sc->io_bytes,(long)gn);
                     band_bytes+=(long)gn;
-                    cc_fill(ces[i],got,gn);
+                    cc_fill(ces[i],got,gn,0);
                     if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
                     chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
                     chunks[nch].bytes=got;chunks[nch].len=gn;chunks[nch].ce=ces[i];chunks[nch].fetched=1;nch++;
@@ -526,7 +540,7 @@ static void *download_worker(void *arg){
                         char p[1500]; snprintf(p,sizeof p,"%s/%ld/%ld/%ld",z0->dir,qz,qy,qx);
                         atomic_fetch_add(&sc->io_open,1);
                         size_t gn=0; int err=0; u8 *got=src_get(p,&gn,&err);
-                        if(err) atomic_fetch_add(&sc->fail,1);
+                        if(err){ atomic_fetch_add(&sc->fail,1); if(core) band_err=1; }
                         if(!got){ atomic_fetch_add(&sc->io_miss,1); continue; }
                         if(core) any=1;
                         atomic_fetch_add(&sc->io_bytes,(long)gn);
@@ -536,7 +550,7 @@ static void *download_worker(void *arg){
                         chunks[nch].ce=NULL;chunks[nch].fetched=2;nch++;   /* private: freed on release */
                         continue;
                     }
-                    if(!ces[i]->bytes){ cc_release(ces[i]); continue; }
+                    if(!ces[i]->bytes){ if(ces[i]->err && core) band_err=1; cc_release(ces[i]); continue; }
                     if(core) any=1;
                     if(nch==cap){cap=cap?cap*2:32;chunks=realloc(chunks,cap*sizeof *chunks);}
                     chunks[nch].ccz=qz;chunks[nch].ccy=qy;chunks[nch].ccx=qx;
@@ -546,7 +560,7 @@ static void *download_worker(void *arg){
             }
             free(needq);
         }
-        bandbuf b={ti,chunks,nch,any?0:1};
+        bandbuf b={ti,chunks,nch,any?0:1,band_err};
         bq_push(&sc->q,b);
         if(have_tok){ cc_tok_release(); have_tok=0; }
     }
@@ -584,8 +598,10 @@ static void *compute_worker(void *arg){
         long bz=ti%sc->nbz, txy=ti/sc->nbz, ty=txy/sc->ntx, tx=txy%sc->ntx;
         /* WORLD band position (reads/assembly); archive coords subtract the ROI origin */
         long vx0=tx*SB+sc->rox, vy0=ty*SB+sc->roy, vz0=bz*BAND+sc->roz;
-        if(bb.empty){ atomic_fetch_add(&sc->skipped,1); atomic_fetch_add(&sc->units_done,1);
-            if(sc->prog_fd>=0){ long v=ti; if(write(sc->prog_fd,&v,8)!=8){} }
+        if(bb.empty){ atomic_fetch_add(&sc->units_done,1);
+            /* journal as empty ONLY if no CORE chunk fetch failed -- a band that merely
+             * LOOKS empty because its core chunks errored must be retried, not skipped. */
+            if(!bb.err){ atomic_fetch_add(&sc->skipped,1); if(sc->prog_fd>=0){ long v=ti; if(write(sc->prog_fd,&v,8)!=8){} } }
             goto release; }
         atomic_fetch_add(&sc->wk_busy,1);
         {
@@ -667,8 +683,11 @@ static void *compute_worker(void *arg){
         atomic_fetch_add(&sc->units_done,1);
         /* journal AFTER all of this unit's chunks are appended (archive is
          * crash-safe per append; the journal trails it, so a crash loses at
-         * most the un-journaled units -- they re-process, never skip wrongly) */
-        if(sc->prog_fd>=0){ long v=ti; if(write(sc->prog_fd,&v,8)!=8){} }
+         * most the un-journaled units -- they re-process, never skip wrongly).
+         * GATE on !bb.err: if a CORE chunk fetch FAILED (uncertain, not a real 404), the
+         * unit is incomplete -- do NOT journal it so a resume retries it (vs silently
+         * baking a zeroed hole and marking it done). */
+        if(!bb.err && sc->prog_fd>=0){ long v=ti; if(write(sc->prog_fd,&v,8)!=8){} }
 release:
         for(int i=0;i<bb.nch;++i){
             if(bb.chunks[i].ce) cc_release(bb.chunks[i].ce);
