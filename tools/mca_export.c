@@ -957,7 +957,7 @@ int main(int argc, char **argv){
                               * under the fetch budget (SB=1024 bands serialized the
                               * downloaders through the progress token) and shrink
                               * worker buffers so compute can run FULL-WIDTH */
-    int nthreads=0, niothreads=0, qcap=0, process=1, no_dither=0, auto_q=0; double cache_gb=12.0, mem_gb=24.0, calib_gb=10.0;
+    int nthreads=0, niothreads=0, qcap=0, process=1, no_dither=0, auto_q=0, no_calib=0; double cache_gb=12.0, mem_gb=24.0, calib_gb=10.0;
     int air_min_comp=64;       /* despeckle: drop interior material islands < N voxels */
     double air_aggr=-1.0;      /* air-cut dial override: 0=floor,1=valley,>1=past valley; <0 = use profile */
     int do_air=0;              /* air-cut OFF by default (--air-cut to enable); the masked
@@ -986,6 +986,7 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i],"--air-cut"))                do_air=1;
         else if (!strcmp(argv[i],"--level")&&i+1<argc)     base_level=atoi(argv[++i]);
         else if (!strcmp(argv[i],"--mem-gb")&&i+1<argc)    mem_gb=atof(argv[++i]);
+        else if (!strcmp(argv[i],"--no-calib"))            no_calib=1;
         else { fprintf(stderr,"unknown arg: %s\n",argv[i]); return 2; }
     }
     if(SB%512||SB<512){fprintf(stderr,"--sb must be a multiple of 512\n");return 2;}
@@ -1058,13 +1059,22 @@ int main(int argc, char **argv){
     cfg.occ_cz=z0.cz;   cfg.occ_cy=z0.cy;  cfg.occ_cx=z0.cx;
 
     /* ---- calibrate (reads the zarr through the fysics library) ---- */
-    if(process){
+    if(process && !no_calib){
         if(resume_has_progress(out,SB,BAND,&z0) && calib_load(out,&cfg,SB,BAND,&z0,profile)==0){
             fprintf(stderr,"resume: loaded calibration from %s.calib (skipping recalibration)\n",out);
         } else {
             if(fy_calibrate(in,&cfg,128,1)!=0){fprintf(stderr,"calibrate failed\n");return 1;}
             calib_save(out,&cfg,SB,BAND,&z0,profile);
         }
+    } else if(process && no_calib){
+        /* --no-calib: skip the budgeted S3 sampling pass entirely. It only feeds noise
+         * floor (auto-q; unused at fixed quality), PSF (deconv; off), air histogram
+         * (air-cut; off), norm histogram (off), dering rings, and per-z z-drift. Leaving
+         * have_zdrift/have_dering at 0 makes the pipeline skip those corrections (mild
+         * cosmetic z-brightness banding only). Occupancy tile-skipping is built separately
+         * (cm_build above) and is unaffected. */
+        cfg.have_zdrift=0; cfg.have_dering=0; cfg.noise_floor=0;
+        fprintf(stderr,"calibration BYPASSED (--no-calib): no z-drift/dering/noise-floor; occupancy skip still active\n");
     }
 
     /* ---- --quality auto: set DC quant step to the measured white-noise floor, so
